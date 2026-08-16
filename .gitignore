@@ -1,0 +1,19 @@
+# 运行时锁 / 心跳 / 进度（瞬时文件，不进版本库）
+*.lock
+.heartbeat
+*_progress.json
+
+# 本地密钥/环境（若改为 env 注入方式，密钥放此处，严禁提交）
+.env
+*.local
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器临时文件
+*.swp
+.DS_Store
+
+# 运行时生成的工作目录定位文件（含绝对路径，非敏感但属运行产物）
+scripts/_workdir.json

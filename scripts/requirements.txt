@@ -1,0 +1,13 @@
+# bili-live-summary 运行时依赖
+# 若使用已含深度学习栈的 Python（如本机 bili-archive venv），通常只需以下纯 Python 包：
+requests>=2.28
+python-docx>=1.1
+
+# 转写相关（若当前 Python 未安装，需一并安装）：
+funasr>=1.2
+modelscope>=1.15
+
+# PyTorch 需按本机 CUDA 版本安装（FunASR GPU 推理必需）。示例（RTX 50 系 Blackwell，CUDA 12.8）：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# 其它 CUDA 版本见 https://pytorch.org/get-started/locally/
+# 无 GPU 时可装 CPU 版 torch，但长音频转写会非常慢。

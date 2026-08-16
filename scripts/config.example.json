@@ -1,0 +1,67 @@
+{
+  "_comment": "bili-live-summary 配置模板（由 setup.py 生成到工作目录 config.json，可直接手改）。",
+  "series": {
+    "url": "",
+    "mid": 0,
+    "series_id": 0,
+    "_comment": "把 url 换成主播合集页；setup.py 会自动解析 mid/series_id，也可手动填"
+  },
+  "latest_mode": {
+    "_comment": "「最新录播」判定方式。latest_by_live_date=按直播实际日期滚动（上传时间不固定时最稳，配合每日多次调度）；可选 newer_than_last / latest_n / since_date / backfill_all。since_live_date 为硬下限：只处理直播日期 >= 该日期的录播（如用户明确只要 2026-08-09 起的）。",
+    "mode": "latest_by_live_date",
+    "first_run_n": 1,
+    "latest_n": 1,
+    "since_date": "",
+    "since_live_date": "",
+    "max_per_run": 2,
+    "skip_shorter_than_sec": 600,
+    "title_must_contain": ""
+  },
+  "hotwords": {
+    "_comment": "转写后自动纠正：解析 hotwords.path（默认 scripts/hotwords.md）里的替换表，对 TXT/SRT 各做一遍替换再送 AI。enabled=false 可关闭；path 留空即用 skill 自带热词表。",
+    "enabled": true,
+    "path": ""
+  },
+  "summarize": {
+    "provider": "google",
+    "model": "gemini-3.7-flash",
+    "api_key": "",
+    "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
+    "proxy": "",
+    "chunk_minutes": 30,
+    "temperature": 0.3,
+    "max_output_tokens": 8192,
+    "thinking_level": "low",
+    "max_retries": 5,
+    "inter_chunk_delay_sec": 6,
+    "streamer": "岁己",
+    "audience": "饼干岁"
+  },
+  "output": {
+    "_comment": "Word 文档目录与命名。{year}/{month}/{streamer}/{audience} 均会被替换；月份取自直播实际日期。",
+    "doc_dir": "C:\\Users\\Tsing\\Desktop",
+    "doc_name_pattern": "{streamer}直播总结_{year}年{month}月.docx",
+    "font": "思源宋体CN Light"
+  },
+  "paths": {
+    "project_root": "",
+    "_comment": "留空=等于工作目录（config.json 所在目录）；也可填绝对路径",
+    "python": "",
+    "ffmpeg": "",
+    "ffprobe": "",
+    "aria2c": "",
+    "cookies": ""
+  },
+  "transcribe": {
+    "device": "auto",
+    "batch_size_s": 300,
+    "ncpu": 4,
+    "chunk_hours_threshold": 4,
+    "chunk_minutes": 30
+  },
+  "cleanup": {
+    "delete_mp3_after_success": true,
+    "keep_txt": true,
+    "keep_srt": true
+  }
+}
