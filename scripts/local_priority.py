@@ -223,36 +223,41 @@ def main():
     LOCK = os.path.join(WORK, '.local_priority.lock')
     HB = os.path.join(WORK, '.local_priority.heartbeat')
 
-    def alive():
-        if not os.path.exists(LOCK):
+    def pid_alive(pid):
+        if not pid:
             return False
         try:
-            age = time.time() - float(open(HB, encoding='utf-8').read().strip() or '0')
-        except Exception:
-            age = 99999
-        return age < 240
+            os.kill(pid, 0)  # Windows: signal 0 仅探测进程是否存在
+            return True
+        except (ProcessLookupError, OSError):
+            return False
 
     def grab():
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return True
         except OSError:
-            return False
+            # 锁已存在：判定持有者是否仍存活
+            try:
+                pid = int(open(LOCK, encoding='utf-8').read().strip() or '0')
+            except Exception:
+                pid = 0
+            if pid_alive(pid):
+                return False  # 确有实例在跑
+            # 持有者已死（残留锁，通常因 sandbox 删文件受限删不掉）：覆盖夺回
+            try:
+                fd = os.open(LOCK, os.O_WRONLY | os.O_TRUNC)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                return True
+            except OSError:
+                return False
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
 
     if not grab():
-        if alive():
-            print('[local_priority] 已有实例运行，退出')
-            sys.exit(0)
-        for p in (LOCK, HB):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        if not grab():
-            print('[local_priority] 锁占用，退出')
-            sys.exit(0)
+        print('[local_priority] 已有实例运行，退出')
+        sys.exit(0)
 
     def touch():
         try:
