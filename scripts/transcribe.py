@@ -111,25 +111,43 @@ def load_model(cfg, log):
     return model
 
 
-def asr_segments(model, audio_path, cfg, offset_sec=0.0):
-    """转写一个音频（块），返回 [(start_sec, end_sec, text), ...]"""
-    res = model.generate(
-        input=audio_path,
-        cache={},
-        language='auto',
-        use_itn=True,
-        batch_size_s=cfg['transcribe'].get('batch_size_s', 300),
-        ncpu=cfg['transcribe'].get('ncpu', 4),
-        merge_vad=True,
-        merge_length_s=15,
-        sentence_timestamp=True,
-    )
+_VAD_MODEL = None
+
+def _get_vad_model(device, log):
+    """独立加载 VAD 模型（仅用于时间戳回退），进程内缓存一次。"""
+    global _VAD_MODEL
+    if _VAD_MODEL is None:
+        from funasr import AutoModel
+        _VAD_MODEL = AutoModel(
+            model='iic/speech_fsmn_vad_zh-cn-16k-common-pytorch',
+            device=device, disable_update=True)
+        if log:
+            try:
+                log('VAD 模型(独立)已加载，用于时间戳回退')
+            except Exception:
+                pass
+    return _VAD_MODEL
+
+
+def _try_sentence_timestamp(model, audio_path, cfg, offset_sec, log):
+    """首选：funasr 原生 sentence_timestamp。失败或未产出时间戳则返回 []。"""
+    try:
+        res = model.generate(
+            input=audio_path, cache={}, language='auto', use_itn=True,
+            batch_size_s=cfg['transcribe'].get('batch_size_s', 300),
+            ncpu=cfg['transcribe'].get('ncpu', 4),
+            merge_vad=True, merge_length_s=15, sentence_timestamp=True)
+    except Exception as e:
+        if log:
+            try:
+                log(f'sentence_timestamp 失败（{e}），回退 VAD 分段', 'WARN')
+            except Exception:
+                pass
+        return []
     if not res:
         return []
     item = res[0]
     out = []
-
-    # 首选：句级时间戳
     sents = item.get('sentence_info') or []
     if sents:
         for s in sents:
@@ -142,19 +160,78 @@ def asr_segments(model, audio_path, cfg, offset_sec=0.0):
             en = float(s.get('end', st * 1000)) / 1000.0 + offset_sec
             out.append((st, max(en, st + 0.5), txt))
         return out
-
-    # 兜底一：整体 timestamp 列表
     ts = item.get('timestamp')
     txt = clean_text(item.get('text', ''))
     if ts and txt:
         st = float(ts[0][0]) / 1000.0 + offset_sec
         en = float(ts[-1][1]) / 1000.0 + offset_sec
         return [(st, en, txt)]
-
-    # 兜底二：纯文本，无时间轴
-    if txt:
-        return [(offset_sec, offset_sec + 1.0, txt)]
     return []
+
+
+def _vad_fallback(model, audio_path, cfg, offset_sec, log):
+    """兜底：VAD 分段 + 逐段 ASR，兼容 funasr 1.3.x 不再返回时间戳的情况。
+    返回 [(start_sec, end_sec, text), ...]，start/end 为绝对秒（含 offset）。"""
+    import soundfile as sf
+    import re as _re
+    try:
+        import torch as _torch
+        device = 'cuda:0' if _torch.cuda.is_available() else 'cpu'
+    except Exception:
+        device = 'cpu'
+    try:
+        vad = _get_vad_model(device, log)
+        vr = vad.generate(input=audio_path)
+        raw = vr[0].get('value') or []
+        if not raw:
+            return []
+        wav, sr = sf.read(audio_path, dtype='float32')
+        out = []
+        for (s_ms, e_ms) in raw:
+            s = int(s_ms / 1000.0 * sr)
+            e = int(e_ms / 1000.0 * sr)
+            if e <= s:
+                continue
+            slice_w = wav[s:e]
+            try:
+                r = model.generate(input=slice_w, cache={}, language='auto',
+                                   use_itn=True, batch_size_s=300,
+                                   ncpu=cfg['transcribe'].get('ncpu', 4),
+                                   merge_vad=True, merge_length_s=15)
+                txt = _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '').strip()
+            except Exception:
+                continue
+            if not txt:
+                continue
+            events = TAG_RE.findall(txt)
+            ct = clean_text(txt)
+            if not is_meaningful(ct) or is_junk(ct, events):
+                continue
+            st = s_ms / 1000.0 + offset_sec
+            en = e_ms / 1000.0 + offset_sec
+            out.append((st, max(en, st + 0.5), ct))
+        if log:
+            try:
+                log(f'VAD 回退产出 {len(out)} 句')
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        if log:
+            try:
+                log(f'VAD 回退也失败：{e}', 'ERROR')
+            except Exception:
+                pass
+        return []
+
+
+def asr_segments(model, audio_path, cfg, offset_sec=0.0, log=None):
+    """转写一个音频（块），返回 [(start_sec, end_sec, text), ...]
+    优先用 funasr 原生 sentence_timestamp；若该版本不出时间戳，则 VAD 分段兜底。"""
+    segs = _try_sentence_timestamp(model, audio_path, cfg, offset_sec, log)
+    if segs:
+        return segs
+    return _vad_fallback(model, audio_path, cfg, offset_sec, log)
 
 
 def split_audio(ffmpeg, src, work_dir, chunk_sec, log):
@@ -233,7 +310,7 @@ def transcribe_one(cfg, mp3_path, model, log):
             # 用实际块时长累加偏移，而不是假设每块都恰好 chunk_sec
             c_dur = probe_duration(P['ffprobe'], c) or chunk_sec
             log(f'  [{i + 1}/{len(chunks)}] 偏移 {hms(offset)} ...')
-            segs.extend(asr_segments(model, c, cfg, offset_sec=offset))
+            segs.extend(asr_segments(model, c, cfg, offset_sec=offset, log=log))
             offset += c_dur
             try:
                 os.remove(c)
@@ -244,7 +321,7 @@ def transcribe_one(cfg, mp3_path, model, log):
         except Exception:
             pass
     else:
-        segs = asr_segments(model, mp3_path, cfg)
+        segs = asr_segments(model, mp3_path, cfg, log=log)
 
     segs = dedup_merge([s for s in segs if is_meaningful(s[2]) and not is_junk(s[2])])
     if not segs:

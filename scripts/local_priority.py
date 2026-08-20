@@ -101,13 +101,24 @@ def parse_entry(dirpath):
     return None
 
 
+def _real_live_date(k, v):
+    """从 key 或字段里还原真实直播日期。LOCAL-YYYYMMDD 占位被故意把 date 推高一天，
+    因此真实日期应从 key 解析；BV 条目的 date/live_date 为真实直播日期。"""
+    m = re.match(r'^LOCAL-(\d{8})', k)
+    if m:
+        y = m.group(1)
+        return '%s-%s-%s' % (y[:4], y[4:6], y[6:])
+    return v.get('live_date') or v.get('date')
+
+
 def already_done(st, live_date, clean_title):
     ymd = live_date.strftime('%Y%m%d')
     cn_date = live_date.strftime('%Y年%m月%d日')
     if ('LOCAL-%s' % ymd) in st.get('processed', {}):
         return True, 'LOCAL-%s 占位已存在' % ymd
     for k, v in st.get('processed', {}).items():
-        if v.get('date') == live_date.isoformat():
+        # 注意：LOCAL-YYYYMMDD 占位里的 date 被推高一天，不能用它做同日期判定
+        if _real_live_date(k, v) == live_date.isoformat():
             return True, 'state 已有同日期条目 %s' % k
         if cn_date in (v.get('title') or ''):
             return True, 'state 已有同直播日期条目 %s' % k
@@ -173,6 +184,7 @@ def summarize_local_one(cfg, st, entry, log, progress):
         'stages': ['transcribe', 'summarize', 'cleanup'],
         'title': '%s %s%d点场' % (clean_title, cn_date, hour),
         'date': next_day,
+        'live_date': date_iso,
         'stem': stem,
         'doc': S.doc_path_for(cfg, live_date),
         'local': True,

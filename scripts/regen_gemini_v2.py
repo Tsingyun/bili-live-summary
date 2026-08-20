@@ -171,9 +171,9 @@ class GeminiRotator:
                 self._advance(); tried += 1; continue
             elif r.status_code in (500, 503, 504):
                 last_err = f'{model} HTTP {r.status_code}'
-                self.log(f'  [Gemini] {last_err}，退避重试')
-                time.sleep(min(8 * (tried + 1), 120))
-                continue
+                self.log(f'  [Gemini] {last_err}，切换下一模型')
+                time.sleep(min(8 * (tried + 1), 60))
+                self._advance(); tried += 1; continue
             else:
                 last_err = f'{model} HTTP {r.status_code}: {r.text[:200]}'
                 self.log(f'  [Gemini] {last_err}')
