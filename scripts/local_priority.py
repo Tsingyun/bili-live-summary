@@ -38,6 +38,7 @@ import summarize_gemini as S
 import hotwords
 import transcribe as T
 import reorder_doc as RD
+import mp3_export
 from common import load_config, Logger, load_state, save_state
 
 WORK = R.WORK
@@ -198,6 +199,9 @@ def summarize_local_one(cfg, st, entry, log, progress):
     st['runs'] = st['runs'][-60:]
     save_state(cfg, st)
     log('已写 state 占位 LOCAL-%s（date=%s），自动化将跳过此场' % (ymd, next_day))
+
+    # --- 总结后导出中质量 MP3 归档（按 config.mp3_export；与 16k 临时 MP3 无关）---
+    mp3_export.export_for_local(cfg, log, src)
 
     try:
         if os.path.exists(mp3_path):
