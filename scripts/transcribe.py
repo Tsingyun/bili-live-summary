@@ -240,7 +240,8 @@ def split_audio(ffmpeg, src, work_dir, chunk_sec, log):
     subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-i', src,
                     '-f', 'segment', '-segment_time', str(int(chunk_sec)),
                     '-ac', '1', '-ar', '16000', pattern],
-                   capture_output=True, text=True, timeout=7200)
+                   capture_output=True, text=True, encoding='utf-8',
+                   errors='replace', timeout=7200)
     chunks = sorted(glob.glob(os.path.join(work_dir, 'chunk_*.wav')))
     log(f'  切分为 {len(chunks)} 块，每块 {chunk_sec // 60} 分钟')
     return chunks

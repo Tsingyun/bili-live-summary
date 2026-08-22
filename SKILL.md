@@ -110,6 +110,18 @@ gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash → gemini-3-flash �
 
 踩过的坑（2026-08-16）：曾因本地脚本启动命令语法错误（`cd /d` 在 Git Bash 失效）导致脚本没跑、占位没写，次日自动化照常抓了 B站 8/15，多花约 10 次 Gemini 调用。根因：**「本地脚本写入 state 占位」才是自动化跳过某场的唯一有效开关**；占位没写，自动化只能按默认逻辑抓取。故务必保证本地优先步骤真实执行成功（看日志确认 `LOCAL-*` 占位已写入）后再依赖自动化。
 
+### 同日期多段连续录播 → 先合并再总结（2026-08-22 新增规则）
+网络波动会导致录播器断流重连，于是**同一日期目录下出现多个录播文件**。规则：
+- `local_priority.py` 扫描每个日期目录，按文件名时间(`HHMMSS`)排序，用 ffprobe 取每段时长算出结束时间。
+- **相邻两段「前段结束 ≈ 后段开始」且间隙 ≤ `local_merge.max_gap_sec`（默认 600s）、且能取到时长** → 视为同一场（网络断开重连），并入同一 chain。
+- 间隙过大、或某段取不到时长 → 视为**独立场次**，各自成 chain、各自总结（同日期多场用编号占位 `LOCAL-YYYYMMDD-2`、`-3`… 区分）。
+- 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；同 recorder 编码一致时直接命中。编码不一致导致失败时回退 `concat filter` 重编码兜底。
+- 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
+- 合并后整场走原「抽 16k 音频 → FunASR 转写 → 热词 → 30min 切块总结 → 写 Word → 导出归档 MP3」流程；归档 MP3 文件名带 `_merged` 后缀，与源命名规则一致（剥 `录制-25788785-` 前缀）。
+- 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限) / `keep_merged`(是否保留合并视频)。
+- **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
+- 复用：因合并视频已留档（`keep_merged=true`），重跑不会重复合并；已写占位(`LOCAL-*`)的场次仍会被跳过。
+
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |
 |---|---|

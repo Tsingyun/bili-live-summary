@@ -39,7 +39,7 @@ import hotwords
 import transcribe as T
 import reorder_doc as RD
 import mp3_export
-from common import load_config, Logger, load_state, save_state
+from common import load_config, Logger, load_state, save_state, probe_duration
 
 WORK = R.WORK
 # 本地录播根目录（用户提供的本地 mp4/flv 放这里，按 YYYY-MM-DD 分子目录）
@@ -81,24 +81,190 @@ def wait_network(log, cfg, timeout=900):
     return False
 
 
-def parse_entry(dirpath):
-    """解析一个本地日期目录，返回 (live_date, clean_title, hour, src_path) 或 None"""
-    d = os.path.basename(dirpath.rstrip('/\\'))
+def scan_sessions(cfg, log, root=LOCAL_ROOT):
+    """扫描本地录播根目录，把每个日期目录下的文件按「时间连续」分组为若干 session。
+
+    连续判定：按文件名里的时间(HHMMSS)排序，相邻两段若「前一段结束时间 ≈ 后一段开始时间」
+    （间隙 <= max_gap_sec，且能取到时长）则视为同一场（网络波动断开重连），归入同一 chain。
+    间隙过大或取不到时长 → 视为独立场次，各自成 chain。
+
+    返回 list[dict]，每个 session 含：
+      live_date, clean_title, hour, member_files, is_merged, chain_index, merged_src(=None)
+    """
+    sessions = []
+    if not os.path.isdir(root):
+        return sessions
+    mc = cfg.get('local_merge') or {}
+    if not mc.get('enabled', True):
+        log('[merge] local_merge 未启用，按「每目录仅首个文件」旧逻辑处理', 'WARN')
+        for d in sorted(os.listdir(root)):
+            dp = os.path.join(root, d)
+            if not os.path.isdir(dp):
+                continue
+            e = _parse_first(d)
+            if e:
+                ld, title, hour, src = e
+                sessions.append(_mk_session(ld, title, hour, [src], 0))
+        return sessions
+
+    max_gap = int(mc.get('max_gap_sec', 600))
+    ffprobe = cfg['paths']['ffprobe']
+    for d in sorted(os.listdir(root)):
+        dp = os.path.join(root, d)
+        if not os.path.isdir(dp):
+            continue
+        m = DIR_RE.match(d)
+        if not m:
+            continue
+        live_date = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        files = []
+        for fn in sorted(os.listdir(dp)):
+            if not fn.lower().endswith(('.mp4', '.flv', '.mkv', '.mov')):
+                continue
+            mm = NAME_RE.match(fn)
+            if not mm:
+                continue
+            hh, mi, ss = int(mm.group(3)[0:2]), int(mm.group(3)[2:4]), int(mm.group(3)[4:6])
+            start = datetime.datetime(live_date.year, live_date.month, live_date.day, hh, mi, ss)
+            files.append({'path': os.path.join(dp, fn), 'start': start,
+                          'title': mm.group(5).strip(), 'hour': hh})
+        if not files:
+            continue
+        dur = {f['path']: probe_duration(ffprobe, f['path']) for f in files}
+        files.sort(key=lambda x: x['start'])
+        # 时长缺失 → 保守地每段独立，避免误合并
+        if any(dur.get(f['path'], 0) <= 0 for f in files):
+            log('[merge] %s 有文件取不到时长，按独立场次处理（不合并）' % d, 'WARN')
+            chains = [[f] for f in files]
+        else:
+            chains, cur = [], [files[0]]
+            for nxt in files[1:]:
+                prev = cur[-1]
+                prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
+                gap = (nxt['start'] - prev_end).total_seconds()
+                if 0 <= gap <= max_gap:
+                    cur.append(nxt)
+                else:
+                    chains.append(cur)
+                    cur = [nxt]
+            chains.append(cur)
+        for idx, chain in enumerate(chains):
+            first = chain[0]
+            sessions.append(_mk_session(live_date, first['title'], first['hour'],
+                                        [f['path'] for f in chain], idx))
+    return sessions
+
+
+def _parse_first(d):
+    """降级模式：取目录里按名排序的第一个媒体文件（保持旧行为）。"""
+    dp = os.path.join(LOCAL_ROOT, d)
     m = DIR_RE.match(d)
     if not m:
         return None
     live_date = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    for fn in sorted(os.listdir(dirpath)):
+    for fn in sorted(os.listdir(dp)):
         if fn.lower().endswith(('.mp4', '.flv', '.mkv', '.mov')):
-            src = os.path.join(dirpath, fn)
+            src = os.path.join(dp, fn)
             mm = NAME_RE.match(fn)
             if mm:
-                hour = int(mm.group(3)[:2])
-                clean_title = mm.group(5).strip()
+                hour = int(mm.group(3)[:2]); clean_title = mm.group(5).strip()
             else:
-                clean_title = re.sub(r'\.\w+$', '', fn).strip()
-                hour = 20
+                clean_title = re.sub(r'\.\w+$', '', fn).strip(); hour = 20
             return (live_date, clean_title, hour, src)
+    return None
+
+
+def _mk_session(live_date, title, hour, member_files, chain_index):
+    return {
+        'live_date': live_date,
+        'clean_title': title,
+        'hour': hour,
+        'member_files': member_files,
+        'is_merged': len(member_files) > 1,
+        'chain_index': chain_index,
+        'merged_src': None,
+    }
+
+
+def session_key(live_date, chain_index):
+    ymd = live_date.strftime('%Y%m%d')
+    return 'LOCAL-%s' % ymd if chain_index == 0 else 'LOCAL-%s-%d' % (ymd, chain_index + 1)
+
+
+def session_fname(session):
+    ld = session['live_date']
+    ymd = ld.strftime('%Y%m%d')
+    cn = ld.strftime('%Y年%m月%d日')
+    suffix = '' if session['chain_index'] == 0 else '（第%d场）' % (session['chain_index'] + 1)
+    stem = '%s-%s %s%d点场%s' % (ymd, session['clean_title'], cn, session['hour'], suffix)
+    return stem + '.txt'
+
+
+def prepare_session(cfg, log, session):
+    """为 session 准备好可用于转写的单一视频源（merged_src）。
+    单文件：直接指向原文件；多文件连续：合并到 merged 工作目录（幂等）。"""
+    if not session['is_merged']:
+        session['merged_src'] = session['member_files'][0]
+        return session['merged_src']
+    merged_dir = os.path.join(cfg['_dirs']['root'], 'merged')
+    os.makedirs(merged_dir, exist_ok=True)
+    first_base = re.sub(r'\.\w+$', '', os.path.basename(session['member_files'][0]))
+    out_path = os.path.join(merged_dir, first_base + '_merged.mp4')
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 1024:
+        log('[merge] 合并视频已存在，跳过重新合并：%s' % os.path.basename(out_path))
+        session['merged_src'] = out_path
+        return out_path
+    log('[merge] 合并 %d 段连续录播为单一时间线：%s'
+        % (len(session['member_files']),
+           ', '.join(os.path.basename(p) for p in session['member_files'])))
+    t0 = time.time()
+    res = merge_videos(cfg, log, session, out_path)
+    if not res:
+        return None
+    log('[merge] 合并完成（%.0fs）：%s' % (time.time() - t0, os.path.basename(out_path)))
+    session['merged_src'] = res
+    return res
+
+
+def merge_videos(cfg, log, session, out_path):
+    """把多段连续录播合并为一个视频。优先 concat demuxer（极快、不重编码）；
+    若容器/编码不一致导致失败，回退到 concat filter 重编码（慢但稳）。"""
+    ffmpeg = cfg['paths']['ffmpeg']
+    ffprobe = cfg['paths']['ffprobe']
+    list_path = out_path + '.list.txt'
+    try:
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for p in session['member_files']:
+                f.write("file '%s'\n" % p.replace("'", "'\\''"))
+        subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-f', 'concat', '-safe', '0', '-i', list_path,
+                        '-c', 'copy', out_path], check=True)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 and (probe_duration(ffprobe, out_path) or 0) > 0:
+            return out_path
+    except Exception as e:
+        log('[merge] concat demuxer 失败（%s），尝试重编码合并' % e, 'WARN')
+    finally:
+        try:
+            os.remove(list_path)
+        except Exception:
+            pass
+    # 回退：重编码合并（同 recorder 通常命中上面的快路径，这里兜底）
+    try:
+        n = len(session['member_files'])
+        ins = []
+        for p in session['member_files']:
+            ins += ['-i', p]
+        vmap = ''.join('[%d:v]' % i for i in range(n))
+        amap = ''.join('[%d:a]' % i for i in range(n))
+        fc = "%s%sconcat=n=%d:v=1:a=1[v][a]" % (vmap, amap, n)
+        subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + ins +
+                       ['-filter_complex', fc, '-map', '[v]', '-map', '[a]',
+                        '-c:v', 'libx264', '-preset', 'veryfast',
+                        '-c:a', 'aac', '-b:a', '192k', out_path], check=True)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 and (probe_duration(ffprobe, out_path) or 0) > 0:
+            return out_path
+    except Exception as e2:
+        log.error('[merge] 重编码合并也失败：%s' % e2)
     return None
 
 
@@ -112,23 +278,15 @@ def _real_live_date(k, v):
     return v.get('live_date') or v.get('date')
 
 
-def already_done(st, live_date, clean_title):
-    ymd = live_date.strftime('%Y%m%d')
-    cn_date = live_date.strftime('%Y年%m月%d日')
-    if ('LOCAL-%s' % ymd) in st.get('processed', {}):
-        return True, 'LOCAL-%s 占位已存在' % ymd
-    for k, v in st.get('processed', {}).items():
-        # 注意：LOCAL-YYYYMMDD 占位里的 date 被推高一天，不能用它做同日期判定
-        if _real_live_date(k, v) == live_date.isoformat():
-            return True, 'state 已有同日期条目 %s' % k
-        if cn_date in (v.get('title') or ''):
-            return True, 'state 已有同直播日期条目 %s' % k
-    # 本地 TXT 已存在（可能正被其它脚本处理，避免重复转写）
+def already_done(st, session):
+    key = session_key(session['live_date'], session['chain_index'])
+    if key in st.get('processed', {}):
+        return True, '%s 占位已存在' % key
+    # 精确 TXT 命中（仅本 session 的 fname），避免误吞同一日期的其它场次
+    fname = session_fname(session)
     txt_dir = st.get('_dirs', {}).get('txt') or os.path.join(WORK, 'TXT')
-    if os.path.isdir(txt_dir):
-        for fn in os.listdir(txt_dir):
-            if fn.startswith(ymd + '-') and fn.endswith('.txt'):
-                return True, '本地 TXT 已存在（可能正在处理）'
+    if os.path.isdir(txt_dir) and os.path.exists(os.path.join(txt_dir, fname)):
+        return True, '本场 TXT 已存在（可能已处理/并行处理）'
     return False, ''
 
 
@@ -144,13 +302,19 @@ def extract_audio(cfg, log, src, mp3_path):
     log('  音频抽取完成（%.0fs）' % (time.time() - t0))
 
 
-def summarize_local_one(cfg, st, entry, log, progress):
-    live_date, clean_title, hour, src = entry
+def summarize_local_one(cfg, st, session, log, progress):
+    live_date = session['live_date']
+    clean_title = session['clean_title']
+    hour = session['hour']
     ymd = live_date.strftime('%Y%m%d')
     cn_date = live_date.strftime('%Y年%m月%d日')
-    stem = '%s-%s %s%d点场' % (ymd, clean_title, cn_date, hour)
-    fname = stem + '.txt'
+    fname = session_fname(session)
+    stem = fname[:-4]  # 去掉 .txt
     date_iso = live_date.isoformat()
+    src = session['merged_src']
+    if not src or not os.path.exists(src):
+        log.error('session 缺少可用的合并源文件，跳过')
+        return False
     mp3_path = os.path.join(cfg['_dirs']['mp3'], stem + '.mp3')
     txt_path = os.path.join(cfg['_dirs']['txt'], fname)
     srt_path = os.path.join(cfg['_dirs']['srt'], fname.replace('.txt', '.srt'))
@@ -181,7 +345,10 @@ def summarize_local_one(cfg, st, entry, log, progress):
 
     # date 推高一天：确保 baseline_ld > live_date，挡住 B站日后上传同场
     next_day = (live_date + datetime.timedelta(days=1)).isoformat()
-    st['processed']['LOCAL-%s' % ymd] = {
+    key = session_key(live_date, session['chain_index'])
+    n_parts = len(session['member_files'])
+    merge_note = '合并 %d 段连续录播后' % n_parts if session['is_merged'] else ''
+    st['processed'][key] = {
         'stages': ['transcribe', 'summarize', 'cleanup'],
         'title': '%s %s%d点场' % (clean_title, cn_date, hour),
         'date': next_day,
@@ -189,7 +356,11 @@ def summarize_local_one(cfg, st, entry, log, progress):
         'stem': stem,
         'doc': S.doc_path_for(cfg, live_date),
         'local': True,
-        'note': '本地录播优先扫描自动处理（%s），已写占位使自动化跳过' % os.path.basename(src),
+        'merged': session['is_merged'],
+        'parts': n_parts,
+        'members': [os.path.basename(p) for p in session['member_files']],
+        'note': '本地录播优先扫描自动处理（%s%s），已写占位使自动化跳过'
+                % (merge_note, os.path.basename(src)),
     }
     st.setdefault('runs', []).append({
         'at': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -198,7 +369,7 @@ def summarize_local_one(cfg, st, entry, log, progress):
     })
     st['runs'] = st['runs'][-60:]
     save_state(cfg, st)
-    log('已写 state 占位 LOCAL-%s（date=%s），自动化将跳过此场' % (ymd, next_day))
+    log('已写 state 占位 %s（date=%s），自动化将跳过此场' % (key, next_day))
 
     # --- 总结后导出中质量 MP3 归档（按 config.mp3_export；与 16k 临时 MP3 无关）---
     mp3_export.export_for_local(cfg, log, src)
@@ -208,6 +379,14 @@ def summarize_local_one(cfg, st, entry, log, progress):
             os.remove(mp3_path)
     except Exception:
         pass
+    # 合并产出的中间视频：按配置决定是否保留
+    mc = cfg.get('local_merge') or {}
+    if not mc.get('keep_merged', True) and session['is_merged'] and src and os.path.exists(src):
+        try:
+            os.remove(src)
+            log('[merge] 已删除中间合并视频（keep_merged=false）')
+        except Exception:
+            pass
     try:
         RD.reorder()
     except Exception as e:
@@ -273,44 +452,42 @@ def main():
             sys.exit(3)
         st = load_state(cfg)
 
-        entries = []
-        if os.path.isdir(LOCAL_ROOT):
-            for d in sorted(os.listdir(LOCAL_ROOT)):
-                dp = os.path.join(LOCAL_ROOT, d)
-                if not os.path.isdir(dp):
-                    continue
-                e = parse_entry(dp)
-                if not e:
-                    continue
-                entries.append(e)
+        sessions = scan_sessions(cfg, log, LOCAL_ROOT)
 
         to_process, skipped = [], []
-        for e in entries:
-            live_date, clean_title, hour, src = e
-            done, reason = already_done(st, live_date, clean_title)
+        for s in sessions:
+            done, reason = already_done(st, s)
             if done:
-                skipped.append((e, reason))
+                skipped.append((s, reason))
             else:
-                to_process.append(e)
+                to_process.append(s)
 
-        log('本地优先扫描：发现 %d 个本地场次，将处理 %d，跳过 %d'
-            % (len(entries), len(to_process), len(skipped)))
-        for e in skipped:
-            log('  跳过 %s：%s' % (e[0][0].isoformat(), e[1]))
-        for e in to_process:
-            log('  将处理 %s %s (%s)' % (e[0].isoformat(), e[1], os.path.basename(e[3])))
+        log('本地优先扫描：发现 %d 个待处理会话（来自本地录播目录），将处理 %d，跳过 %d'
+            % (len(sessions), len(to_process), len(skipped)))
+        for s in skipped:
+            log('  跳过 %s：%s' % (s[0]['live_date'].isoformat(), s[1]))
+        for s in to_process:
+            parts = len(s['member_files'])
+            tag = ('合并 %d 段连续录播' % parts) if s['is_merged'] else '单文件'
+            log('  将处理 %s %s [%s] (%s)'
+                % (s['live_date'].isoformat(), s['clean_title'], tag,
+                   ', '.join(os.path.basename(p) for p in s['member_files'])))
 
         if args.dry_run:
             log('dry-run，未实际处理。')
             return
 
         progress = {}
-        for e in to_process:
+        for s in to_process:
             touch()
+            src = prepare_session(cfg, log, s)
+            if not src:
+                log.error('准备源文件失败，跳过：%s' % s['live_date'].isoformat())
+                continue
             try:
-                summarize_local_one(cfg, st, e, log, progress)
+                summarize_local_one(cfg, st, s, log, progress)
             except Exception as ex:
-                log.error('处理 %s 失败：%s' % (e[0].isoformat(), ex))
+                log.error('处理 %s 失败：%s' % (s['live_date'].isoformat(), ex))
             time.sleep(int(cfg.get('summarize', {}).get('inter_video_delay_sec', 15)))
         log('本地优先扫描完成')
     finally:

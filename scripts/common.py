@@ -257,7 +257,8 @@ def probe_duration(ffprobe, path):
     try:
         r = subprocess.run([ffprobe, '-v', 'error', '-show_entries', 'format=duration',
                             '-of', 'default=noprint_wrappers=1:nokey=1', path],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, encoding='utf-8',
+                           errors='replace', timeout=120)
         return float(r.stdout.strip())
     except Exception:
         return 0.0
