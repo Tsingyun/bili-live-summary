@@ -26,6 +26,7 @@ import requests
 from docx import Document
 from docx.enum.text import WD_BREAK
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 
 from common import load_config, Logger, hms, parse_hms, live_date
@@ -448,10 +449,68 @@ def clean_block(text):
     return '\n'.join(out)
 
 
-def append_section(doc, heading, meta_lines, blocks, font, first_in_doc, overview=''):
-    """把一场直播的总结追加进文档。overview 为标题正下方的内容概要（可选）。
+def add_horizontal_rule(doc, color='BFBFBF', sz=6):
+    """在文档中插入一条横向分隔线，用于话题块之间的视觉分隔。"""
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(2)
+    p.paragraph_format.space_after = Pt(2)
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), str(sz))
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), color)
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+    return p
+
+
+TOPIC_SEG_SYSTEM = (
+    '你是一名直播内容编辑助手。下面是一段直播总结文本（按时间顺序，含 [HH:MM:SS] 时间标注）。\n'
+    '请识别其中的「话题边界」——即当主播从一个明显不同的话题切换到另一个话题时'
+    '（例如：从吃饭聊到打游戏、从游戏聊到看电影、从闲聊切换到读信/互动环节等）。\n'
+    '严格遵守以下规则：\n'
+    '1. 在每一处话题边界处，单独插入一行，该行内容仅为一个标记「§SEP§」（前后不要有任何其它字符）。\n'
+    '2. 绝对不要改写、删减、合并、重新组织或总结原文；你的唯一任务是插入分隔标记。\n'
+    '3. 同一个话题内部的自然小分段（如同一话题下的不同小点）不要插入分隔。\n'
+    '4. 若全文只围绕一个话题，则不要插入任何标记。\n'
+    '5. 输出纯文本，逐行保留原文所有行（含 [HH:MM:SS] 行与「」金句行），不要使用 markdown。'
+)
+
+
+def segment_topics_with(combined_text, call_fn, log):
+    """调用模型在话题边界插入 §SEP§ 标记，返回按标记切分后的话题块列表。
+    任何异常、无返回、或模型改动/丢失了原文行，都安全退回为单一块（不丢内容、不加横线）。"""
+    if not combined_text.strip():
+        return [combined_text]
+    try:
+        text = call_fn(TOPIC_SEG_SYSTEM, combined_text)
+    except Exception as e:
+        log.error('  话题分隔模型调用异常，退回单块：%s' % e)
+        return [combined_text]
+    if not text:
+        log.error('  话题分隔模型无返回，退回单块（不影响内容）')
+        return [combined_text]
+    # 安全网：模型不得改动原文行；任意非标记行不在原文集合中则退回
+    orig_lines = set(l.strip() for l in combined_text.split('\n') if l.strip())
+    model_lines = set(l.strip() for l in text.split('\n')
+                      if l.strip() and l.strip() != '§SEP§')
+    if not model_lines.issubset(orig_lines):
+        log.error('  话题分隔模型改动了原文行，退回单块（不影响内容）')
+        return [combined_text]
+    segs = [s.strip('\n') for s in text.split('§SEP§')]
+    segs = [s for s in segs if s.strip()]
+    if len(segs) < 2:
+        return [combined_text]
+    return segs
+
+
+def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overview='', topic_sep=True):
+    """把一场直播的总结追加进文档。segments 为话题块列表（每个元素是含多行的字符串）；
+    开启 topic_sep 时，在相邻话题块之间插入一条横向分隔线。
     金句（引号行）按提示词要求：每段总结可附带 1–2 句，超出该段 2 句上限的后续金句行丢弃。"""
-    para_quote = 0  # 每段金句计数，遇新的总结段重置
+    para_quote = 0  # 每段金句计数，遇到新的总结段重置
     if not first_in_doc:
         doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
@@ -479,8 +538,11 @@ def append_section(doc, heading, meta_lines, blocks, font, first_in_doc, overvie
         r.font.size = Pt(9)
         r.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
 
-    for text in blocks:
-        for line in text.strip().split('\n'):
+    for si, seg in enumerate(segments):
+        if si > 0 and topic_sep:
+            add_horizontal_rule(doc)
+            para_quote = 0  # 新话题块 → 金句计数重置
+        for line in seg.strip().split('\n'):
             line = line.strip()
             if not line:
                 continue
@@ -594,8 +656,17 @@ def summarize_one(cfg, txt_path, log, date_str=None, title=None, bvid=None, url=
         if bvid:
             meta.append(f'来源 {url or "https://www.bilibili.com/video/" + bvid}')
 
+        # 话题分隔：合并全部块 → 调模型在话题边界插入横线
+        sep_cfg = cfg.get('topic_separator', {}) or {}
+        if sep_cfg.get('enabled', True):
+            combined = '\n'.join(blocks)
+            segs = segment_topics_with(combined, lambda s, u: call_model(cfg, s, u, log)[0], log)
+            log(f'  话题分隔完成：{len(segs)} 个话题块')
+        else:
+            segs = blocks
         first = created and len([p for p in doc.paragraphs if p.text.strip()]) == 0
-        append_section(doc, heading, meta, blocks, font, first, overview)
+        append_section(doc, heading, meta, segs, font, first, overview,
+                       topic_sep=sep_cfg.get('enabled', True))
         os.makedirs(os.path.dirname(docx_path), exist_ok=True)
         doc.save(docx_path)
         log(f'  已{"创建" if created else "追加至"}文档：{docx_path}')

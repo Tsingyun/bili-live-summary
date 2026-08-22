@@ -288,13 +288,23 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
                     log.error('  概要生成失败，跳过概要（不影响正文）')
         overview = sess.get('overview', '')
 
+        # 话题分隔：合并全部块 → 调模型在话题边界插入横线
+        sep_cfg = cfg.get('topic_separator', {}) or {}
+        if sep_cfg.get('enabled', True):
+            combined = '\n'.join(all_blocks)
+            segs = S.segment_topics_with(combined, lambda s, u: rot.call(s, u, tag='[话题分隔]'), log)
+            log(f'  话题分隔完成：{len(segs)} 个话题块')
+        else:
+            segs = all_blocks
+
         chunk_sec = int(cfg['summarize'].get('chunk_minutes', 30)) * 60
         dur = S.hms(chunks[-1][0] + chunk_sec)
         meta = [f'直播日期 {d:%Y-%m-%d}  |  时长 {dur}  |  {len(all_blocks)}/{total} 段  |  总结于 {datetime.datetime.now():%Y-%m-%d %H:%M}']
         if src_path:
             meta.append(f'来源 {src_path}')
         first = created and len([p for p in doc.paragraphs if p.text.strip()]) == 0
-        S.append_section(doc, heading, meta, all_blocks, font, first, overview)
+        S.append_section(doc, heading, meta, segs, font, first, overview,
+                         topic_sep=sep_cfg.get('enabled', True))
         os.makedirs(os.path.dirname(docx_path), exist_ok=True)
         doc.save(docx_path)
         log(f'  ✅ 已保存：{docx_path}（{len(all_blocks)} 块）')

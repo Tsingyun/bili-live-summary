@@ -70,5 +70,9 @@
     "max_gap_sec": 600,
     "keep_merged": true,
     "exclude_dates": []
+  },
+  "topic_separator": {
+    "_comment": "一场直播总结成一整段不易阅读，在话题转折/结束处插入横向分隔线。判定：合并全部分块总结后，调模型在话题边界插入 §SEP§ 标记再切分，每个话题块之间写一条横线。enabled=false 可关闭（退回不分段）。",
+    "enabled": true
   }
 }
