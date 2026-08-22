@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from common import load_config, Logger, hms, probe_duration
+from common import load_config, Logger, hms, probe_duration, clean_segment_boundaries
 
 # SenseVoice 富文本标签：<|zh|><|NEUTRAL|><|Speech|><|woitn|> 等
 TAG_RE = re.compile(r'<\|([^|]*)\|>')
@@ -325,6 +325,8 @@ def transcribe_one(cfg, mp3_path, model, log):
         segs = asr_segments(model, mp3_path, cfg, log=log)
 
     segs = dedup_merge([s for s in segs if is_meaningful(s[2]) and not is_junk(s[2])])
+    # 清洗冗余双标点（FunASR 分段兜底会在句末/句内叠出 "。，" 等），从源头杜绝
+    segs = clean_segment_boundaries(segs)
     if not segs:
         log.error(f'  转写结果为空：{stem}')
         return None

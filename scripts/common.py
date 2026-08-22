@@ -262,3 +262,39 @@ def probe_duration(ffprobe, path):
         return float(r.stdout.strip())
     except Exception:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 标点清洗：清理转写/总结里常见的冗余双标点（FunASR 分段兜底导致句末标点与
+# 句内连接标点叠在一起，如 "。，" "？，" "，。" "。？"）。纯纠错，不改语义。
+# ---------------------------------------------------------------------------
+_PUNCT_TERMINAL = "。！？"          # 句末终结标点
+_PUNCT_CONNECTOR = "，、；："        # 句内连接/停顿标点
+_RE_TERMINAL_CONN = re.compile(r'([。！？])[，、；：]+')   # 句末 + 连接 → 句末
+_RE_CONN_TERMINAL = re.compile(r'[，、；：]+([。！？])')   # 连接 + 句末 → 句末
+_RE_DOTS = re.compile(r'。{2,}')                        # 多句号折叠
+
+
+def clean_punctuation(text):
+    """清理相邻/冗余的中文标点组合，不改变语义。
+    例：'。，'→'。'  '？，'→'？'  '，。'→'。'  '。？'→'？'  '。。'→'。'"""
+    if not text:
+        return text
+    text = _RE_TERMINAL_CONN.sub(r'\1', text)
+    text = _RE_CONN_TERMINAL.sub(r'\1', text)
+    text = _RE_DOTS.sub('。', text)
+    text = text.replace('。？', '？').replace('？。', '？')
+    return text
+
+
+def clean_segment_boundaries(segs):
+    """转写分段拼接处的标点衔接修复：上句以句末标点结尾、下句以连接标点开头时，
+    去掉下句开头的连接标点（这种情况本应是同一句的延续，段切分误加了句号）。"""
+    out = []
+    for st, en, t in segs:
+        t = clean_punctuation(t)
+        if out and out[-1][2] and out[-1][2][-1:] in _PUNCT_TERMINAL \
+                and t and t[0] in _PUNCT_CONNECTOR:
+            t = t.lstrip(_PUNCT_CONNECTOR)
+        out.append((st, en, t))
+    return out
