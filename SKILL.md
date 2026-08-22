@@ -62,6 +62,7 @@ python SKILL_DIR/scripts/run_pipeline.py --dry-run
 - **paths**：project_root / python / ffmpeg / ffprobe / aria2c / cookies
 - **transcribe / cleanup**：推理参数与产物清理
 - **hotwords**：转写后自动纠正。`enabled:true` 时解析 `path`（默认 `SKILL_DIR/scripts/hotwords.md`）里的替换表，对 TXT/SRT 各做一遍替换再送 AI；`enabled:false` 关闭；`path` 可指向自定义替换表
+- **标点清洗（冗余双标点）**：FunASR 的 VAD 分段兜底会在转写里叠出 `。，` `？，` `，。` `。？` 这类"句末终结符+句内连接符相邻"的冗余双标点。脚本在**写出 TXT/SRT 前**（`clean_segment_boundaries`）与**写 Word 前**（`clean_punctuation`，覆盖每块总结与概要）两处自动清洗——纯纠错不改语义，无需手动干预。若日后发现新双标点模式，改 `common.py` 的 `_RE_TERMINAL_CONN / _RE_CONN_TERMINAL` 即可。
 
 ## 大模型调用约定（首选 Google / Gemini）
 
