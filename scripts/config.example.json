@@ -68,6 +68,7 @@
     "_comment": "同日期目录下多个录播文件若时间连续（网络波动断开重连），先合并成单一时间线再总结。判定：按文件名时间排序，相邻段间隙<=max_gap_sec 且能取到时长则并入同一场；否则各自总结。keep_merged=false 则在总结完成后删除中间合并视频。",
     "enabled": true,
     "max_gap_sec": 600,
-    "keep_merged": true
+    "keep_merged": true,
+    "exclude_dates": []
   }
 }

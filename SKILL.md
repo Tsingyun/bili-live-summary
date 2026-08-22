@@ -118,8 +118,9 @@ gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash → gemini-3-flash �
 - 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；同 recorder 编码一致时直接命中。编码不一致导致失败时回退 `concat filter` 重编码兜底。
 - 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
 - 合并后整场走原「抽 16k 音频 → FunASR 转写 → 热词 → 30min 切块总结 → 写 Word → 导出归档 MP3」流程；归档 MP3 文件名带 `_merged` 后缀，与源命名规则一致（剥 `录制-25788785-` 前缀）。
-- 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限) / `keep_merged`(是否保留合并视频)。
+- 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限) / `keep_merged`(是否保留合并视频) / `exclude_dates`(日期列表，**显式强制不合并**，优先级高于 `max_gap_sec`，用于用户确认是「多场独立直播」而非断流重连的日期)。
 - **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
+- ⚠️ **临界风险**：若某日期多文件真实间隙只比 `max_gap_sec` 略大（如 609s vs 600s），ffprobe 时长精度波动可能让间隙跌破阈值而被误合并。对确认是独立多场的日期务必加入 `exclude_dates`（如 `"exclude_dates": ["2026-08-22"]`），不依赖阈值侥幸。
 - 复用：因合并视频已留档（`keep_merged=true`），重跑不会重复合并；已写占位(`LOCAL-*`)的场次仍会被跳过。
 
 ## 「最新录播」的几种判定（latest_mode.mode）

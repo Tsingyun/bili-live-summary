@@ -130,24 +130,30 @@ def scan_sessions(cfg, log, root=LOCAL_ROOT):
                           'title': mm.group(5).strip(), 'hour': hh})
         if not files:
             continue
-        dur = {f['path']: probe_duration(ffprobe, f['path']) for f in files}
-        files.sort(key=lambda x: x['start'])
-        # 时长缺失 → 保守地每段独立，避免误合并
-        if any(dur.get(f['path'], 0) <= 0 for f in files):
-            log('[merge] %s 有文件取不到时长，按独立场次处理（不合并）' % d, 'WARN')
+        excl = set(mc.get('exclude_dates') or [])
+        if live_date.isoformat() in excl:
+            # 显式排除：该日期强制不合并，每段独立成场（用于用户确认是「多场独立直播」的情况）
+            log('[merge] %s 在 exclude_dates 中，强制不合并（每段独立成场）' % live_date.isoformat(), 'WARN')
             chains = [[f] for f in files]
         else:
-            chains, cur = [], [files[0]]
-            for nxt in files[1:]:
-                prev = cur[-1]
-                prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
-                gap = (nxt['start'] - prev_end).total_seconds()
-                if 0 <= gap <= max_gap:
-                    cur.append(nxt)
-                else:
-                    chains.append(cur)
-                    cur = [nxt]
-            chains.append(cur)
+            dur = {f['path']: probe_duration(ffprobe, f['path']) for f in files}
+            files.sort(key=lambda x: x['start'])
+            # 时长缺失 → 保守地每段独立，避免误合并
+            if any(dur.get(f['path'], 0) <= 0 for f in files):
+                log('[merge] %s 有文件取不到时长，按独立场次处理（不合并）' % d, 'WARN')
+                chains = [[f] for f in files]
+            else:
+                chains, cur = [], [files[0]]
+                for nxt in files[1:]:
+                    prev = cur[-1]
+                    prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
+                    gap = (nxt['start'] - prev_end).total_seconds()
+                    if 0 <= gap <= max_gap:
+                        cur.append(nxt)
+                    else:
+                        chains.append(cur)
+                        cur = [nxt]
+                chains.append(cur)
         for idx, chain in enumerate(chains):
             first = chain[0]
             sessions.append(_mk_session(live_date, first['title'], first['hour'],
