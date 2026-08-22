@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from common import load_config, Logger, hms, probe_duration, clean_segment_boundaries
+from common import load_config, Logger, hms, probe_duration, clean_segment_boundaries, normalize_numbers
 
 # SenseVoice 富文本标签：<|zh|><|NEUTRAL|><|Speech|><|woitn|> 等
 TAG_RE = re.compile(r'<\|([^|]*)\|>')
@@ -327,6 +327,9 @@ def transcribe_one(cfg, mp3_path, model, log):
     segs = dedup_merge([s for s in segs if is_meaningful(s[2]) and not is_junk(s[2])])
     # 清洗冗余双标点（FunASR 分段兜底会在句末/句内叠出 "。，" 等），从源头杜绝
     segs = clean_segment_boundaries(segs)
+    # 数字归一：把紧跟规格单位的中国数字转回阿拉伯（三零五零显卡→3050显卡、
+    # 七十五赫兹→75Hz、八G→8G），从源头杜绝专有名词被读成中文
+    segs = [(st, en, normalize_numbers(t)) for st, en, t in segs]
     if not segs:
         log.error(f'  转写结果为空：{stem}')
         return None

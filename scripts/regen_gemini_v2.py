@@ -32,7 +32,7 @@ import requests
 
 # 复用技能库里的 Word 排版 / 文档函数（粗体总结、斜体金句、写锁等）
 import summarize_gemini as S
-from common import load_config, Logger, clean_punctuation
+from common import load_config, Logger, clean_punctuation, normalize_numbers
 
 WORK = r'D:\岁己直播自动总结'
 PROMPT_ORIGINAL = os.path.join(WORK, 'prompt_original.txt')
@@ -265,6 +265,8 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
                 return False
             # 清洗可能由模型生成的冗余双标点（如 "。，"），双保险
             text = clean_punctuation(text)
+            # 数字归一双保险：规格数字若是中文读法也转回阿拉伯（3050显卡/75Hz/8G）
+            text = normalize_numbers(text)
             sess['chunks'][str(i)] = text
             save_progress(progress)
             all_blocks.append(text)
@@ -279,7 +281,7 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
             if summary_only.strip():
                 ov = rot.call(OVERVIEW_SYS, summary_only, tag='[概要]')
                 if ov:
-                    sess['overview'] = clean_punctuation(ov)
+                    sess['overview'] = normalize_numbers(clean_punctuation(ov))
                     save_progress(progress)
                     log(f'  概要生成完成（{len(ov)} 字）')
                 else:

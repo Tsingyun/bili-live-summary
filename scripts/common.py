@@ -298,3 +298,93 @@ def clean_segment_boundaries(segs):
             t = t.lstrip(_PUNCT_CONNECTOR)
         out.append((st, en, t))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 数字归一：FunASR 把规格数字读成中文（"三零五零显卡" "七十五赫兹" "八G内存"），
+# 在转写源头与写 Word 前各做一遍，把这些「紧跟规格单位的中国数字」转回阿拉伯数字。
+# 仅当数字紧邻规格单位（显卡/GPU/Hz/赫兹/G/GB/寸/英寸/K/p/ti 等）才转换，避免把
+# 「三个显卡」「七十五块钱」里的普通计数误转。已是阿拉伯数字的文本不受影响（幂等）。
+# ---------------------------------------------------------------------------
+_CN_DIGIT = {'零': '0', '一': '1', '二': '2', '两': '2', '三': '3', '四': '4',
+             '五': '5', '六': '6', '七': '7', '八': '8', '九': '9'}
+_CN_MULT = set('十百千万亿')
+_NUM_TRIGGERS = [
+    # (原文单位, 归一后单位) —— 长的放前面，避免被短前缀误吞
+    ('赫兹', 'Hz'), ('兆赫', 'MHz'), ('显卡', '显卡'),
+    ('GPU', 'GPU'), ('gpu', 'GPU'), ('Hz', 'Hz'), ('hz', 'Hz'),
+    ('GB', 'GB'), ('gb', 'GB'), ('G', 'G'), ('g', 'G'),
+    ('英寸', '英寸'), ('吋', '寸'), ('寸', '寸'),
+    ('Ti', 'Ti'), ('ti', 'Ti'), ('K', 'K'), ('k', 'K'),
+    ('p', 'p'), ('P', 'p'),
+]
+
+
+def _cn_num_to_str(num):
+    """把一段纯中文数字（含 十百千万）转成阿拉伯数字字符串；无法解析返回 None。"""
+    if not num:
+        return None
+    if all(c in _CN_DIGIT for c in num):
+        # 逐位读法（型号/编号，如 三零五零 → 3050）
+        return ''.join(_CN_DIGIT[c] for c in num)
+    if any(c in _CN_MULT for c in num):
+        # 复合读法（如 七十五 → 75，一百零八 → 108，三千零五十 → 3050）
+        total, cur = 0, 0
+        for ch in num:
+            if ch in _CN_DIGIT:
+                cur = int(_CN_DIGIT[ch])
+            elif ch == '十':
+                cur = cur * 10 if cur else 10
+                total += cur
+                cur = 0
+            elif ch == '百':
+                total += cur * 100
+                cur = 0
+            elif ch == '千':
+                total += cur * 1000
+                cur = 0
+            elif ch == '万':
+                total = (total + cur) * 10000
+                cur = 0
+            else:
+                return None
+        return str(total + cur)
+    return None
+
+
+_NUM_RE = re.compile(r'[零一二两三四五六七八九十百千万亿]+')
+
+
+def normalize_numbers(text):
+    """把紧跟规格单位的中国数字转成阿拉伯数字（如 3050显卡 / 75Hz / 8G）。
+    仅对「数字紧邻规格单位」的情况生效，普通计数（三个/七十五块）不动。幂等。"""
+    if not text:
+        return text
+    out, last = [], 0
+    for m in _NUM_RE.finditer(text):
+        start, end = m.span()
+        num = m.group()
+        rest = text[end:]
+        converted = unit_out = None
+        consumed = 0
+        for unit, repl in _NUM_TRIGGERS:
+            if rest.startswith(unit):
+                converted = _cn_num_to_str(num)
+                unit_out = repl
+                consumed = len(unit)
+                break
+            if rest.startswith(' ') and rest[1:].startswith(unit):
+                converted = _cn_num_to_str(num)
+                unit_out = repl
+                consumed = 1 + len(unit)
+                break
+        out.append(text[last:start])
+        if converted is not None:
+            out.append(str(converted))
+            out.append(unit_out)
+            last = end + consumed
+        else:
+            out.append(num)
+            last = end
+    out.append(text[last:])
+    return ''.join(out)
