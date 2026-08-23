@@ -299,7 +299,7 @@ def transcribe_one(cfg, mp3_path, model, log):
     t0 = time.time()
     log(f'开始转写 {stem}（{hms(dur)}）')
 
-    threshold = cfg['transcribe'].get('chunk_hours_threshold', 4) * 3600
+    threshold = cfg['transcribe'].get('chunk_hours_threshold', 2) * 3600
     if dur > threshold:
         chunk_sec = cfg['transcribe'].get('chunk_minutes', 30) * 60
         work = os.path.join(cfg['_dirs']['tmp'], 'asr_' + stem[:40])

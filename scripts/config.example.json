@@ -56,7 +56,8 @@
     "device": "auto",
     "batch_size_s": 300,
     "ncpu": 4,
-    "chunk_hours_threshold": 4,
+    "_comment": "chunk_hours_threshold: 超过此时长强制按 chunk_minutes 切块后再转写。经验值 2h：FunASR VAD 回退在 3h+ 单文件上出现过只返回前 2h48m 的截断，切 30min 块可彻底规避。",
+    "chunk_hours_threshold": 2,
     "chunk_minutes": 30
   },
   "cleanup": {
