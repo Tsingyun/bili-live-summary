@@ -86,7 +86,14 @@ def apply_to_file(path, cfg, log=None):
     hw = cfg.get('hotwords') or {}
     if not hw.get('enabled', True):
         return False
-    md = hw.get('path') or os.path.join(SCRIPT_DIR, 'hotwords.md')
+    md = hw.get('path') or ''
+    if md and not os.path.isabs(md) and cfg.get('_workdir'):
+        # 相对路径以工作目录为基准解析，便于多主播各自放一份热词表
+        cand = os.path.join(cfg['_workdir'], md)
+        if os.path.exists(cand):
+            md = cand
+    if not md or not os.path.exists(md):
+        md = os.path.join(SCRIPT_DIR, 'hotwords.md')
     rules, protect = load_rules(md)
     if not rules and not protect:
         return False

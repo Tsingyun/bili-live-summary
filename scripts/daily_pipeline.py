@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-daily_pipeline.py —— 岁己（SUI）直播录播 每日主编排（用户 2026-08-24 定义的 5 步流程）
+daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 skill，配置驱动）
 
-每天早上（默认 04:00，由自动化触发一次）跑完整条流水线：
+默认由自动化每天触发一次，跑完整条流水线（具体触发时间由调用方/自动化决定）：
 
-  1. 监测本地录播根目录 `D:\\录播\\25788785-岁己SUI` 下的新录播文件
+  1. 监测本地录播根目录（config.local.root）下的新录播文件
      （通常是 flv 或 mp4，直接放在根目录，不在日期子目录里）。
        · 已处理过（state 占位 / TXT 命中）的跳过；
        · 正在录制中的临时文件（大小不稳定 / 修改时间太新）跳过，避免截半。
   2. 若有新本地文件 → 直接走本地总结流程（FunASR 转写 → 热词 → Gemini 切块总结 → 写 Word）。
-  3. 若没有新本地文件 → 去 B站合集
-     https://space.bilibili.com/1954091502/lists/2609053?type=series
+  3. 若没有新本地文件 → 去 B站合集（config.series：mid + series_id）
      搜索最近未处理的录播，下载并合并多 P 为单个视频，再走总结流程。
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
      （192k / 44.1k，体积不大，音质满足文字识别即可，用户另有他用）。
@@ -49,12 +48,33 @@ import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
 
-WORK = R.WORK
-LOCAL_ROOT = r'D:\录播\25788785-岁己SUI'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 根目录录制文件命名：录制-25788785-20260824-203245-785-标题.flv （也兼容无「录制-」前缀）
-NAME_RE = re.compile(r'^(?:录制-)?(\d+)-(\d{8})-(\d{6})-(\d+)-(.+)\.(mp4|flv|mkv|mov|MP4|FLV|MKV|MOV)$')
+# 默认本地录制文件名正则（录制器命名：录制-UID-YYYYMMDD-HHMMSS-序号-标题.扩展名）。
+# 可用 config.local.name_regex 覆盖；自定义正则必须含命名组 date(YYYYMMDD)、time(HHMMSS)、title。
+DEFAULT_NAME_PATTERN = r'^(?:录制-)?(?P<uid>\d+)-(?P<date>\d{8})-(?P<time>\d{6})-(?P<num>\d+)-(?P<title>.+)\.(?P<ext>mp4|flv|mkv|mov|MP4|FLV|MKV|MOV)$'
+DEFAULT_NAME_RE = re.compile(DEFAULT_NAME_PATTERN)
 MEDIA_EXT = ('.mp4', '.flv', '.mkv', '.mov')
+
+
+def resolve_config_arg(args):
+    """根据 --config / --workdir / 环境变量 / skill 同级 _workdir.json 解析 config.json 路径。"""
+    if getattr(args, 'config', None):
+        return args.config
+    wd = getattr(args, 'workdir', None) or os.environ.get('BILI_WORKDIR')
+    if wd:
+        return os.path.join(wd, 'config.json')
+    ptr = os.path.join(SCRIPT_DIR, '_workdir.json')
+    if os.path.exists(ptr):
+        try:
+            d = json.load(open(ptr, encoding='utf-8'))
+            cand = os.path.join(d['workdir'], 'config.json')
+            if os.path.exists(cand):
+                return cand
+        except Exception:
+            pass
+    raise RuntimeError('无法确定工作目录：请传 --workdir/--config、设 BILI_WORKDIR，'
+                       '或在 skill 目录放 _workdir.json')
 
 
 # ---------------------------------------------------------------------------
@@ -136,26 +156,29 @@ def scan_root_sessions(cfg, log):
     同时过滤：已处理（state 占位 / TXT 命中）、正在录制中（不稳定）的文件。
     """
     sessions = []
-    if not os.path.isdir(LOCAL_ROOT):
+    local_root = (cfg.get('local') or {}).get('root') or ''
+    if not local_root or not os.path.isdir(local_root):
+        log('[monitor] 本地根目录未配置或不存在（config.local.root=%s），跳过本地监测' % local_root, 'WARN')
         return sessions
     mc = cfg.get('local_merge') or {}
     max_gap = int(mc.get('max_gap_sec', 600))
     ffprobe = cfg['paths']['ffprobe']
+    name_re = re.compile((cfg.get('local') or {}).get('name_regex') or DEFAULT_NAME_PATTERN)
 
     files = []
-    for fn in sorted(os.listdir(LOCAL_ROOT)):
-        fp = os.path.join(LOCAL_ROOT, fn)
+    for fn in sorted(os.listdir(local_root)):
+        fp = os.path.join(local_root, fn)
         if not os.path.isfile(fp):
             continue
         if not fn.lower().endswith(MEDIA_EXT):
             continue
-        mm = NAME_RE.match(fn)
+        mm = name_re.match(fn)
         if not mm:
             log('[monitor] 根目录文件 %s 不匹配命名规则，跳过' % fn, 'WARN')
             continue
-        ymd = mm.group(2)
-        hhmmss = mm.group(3)
-        title = mm.group(5).strip()
+        ymd = mm.group('date')
+        hhmmss = mm.group('time')
+        title = mm.group('title').strip()
         y, mo, d = int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8])
         hh, mi, ss = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
         live_date = datetime.date(y, mo, d)
@@ -199,14 +222,14 @@ def scan_root_sessions(cfg, log):
     return sessions
 
 
-def already_done_local(st, session):
+def already_done_local(cfg, st, session):
     key = session_key(session['live_date'], session['chain_index'])
     if key in st.get('processed', {}):
         return True, '%s 占位已存在' % key
     fname = session_fname(session['live_date'], session['clean_title'],
                           session['hour'], session['chain_index'])
-    txt_dir = st.get('_dirs', {}).get('txt') or os.path.join(WORK, 'TXT')
-    if os.path.isdir(txt_dir) and os.path.exists(os.path.join(txt_dir, fname)):
+    txt_dir = cfg['_dirs'].get('txt') or st.get('_dirs', {}).get('txt')
+    if txt_dir and os.path.isdir(txt_dir) and os.path.exists(os.path.join(txt_dir, fname)):
         return True, '本场 TXT 已存在'
     return False, ''
 
@@ -321,11 +344,10 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
             hotwords.apply_to_file(srt_path, cfg, log)
 
     # 3) Gemini 逐 30 分钟块总结 → 写 Word（含章节元数据 + 话题分隔线）
-    with open(R.PROMPT_ORIGINAL, 'r', encoding='utf-8') as f:
-        sys_prompt = f.read().strip()
+    sys_prompt = R.load_prompt(cfg)
     font = cfg['output'].get('font', '思源宋体CN Light')
-    rot = R.GeminiRotator(R.API_KEY, R.PROXY, R.MODELS, rpm=5, window=60,
-                          max_per_model=20, log=log)
+    rot = R.GeminiRotator(R.get_api_key(cfg), cfg['summarize'].get('proxy') or R.PROXY,
+                          R.MODELS, rpm=5, window=60, max_per_model=20, log=log)
     ok = R.process_session(rot, sys_prompt, cfg, fname, date_iso, font, log, progress,
                            src_path=src_video)
     if not ok:
@@ -338,8 +360,9 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     # 5) 压缩成 ~5GB HEVC MP4（按 config.compress；默认输出到 根/YYYY-MM-DD/ 日期子目录）
     cc = cfg.get('compress') or {}
     replace = (src_kind == 'local') and cc.get('replace_original', False)
+    local_root = (cfg.get('local') or {}).get('root') or ''
     compress_video.compress_video(cfg, log, src_video, replace_original=replace,
-                                  archive_root=LOCAL_ROOT)
+                                  archive_root=local_root or None)
 
     # 清理 16k 临时音频（与中质量归档 MP3 无关）
     if cfg['cleanup'].get('delete_mp3_after_success', True):
@@ -462,11 +485,15 @@ def main():
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--date', default=None,
                     help='只处理指定直播日期（YYYY-MM-DD）；不指定则处理全部未处理')
+    ap.add_argument('--workdir', default=None,
+                    help='工作目录（含 config.json）；不传则按 BILI_WORKDIR / _workdir.json / BILI_LIVE_CONFIG 推断')
+    ap.add_argument('--config', default=None, help='直接指定 config.json 路径（优先级最高）')
     args = ap.parse_args()
 
+    cfg_path = resolve_config_arg(args)
     # 单实例锁（避免并发抢 Gemini 配额）
-    LOCK = os.path.join(WORK, '.daily_pipeline.lock')
-    HB = os.path.join(WORK, '.daily_pipeline.heartbeat')
+    LOCK = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), '.daily_pipeline.lock')
+    HB = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), '.daily_pipeline.heartbeat')
 
     def pid_alive(pid):
         if not pid:
@@ -510,7 +537,7 @@ def main():
             pass
 
     try:
-        cfg = load_config(os.path.join(WORK, 'config.json'))
+        cfg = load_config(cfg_path)
         log = Logger(cfg, 'daily')
         if not args.dry_run and not wait_network(log, cfg):
             sys.exit(3)
@@ -525,7 +552,7 @@ def main():
         # 过滤已处理 + 跳过录制中文件
         to_process, skipped = [], []
         for s in sessions:
-            done, reason = already_done_local(st, s)
+            done, reason = already_done_local(cfg, st, s)
             if done:
                 skipped.append((s, reason))
                 continue

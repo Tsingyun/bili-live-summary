@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """bili-live-summary 首次配置向导：检测环境 → 生成工作目录 config.json → 写 _workdir.json 指针。
 
-即开即用：本向导运行一次后，直接 `python run_pipeline.py` 即可全自动处理，
+即开即用：本向导运行一次后，直接 `python daily_pipeline.py --workdir <工作目录>` 即可全自动处理，
 无需每次指定路径。所有参数既可用命令行传入（便于智能体一键调用），也可交互式填写。
 """
 
@@ -15,7 +15,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 用户机器上已知的默认路径：检测到即用，检测不到则提示手动填。
 DEFAULTS = {
-    'workdir': r'D:\岁己直播自动总结',
+    'workdir': r'D:\直播自动总结',
     'python': r'C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe',
     'ffmpeg': r'D:\ffmpeg\bin\ffmpeg.exe',
     'ffprobe': r'D:\ffmpeg\bin\ffprobe.exe',
@@ -100,8 +100,8 @@ def main():
     url = get('series_url', '', 'B站合集页 URL（space.bilibili.com/.../lists/...）')
     mid, sid = parse_series_url(url)
 
-    streamer = get('streamer', '岁己', '主播名（总结主语）')
-    audience = get('audience', '饼干岁', '观众名（文中"观众"统一替换为此）')
+    streamer = get('streamer', '主播', '主播名（总结主语）')
+    audience = get('audience', '观众', '观众名（文中"观众"统一替换为此）')
     api_key = get('api_key', '', 'AI API Key（必填）')
     while not ni and not api_key:
         api_key = ask('AI API Key（必填）', '')
@@ -205,9 +205,9 @@ def main():
     if _missing_key:
         print('[!] 未填写 API Key，请在 config.json 的 summarize.api_key 填写')
     print('\n下一步：')
-    print(f'  试运行：  "{py or "python"}" "{os.path.join(SCRIPT_DIR, "run_pipeline.py")}" --dry-run')
-    print(f'  正式运行："{py or "python"}" "{os.path.join(SCRIPT_DIR, "run_pipeline.py")}"')
-    print(f'  每日自动化：在 WorkBuddy 自动化面板建任务，命令为上面「正式运行」那行；')
+    print(f'  试运行：  "{py or "python"}" "{os.path.join(SCRIPT_DIR, "daily_pipeline.py")}" --dry-run')
+    print(f'  正式运行："{py or "python"}" "{os.path.join(SCRIPT_DIR, "daily_pipeline.py")}"')
+    print(f'  每日自动化：在 WorkBuddy 自动化面板建任务，命令为上面「正式运行」那行（加 --workdir 指向本工作目录）；')
     print(f'            调度 RRULE 建议：FREQ=DAILY;BYHOUR={args.schedule_hours};BYMINUTE=0;BYSECOND=0')
 
 

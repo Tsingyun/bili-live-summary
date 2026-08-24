@@ -1,45 +1,74 @@
-# 岁己直播录播 · AI 上手手册（bili-live-summary）
+# bili-live-summary · AI 上手手册（通用版）
 
 > 给 AI / 接手者阅读。读完本文件即可独立运行、排障、扩展这套「直播录播 → 总结 → MP3 → 压缩」全链路，无需再翻聊天记录。
+> 本 skill **完全配置驱动、零主播专有数据**：每个主播用一个独立工作目录 + 一份 config.json 即可运行，不动任何代码。
 
 ---
 
 ## 0. 一句话目标
 
-把岁己（SUI，B站 UID 1954091502）的每日直播录播，自动变成 **3 个成品文件**：
+把**某位 B站主播**的每日直播录播，自动变成 **3 个成品文件**（具体主播由工作目录的 config 决定）：
 
-1. **AI 总结的 Word 文档**（放在桌面，按月归档）
+1. **AI 总结的 Word 文档**（放在桌面/指定目录，按月归档）
 2. **中质量 MP3**（192k / 44.1k，体积不大，音质够文字识别，用户另有他用）
-3. **压缩后的 HEVC MP4**（~5GB，放到 `D:\录播\25788785-岁己SUI\YYYY-MM-DD\`）
+3. **压缩后的 HEVC MP4**（~5GB，放到 `本地录播根目录/YYYY-MM-DD/`）
 
 来源优先级：**本地录播目录优先；本地没有才去 B站合集兜底**。
+
+> 下文用 **岁己（SUI，B站 UID 1954091502）** 作为「已落地的具体主播」示例值，方便对照；换成别的女主播 / UP主时，只需把这些示例值替换为新主播的配置，**代码一行不改**。
+
+---
+
+## 0.5 新 AI 接手 / 开场白模板（给接手的 AI 用）
+
+当你（新 AI）要接手这套管线时，开场白应能让原系统被正确定位、并让对方快速给你正确权限。直接复制下面这段作为开场（把 `<...>` 替换为实际值）：
+
+```
+你好，我接手「bili-live-summary」这套 B站直播录播自动总结管线。
+请帮我确认以下信息，我就能独立运行 / 排障：
+
+1. 工作目录在哪？（默认 `D:\直播自动总结`，岁己在 `D:\岁己直播自动总结`）
+   里面应有 config.json / state.json / hotwords.md / prompt_original.txt。
+2. 每日自动化是哪个？（automation_update 的 id，岁己是 automation-1786280495470，每天 04:00）
+3. 跑管线的 python 环境是哪个？（默认用 bili-archive venv 里的 python.exe）
+4. 录播原始文件放哪个本地根目录？（config.local.root，岁己是 D:\录播\25788785-岁己SUI）
+5. B站合集 series_id / mid 是多少？（config.series，岁己 mid=1954091502 / series_id=2609053）
+6. API Key 在哪？（config.summarize.api_key，注意免费层每模型每日 20 次硬上限）
+7. 总结用的 Word 落哪个目录、命名什么？（config.output.doc_dir / doc_name_pattern）
+8. 有没有还需保留的特殊规则（如某日期不要合并、热词保护名单）？
+
+确认后我先 `daily_pipeline.py --workdir "<工作目录>" --dry-run` 验证选片，再正式跑。
+```
+
+> 关键原则：**所有差异都在工作目录的 config / hotwords / prompt 里，skill 代码零改动**。不要为某个主播去改 skill 内的脚本。
 
 ---
 
 ## 1. 每日怎么跑（唯一入口）
 
-每天 **04:00**（自动化 `automation-1786280495470`）触发，跑 **这一条命令**：
+每天由自动化触发（岁己示例：04:00 的 `automation-1786280495470`），跑 **这一条命令**：
 
 ```bat
-"C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" -u "C:\Users\Tsing\.workbuddy\skills\bili-live-summary\scripts\daily_pipeline.py"
+"C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" -u "C:\Users\Tsing\.workbuddy\skills\bili-live-summary\scripts\daily_pipeline.py" --workdir "D:\岁己直播自动总结"
 ```
 
 - `daily_pipeline.py` 是 **唯一入口**，内置完整 5 步，不要再拆成 `local_priority.py` / `run_pipeline.py`（那两个已被取代，仅供参考）。
 - 脚本自带 **单实例锁**（`.daily_pipeline.lock`）和 **断点续跑**（state 占位 + TXT/SRT 存在性判定）。
 - 退出码：`0`=全部成功、`1`=个别失败（下次自动重试）、`3`=网络未就绪。
+- `--workdir` 可省略（靠 `_workdir.json` 指针 / `BILI_WORKDIR` 推断），但显式写更清晰、免歧义。
 
 手动 / 排障命令：
 
 ```bat
 :: 只预览会处理哪些、跳过哪些，不碰任何文件（强烈建议先跑这个）
-python daily_pipeline.py --dry-run
+python daily_pipeline.py --workdir "D:\岁己直播自动总结" --dry-run
 
 :: 只处理某一天（定向重跑 / 补跑），如 8/24 漏了
-python daily_pipeline.py --date 2026-08-24
+python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-24
 ```
 
 > 运行环境必须用上面的 `bili-archive` venv（已装 torch / FunASR / python-docx / requests）。
-> 工作目录指针在 `scripts/_workdir.json` → `D:\岁己直播自动总结`，config 即该目录下的 `config.json`。
+> 工作目录指针在 `scripts/_workdir.json`（岁己 = `D:\岁己直播自动总结`），config 即该目录下的 `config.json`。
 
 ---
 
@@ -47,10 +76,10 @@ python daily_pipeline.py --date 2026-08-24
 
 | 步 | 动作 | 关键函数 / 脚本 | 产出 |
 |---|---|---|---|
-| 1 | **监测本地根目录** `D:\录播\25788785-岁己SUI` 的新录播（flv/mp4，直接放根目录） | `scan_root_sessions` | 待处理 session 列表；录制中/已处理的自动跳过 |
+| 1 | **监测本地根目录**（`config.local.root`）的新录播（flv/mp4，直接放根目录） | `scan_root_sessions` | 待处理 session 列表；录制中/已处理的自动跳过 |
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
 | 3 | **无本地新文件 → B站兜底**：抓合集最近未处理录播，下载合并多 P 视频 → 同一条总结流程 | `bilibili_fallback` + `download_merge.download_video_one` | 同上（源是下载的视频） |
-| 4 | **导出中质量 MP3**（192k/44.1k） | `mp3_export.export_mp3` | 根目录下的 `.mp3` |
+| 4 | **导出中质量 MP3**（192k/44.1k） | `mp3_export.export_for_local` | 根目录下的 `.mp3` |
 | 5 | **压缩 HEVC MP4**（~5GB）→ 日期子目录 | `compress_video.compress_video` | `根目录/YYYY-MM-DD/*_compressed.mp4` |
 
 > 第 1 步有文件 → 走第 2 步；第 1 步**没有任何可处理文件** → 才走第 3 步 B站兜底（二者互斥，不会重复）。
@@ -59,15 +88,16 @@ python daily_pipeline.py --date 2026-08-24
 
 ## 3. 目录与文件约定（务必遵守）
 
-### 本地录播根目录 `D:\录播\25788785-岁己SUI`
+### 本地录播根目录（示例 `D:\录播\25788785-岁己SUI`）
 - 录制器产出的原始文件 **直接放根目录**（不在日期子目录里）：
   `录制-25788785-20260824-203245-785-陪你这个猪过周一！5070ti版.flv`
   命名规则：`录制-<UID>-<YYYYMMDD>-<HHMMSS>-<idx>-<标题>.<ext>`
+  （自定义命名需在 config.local.name_regex 里提供含 `date`/`time`/`title` 命名组的正则）
 - **flv 通常是录制中的临时格式，且可能在录制过程中被监测到**——脚本用「大小稳定 + 修改时间够老」判定文件已写完，否则整段跳过，避免截半。
 - 处理完成后根目录会留下：中质量 `.mp3`（交付物）+ 各 `YYYY-MM-DD\` 子目录（里面是压缩后的 `_compressed.mp4` 交付物）。
 
-### 压缩产物位置（用户 tips，2026-08-24）
-- `compress.out_dir_mode = "date_subfolder"`：压缩后 MP4 进 **`根目录/YYYY-MM-DD/`** 子目录（子目录不存在则新建；已存在则跳过这步）。
+### 压缩产物位置（`compress.out_dir_mode = "date_subfolder"`）
+- 压缩后 MP4 进 **`根目录/YYYY-MM-DD/`** 子目录（子目录不存在则新建；已存在则跳过这步）。
 - 日期从文件名里的 8 位日期 `20260824` 解析（自动跳过 UID 等非法日期串）。
 - 本地源：`replace_original=true` → 压缩成功后原视频先备份到 `~/.workbuddy/backups/live_raw/` 再移入**回收站**（绝不裸删）。
 - B站源：是临时下载文件，压缩成功后直接删除。
@@ -78,28 +108,32 @@ config.json            # 唯一配置（不进 git）
 state.json             # 处理进度 / 去重占位
 TXT/  SRT/  MP3/       # 转写文本 / 字幕 / 16k 临时音频
 logs/  tmp/  merged/    # 日志 / 临时 / 合并中间视频
+hotwords.md            # 热词替换表（转写后纠正用）
 prompt_original.txt    # 总结用的 system prompt
 ```
 
-### 交付物最终落点
+### 交付物最终落点（示例，岁己）
 | 交付物 | 位置 |
 |---|---|
 | Word 总结 | 桌面 `岁己直播总结_{year}年{month}月.docx`（同月同一文档，分页追加） |
-| 中质量 MP3 | `D:\录播\25788785-岁己SUI\<原名>.mp3` |
-| 压缩 HEVC MP4 | `D:\录播\25788785-岁己SUI\YYYY-MM-DD\<原名>_compressed.mp4` |
+| 中质量 MP3 | `本地根目录\<原名>.mp3` |
+| 压缩 HEVC MP4 | `本地根目录\YYYY-MM-DD\<原名>_compressed.mp4` |
 
 ---
 
 ## 4. 配置速查（`config.json` 关键项）
 
-| 段 | 字段 | 含义 / 当前值 |
+| 段 | 字段 | 含义 / 示例值（岁己） |
 |---|---|---|
 | `series` | `mid` / `series_id` | `1954091502` / `2609053`（B站合集，兜底用） |
 | `latest_mode` | `mode` | `latest_by_live_date`；`since_live_date=2026-08-09` 硬下限 |
 | `summarize` | `provider/model` | `google` / `gemini-3.7-flash`（首选，带轮换兜底） |
+| `summarize` | `streamer` / `audience` | `岁己` / `饼干岁`（总结人称，prompt 占位符用） |
 | `summarize` | `chunk_minutes` | `30`（**必须**按 30 分钟切块逐块发 AI） |
+| `summarize` | `prompt_path` | 可选；指向含 `{streamer}`/`{audience}` 占位符的 prompt 文件 |
+| `output` | `doc_dir` / `doc_name_pattern` | 桌面 / `岁己直播总结_{year}年{month}月.docx` |
 | `transcribe` | `chunk_hours_threshold` | `2`（>2h 音频先切块再转写，规避 FunASR VAD 截断） |
-| `hotwords` | `enabled` | `true`（转写后送 AI 前做热词替换） |
+| `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
 | `mp3_export` | `enabled/bitrate/ar` | `true` / `192k` / `44100`；`out_dir` = 录播根目录 |
 | `local_merge` | `enabled/max_gap_sec/exclude_dates` | 同日期连续段合并；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder` / `true`（压缩后回收站删原视频） |
@@ -134,7 +168,7 @@ prompt_original.txt    # 总结用的 system prompt
 | B站兜底重复下了本地已处理的日期 | 看 `state.json` 的 `done_dates` 是否含该日期；根目录若仍留有原 flv，本地监测会优先处理、不会走 B站。 |
 | 合并多场被误判成一场 | 加 `local_merge.exclude_dates: ["2026-08-22"]` 显式强制不合并（别依赖阈值侥幸）。 |
 
-**日志位置**：`D:\岁己直播自动总结\logs\YYYY-MM-DD.log`（每日一个）+ `logs\errors.log`（错误汇总）。
+**日志位置**：`工作目录\logs\YYYY-MM-DD.log`（每日一个）+ `logs\errors.log`（错误汇总）。
 
 ---
 
@@ -152,10 +186,10 @@ prompt_original.txt    # 总结用的 system prompt
 
 | 文件 | 职责 |
 |---|---|
-| `scripts/daily_pipeline.py` | **主编排器**：监测 → 本地/B站 → MP3 → 压缩，含锁/断点/状态写入 |
+| `scripts/daily_pipeline.py` | **主编排器**：监测 → 本地/B站 → MP3 → 压缩，含锁/断点/状态写入（通用，零主播硬编码） |
 | `scripts/scan_root_sessions`（在 daily_pipeline 内） | 根目录监测 + 连续段合并 + 录制中跳过 |
 | `scripts/transcribe.py` | FunASR 转写（带时间轴 TXT/SRT），`chunk_hours_threshold` 切块 |
-| `scripts/hotwords.py` | 转写后热词替换 |
+| `scripts/hotwords.py` | 转写后热词替换（路径相对工作目录解析） |
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |
 | `scripts/summarize_gemini.py` | Word 排版底层（粗体总结、斜体金句、章节元数据、话题分隔线） |
 | `scripts/mp3_export.py` | 中质量 MP3 导出 |
@@ -167,9 +201,31 @@ prompt_original.txt    # 总结用的 system prompt
 
 ---
 
-## 9. 扩展 / 二次开发注意事项
+## 9. 新主播接入（零代码，重点）
+
+换成**全新主播**时，按下面步骤，**不要改 skill 代码**：
+
+1. **建工作目录**：`D:\直播自动总结`（或任意独立目录，建议按主播命名，如 `D:\新主播直播自动总结`）。
+2. **生成 config**：跑 `setup.py` 向导或复制 `scripts/config.example.json` 为 `工作目录/config.json`，填入：
+   - `series.mid` / `series.series_id` / `series.url`（新主播的 B站合集）
+   - `local.root`（新主播本地录播根目录）
+   - `summarize.streamer` / `summarize.audience`（新主播名 / 观众称呼）
+   - `summarize.api_key`（新主播用的 Gemini Key）
+   - `output.doc_dir` / `output.doc_name_pattern`（新 Word 命名，可含 `{streamer}`）
+   - 其余（transcribe / compress / mp3_export / local_merge / topic_separator）沿用默认值即可。
+3. **prompt（可选）**：复制 `scripts/prompt_template.txt` → `工作目录/prompt_original.txt`，把 `{streamer}`/`{audience}` 替换或保留占位符（运行时自动替换）；并在 config 设 `summarize.prompt_path="prompt_original.txt"`。不配则脚本回退到幂等保留字面内容。
+4. **hotwords（可选）**：复制 `scripts/hotwords.md` → `工作目录/hotwords.md` 填术语/歌名纠正规则，config 设 `hotwords.path="hotwords.md"`；不填则 `enabled:false` 或留空用空模板。
+5. **验证**：`daily_pipeline.py --workdir "<新工作目录>" --dry-run` 确认选片正确。
+6. **挂自动化**：用 `automation_update` 建 recurring 自动化，命令带 `--workdir "<新工作目录>"`。
+7. **skill 级指针（可选）**：若要让不带 `--workdir` 的调用默认指向新主播，在 `scripts/_workdir.json` 改 `workdir` 字段（⚠️ 这会影响不带参数的调用，多主播时更推荐每条命令都显式带 `--workdir`）。
+
+> 验证清单：py_compile 五个脚本全过 → `--dry-run` 选片正确 → 真实跑一场确认 Word/MP3/MP4 三样齐全、state 占位已写。
+
+---
+
+## 10. 扩展 / 二次开发注意事项
 
 - **加新步骤**：在 `daily_pipeline.process_video_source` 里按顺序追加，保持「转写 → 总结 → MP3 → 压缩」的先后，且每步失败不应误删已完成的产物。
 - **改压缩目标体积/质量**：只动 `config.json` 的 `compress.target_size_gb` / `cq`，无需改代码。
 - **换模型/换 provider**：改 `config.json` 的 `summarize.model`；Gemini 轮换顺序在 `regen_gemini_v2.MODELS`。
-- **加新主播**：复制整套 config（改 `series` / `streamer` / `audience` / `doc_dir`），`setup.py` 可向导生成。
+- **加新主播**：见第 9 节，复制整套 config（改 `series` / `streamer` / `audience` / `doc_dir`），`setup.py` 可向导生成；**代码不需要任何改动**。

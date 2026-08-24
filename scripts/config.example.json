@@ -1,13 +1,13 @@
 {
-  "_comment": "bili-live-summary 配置模板（由 setup.py 生成到工作目录 config.json，可直接手改）。",
+  "_comment": "bili-live-summary 配置模板（复制到工作目录后改名 config.json，可直接手改）。skill 本身不含任何主播专属数据，靠本文件区分不同主播——每个主播一个独立工作目录 + 一份本配置。工作目录结构：config.json / state.json / TXT/ SRT/ MP3/ logs/ tmp/ 以及可选的 hotwords.md 与 prompt_original.txt（或 prompt_path 指定的文件）。",
   "series": {
     "url": "",
     "mid": 0,
     "series_id": 0,
-    "_comment": "把 url 换成主播合集页；setup.py 会自动解析 mid/series_id，也可手动填"
+    "_comment": "把 url 换成主播合集页；setup.py 会自动解析 mid/series_id，也可手动填。步骤3（B站兜底）按此抓录播。"
   },
   "latest_mode": {
-    "_comment": "「最新录播」判定方式。latest_by_live_date=按直播实际日期滚动（上传时间不固定时最稳，配合每日多次调度）；可选 newer_than_last / latest_n / since_date / backfill_all。since_live_date 为硬下限：只处理直播日期 >= 该日期的录播（如用户明确只要 2026-08-09 起的）。",
+    "_comment": "「最新录播」判定方式。latest_by_live_date=按直播实际日期滚动（上传时间不固定时最稳）；可选 newer_than_last / latest_n / since_date / backfill_all。since_live_date 为硬下限：只处理直播日期 >= 该日期的录播。",
     "mode": "latest_by_live_date",
     "first_run_n": 1,
     "latest_n": 1,
@@ -18,7 +18,7 @@
     "title_must_contain": ""
   },
   "hotwords": {
-    "_comment": "转写后自动纠正：解析 hotwords.path（默认 scripts/hotwords.md）里的替换表，对 TXT/SRT 各做一遍替换再送 AI。enabled=false 可关闭；path 留空即用 skill 自带热词表。",
+    "_comment": "转写后自动纠正：解析 hotwords.path 里的替换表（markdown 表格），对 TXT/SRT 各做一遍替换再送 AI。enabled=false 可关闭；path 留空则用 skill 自带空模板（不纠正）。相对路径以工作目录为基准。",
     "enabled": true,
     "path": ""
   },
@@ -27,25 +27,29 @@
     "model": "gemini-3.7-flash",
     "api_key": "",
     "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
-    "proxy": "",
+    "proxy": "http://127.0.0.1:7897",
     "chunk_minutes": 30,
     "temperature": 0.3,
     "max_output_tokens": 8192,
-    "thinking_level": "low",
     "max_retries": 5,
     "inter_chunk_delay_sec": 6,
-    "streamer": "岁己",
-    "audience": "饼干岁"
+    "streamer": "主播",
+    "audience": "观众",
+    "inter_video_delay_sec": 15,
+    "thinking_level": "low",
+    "_comment_streamer": "streamer/audience 用于概要段与 prompt 占位符 {streamer}/{audience}（prompt_path 文件里可写占位符，运行时自动替换）；也用于 Word 文档标题。",
+    "prompt_path": "",
+    "_comment_prompt": "总结用的 system prompt 文件路径。留空=用工作目录下的 prompt_original.txt；也可指向 skill 内的 scripts/prompt_template.txt 副本。文件里支持 {streamer}/{audience} 占位符，会自动替换；无占位符则原文不变（兼容旧字面 prompt）。"
   },
   "output": {
-    "_comment": "Word 文档目录与命名。{year}/{month}/{streamer}/{audience} 均会被替换；月份取自直播实际日期。",
+    "_comment": "Word 文档目录与命名。{year}/{month}/{streamer} 均会被替换；月份取自直播实际日期。",
     "doc_dir": "C:\\Users\\Tsing\\Desktop",
     "doc_name_pattern": "{streamer}直播总结_{year}年{month}月.docx",
     "font": "思源宋体CN Light"
   },
   "paths": {
     "project_root": "",
-    "_comment": "留空=等于工作目录（config.json 所在目录）；也可填绝对路径",
+    "_comment": "留空=等于工作目录（config.json 所在目录）；也可填绝对路径。运行时产物（MP3/TXT/SRT/logs/tmp/state.json）默认落在工作目录。",
     "python": "",
     "ffmpeg": "",
     "ffprobe": "",
@@ -65,8 +69,22 @@
     "keep_txt": true,
     "keep_srt": true
   },
+  "mp3_export": {
+    "_comment": "总结之后，把该场录播视频转成中质量 MP3 留档（默认 192k/44.1k，供文字识别/其他用途）。out_dir 为输出根目录；strip_prefix 用于去掉录制器文件名前缀，使输出文件名直接以日期开头。",
+    "enabled": true,
+    "bitrate": "192k",
+    "ar": 44100,
+    "out_dir": "",
+    "keep_in_date_subfolder": false,
+    "strip_prefix": []
+  },
+  "local": {
+    "_comment": "步骤1 本地录播监测。root=本地录制根目录（flv/mp4 直接放这，不在日期子目录）；name_regex 留空用默认（录制器命名 录制-UID-YYYYMMDD-HHMMSS-序号-标题.扩展名），自定义须含命名组 date(YYYYMMDD)/time(HHMMSS)/title（用于解析直播日期与标题）。root 留空则完全跳过本地监测、只走 B站兜底。",
+    "root": "",
+    "name_regex": ""
+  },
   "local_merge": {
-    "_comment": "同日期目录下多个录播文件若时间连续（网络波动断开重连），先合并成单一时间线再总结。判定：按文件名时间排序，相邻段间隙<=max_gap_sec 且能取到时长则并入同一场；否则各自总结。keep_merged=false 则在总结完成后删除中间合并视频。",
+    "_comment": "同日期目录下多个录播文件若时间连续（网络波动断开重连），先合并成单一时间线再总结。判定：按文件名时间排序，相邻段间隙<=max_gap_sec 且能取到时长则并入同一场；否则各自总结。",
     "enabled": true,
     "max_gap_sec": 600,
     "keep_merged": true,

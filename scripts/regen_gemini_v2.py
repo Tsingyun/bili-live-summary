@@ -34,34 +34,87 @@ import requests
 import summarize_gemini as S
 from common import load_config, Logger, clean_punctuation, normalize_numbers
 
-WORK = r'D:\岁己直播自动总结'
-PROMPT_ORIGINAL = os.path.join(WORK, 'prompt_original.txt')
-DOC_LOCK = os.path.join(WORK, '.regen_gemini_v2.lock')
-HEARTBEAT = os.path.join(WORK, '.regen_gemini_v2.heartbeat')
-PROGRESS = os.path.join(WORK, '.regen_gemini_v2_progress.json')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def touch_heartbeat():
+def resolve_workdir(explicit=None):
+    """确定工作目录（按优先级）：
+    1. explicit（调用方显式传入，如 --workdir）
+    2. 环境变量 BILI_WORKDIR
+    3. skill 同级 _workdir.json 中的 workdir
+    4. 环境变量 BILI_LIVE_CONFIG 所在目录
+    全部缺失则抛错。工作目录与主播一一对应，故 skill 可同时服务多位主播。"""
+    if explicit:
+        return explicit
+    env = os.environ.get('BILI_WORKDIR')
+    if env and os.path.isdir(env):
+        return env
+    ptr = os.path.join(SCRIPT_DIR, '_workdir.json')
+    if os.path.exists(ptr):
+        try:
+            d = json.load(open(ptr, encoding='utf-8'))
+            if d.get('workdir') and os.path.isdir(d['workdir']):
+                return d['workdir']
+        except Exception:
+            pass
+    cfg_env = os.environ.get('BILI_LIVE_CONFIG')
+    if cfg_env and os.path.isfile(cfg_env):
+        wd = os.path.dirname(os.path.abspath(cfg_env))
+        if os.path.isdir(wd):
+            return wd
+    raise RuntimeError('无法确定工作目录：请传 --workdir、设 BILI_WORKDIR，'
+                       '或在 skill 目录放 _workdir.json')
+
+
+PROXY = 'http://127.0.0.1:7897'  # 默认本地 Clash；config.summarize.proxy 可覆盖
+
+
+def get_api_key(cfg):
+    """取 Gemini API Key（脱敏）：优先环境变量 GEMINI_API_KEY，其次 config.summarize.api_key。"""
+    key = os.environ.get('GEMINI_API_KEY')
+    if key:
+        return key
+    key = (cfg.get('summarize') or {}).get('api_key')
+    if key:
+        return key
+    raise RuntimeError('缺少 Gemini API Key：请设置环境变量 GEMINI_API_KEY，'
+                       '或在 config.json 的 summarize.api_key 填写')
+
+
+def load_prompt(cfg):
+    """读取总结用的 system prompt。优先 config.summarize.prompt_path，
+    否则用工作目录下的 prompt_original.txt。支持 {streamer}/{audience} 占位符
+    （来自 config.summarize），无占位符则原文不变，兼容岁己既有字面 prompt。"""
+    p = (cfg.get('summarize') or {}).get('prompt_path') \
+        or os.path.join(cfg['_workdir'], 'prompt_original.txt')
+    with open(p, 'r', encoding='utf-8') as f:
+        text = f.read().strip()
+    text = text.replace('{streamer}', (cfg.get('summarize') or {}).get('streamer', '主播'))
+    text = text.replace('{audience}', (cfg.get('summarize') or {}).get('audience', '观众'))
+    return text
+
+
+def build_overview_sys(cfg):
+    """「内容概要」用的 system 指令，主播名/观众名从 config 读取（不再写死）。"""
+    streamer = (cfg.get('summarize') or {}).get('streamer', '主播')
+    audience = (cfg.get('summarize') or {}).get('audience', '观众')
+    return (
+        '你是一名直播内容编辑。下面是一场直播的分段总结（按时间顺序，每段覆盖约30分钟）。'
+        '请综合这些分段，写一段【内容概要】：用自然流畅的中文 prose（不是列表、不用项目符号），'
+        f'约 200–300 字，以“{streamer}”为主语，概括这场直播整体在做什么、聊了哪些话题、氛围如何、'
+        '有哪些关键节点或名场面。不要逐条复述时间轴，重在让读者一眼抓住“这场直播是什么”的整体印象。'
+        f'观众统称“{audience}”。纯文本输出，不要使用 ** 或 * 等 markdown 标记。'
+    )
+
+
+def touch_heartbeat(cfg):
     """刷新心跳时间戳，供看门狗/启动锁判断本实例是否仍存活（抗 PID 复用）。"""
     try:
-        with open(HEARTBEAT, 'w', encoding='utf-8') as _f:
+        with open(os.path.join(cfg['_workdir'], '.regen_gemini_v2.heartbeat'),
+                  'w', encoding='utf-8') as _f:
             _f.write(str(int(time.time())))
     except Exception:
         pass
-PROXY = 'http://127.0.0.1:7897'  # 本地 Clash 代理地址（非敏感，可明文保留）
-
-# ── 密钥脱敏（2026-08-16）：不再硬编码明文，避免推到 GitHub 泄露 ──
-# 优先取环境变量 GEMINI_API_KEY；否则从工作目录 config.json 的 summarize.api_key 读取
-# （config.json 不进 git，仅本地持有）。两者皆缺则显式报错，不静默置空。
-_cfg_path = os.path.join(WORK, 'config.json')
-try:
-    _cfg = load_config(_cfg_path)
-    _cfg_key = (_cfg.get('summarize') or {}).get('api_key')
-except Exception:
-    _cfg_key = None
-API_KEY = os.environ.get('GEMINI_API_KEY') or _cfg_key
-if not API_KEY:
-    raise RuntimeError('缺少 Gemini API Key：请设置环境变量 GEMINI_API_KEY，或在 config.json 的 summarize.api_key 填写')
 
 # 模型轮换顺序（按能力，用户指定 + 依能力类推的补充 lite/pro 兜底）
 # 2026-08-14：Gemini 3.7 Flash 于 AI Studio 上线 GA，提升为首选（能力最强、单价更低）
@@ -182,21 +235,21 @@ class GeminiRotator:
         return ''
 
 
-def load_progress():
-    if os.path.exists(PROGRESS):
+def load_progress(path):
+    if os.path.exists(path):
         try:
-            with open(PROGRESS, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
 
 
-def save_progress(data):
-    tmp = PROGRESS + '.tmp'
+def save_progress(data, path):
+    tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PROGRESS)
+    os.replace(tmp, path)
 
 
 def build_user(chunk_label, idx, total, content):
@@ -211,17 +264,20 @@ def build_user(chunk_label, idx, total, content):
     )
 
 
-OVERVIEW_SYS = (
+# 内容概要指令已改为配置驱动：见 build_overview_sys(cfg)，主播名/观众名取自 config.summarize。
+# 保留此常量仅为向后兼容极旧的调用，新代码一律用 build_overview_sys(cfg)。
+OVERVIEW_SYS_DEPRECATED = (
     '你是一名直播内容编辑。下面是一场直播的分段总结（按时间顺序，每段覆盖约30分钟）。'
     '请综合这些分段，写一段【内容概要】：用自然流畅的中文 prose（不是列表、不用项目符号），'
-    '约 200–300 字，以“岁己”为主语，概括这场直播整体在做什么、聊了哪些话题、氛围如何、'
+    '约 200–300 字，概括这场直播整体在做什么、聊了哪些话题、氛围如何、'
     '有哪些关键节点或名场面。不要逐条复述时间轴，重在让读者一眼抓住“这场直播是什么”的整体印象。'
-    '观众统称“饼干岁”。纯文本输出，不要使用 ** 或 * 等 markdown 标记。'
+    '纯文本输出，不要使用 ** 或 * 等 markdown 标记。'
 )
 
 
 def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, src_path=None):
-    txt_path = os.path.join(WORK, 'TXT', fname)
+    txt_path = os.path.join(cfg['_dirs']['txt'], fname)
+    progress_path = os.path.join(cfg['_workdir'], '.regen_gemini_v2_progress.json')
     title = fname.split('-', 1)[1].rsplit('.txt', 1)[0] if '-' in fname else fname
     heading = title
     d = datetime.date.fromisoformat(date_str)
@@ -237,7 +293,7 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         if S.has_section(doc, heading):
             log(f'文档已存在「{heading[:30]}」章节，跳过整场')
             progress.pop(date_str, None)
-            save_progress(progress)
+            save_progress(progress, progress_path)
             return True
 
         chunks = S.load_and_chunk(txt_path, int(cfg['summarize'].get('chunk_minutes', 30)) * 60)
@@ -250,7 +306,7 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         sess = progress.setdefault(date_str, {'chunks': {}, 'overview': ''})
         all_blocks = []
         for i, (start, content) in enumerate(chunks, 1):
-            touch_heartbeat()
+            touch_heartbeat(cfg)
             label = f'{S.hms(start)} - {S.hms(start + int(cfg["summarize"].get("chunk_minutes", 30)) * 60)}'
             if str(i) in sess['chunks']:
                 all_blocks.append(sess['chunks'][str(i)])
@@ -261,14 +317,14 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
             text = rot.call(sys_prompt, user, tag=f'[{i}/{total}]')
             if not text:
                 log.error(f'  [{i}/{total}] {label} [FAIL] 所有模型失败，本场中止（保留进度，稍后续跑）')
-                save_progress(progress)
+                save_progress(progress, progress_path)
                 return False
             # 清洗可能由模型生成的冗余双标点（如 "。，"），双保险
             text = clean_punctuation(text)
             # 数字归一双保险：规格数字若是中文读法也转回阿拉伯（3050显卡/75Hz/8G）
             text = normalize_numbers(text)
             sess['chunks'][str(i)] = text
-            save_progress(progress)
+            save_progress(progress, progress_path)
             all_blocks.append(text)
             log(f'  [{i}/{total}] {label} [OK] {len(text)} 字 / {time.time() - t0:.0f}s')
 
@@ -279,10 +335,10 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
                 if re.match(r'^\s*\[\d{1,2}:\d{2}:\d{2}\]', ln) and not S.is_quote_line(ln.strip())
             )
             if summary_only.strip():
-                ov = rot.call(OVERVIEW_SYS, summary_only, tag='[概要]')
+                ov = rot.call(build_overview_sys(cfg), summary_only, tag='[概要]')
                 if ov:
                     sess['overview'] = normalize_numbers(clean_punctuation(ov))
-                    save_progress(progress)
+                    save_progress(progress, progress_path)
                     log(f'  概要生成完成（{len(ov)} 字）')
                 else:
                     log.error('  概要生成失败，跳过概要（不影响正文）')
@@ -318,8 +374,14 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--test-one', action='store_true', help='只跑 8/9 第 1 块并打印原始输出')
+    ap.add_argument('--workdir', default=None, help='工作目录（含 config.json）；不传则按 BILI_WORKDIR / _workdir.json / BILI_LIVE_CONFIG 推断')
+    ap.add_argument('--test-one', action='store_true', help='只跑 TXT 目录里第 1 个 .txt 的第 1 块并打印原始输出')
     args = ap.parse_args()
+
+    workdir = resolve_workdir(args.workdir)
+    DOC_LOCK = os.path.join(workdir, '.regen_gemini_v2.lock')
+    HEARTBEAT = os.path.join(workdir, '.regen_gemini_v2.heartbeat')
+    PROGRESS = os.path.join(workdir, '.regen_gemini_v2_progress.json')
 
     # 启动级单实例锁（抗环境回收 + 抗 Windows PID 复用）：
     # 用「心跳文件」判断持有者是否还活着，而非单纯 os.kill(pid,0)。
@@ -360,33 +422,47 @@ def main():
         if lf is None:
             print('[regen_gemini_v2] 锁仍被占用，退出')
             sys.exit(0)
-    touch_heartbeat()
+    touch_heartbeat({'_workdir': workdir})
 
-    cfg = load_config(os.path.join(WORK, 'config.json'))
+    cfg = load_config(os.path.join(workdir, 'config.json'))
     log = Logger(cfg, 'regen_gemini_v2')
     font = cfg['output'].get('font', '思源宋体CN Light')
-    with open(PROMPT_ORIGINAL, 'r', encoding='utf-8') as f:
-        sys_prompt = f.read().strip()
+    sys_prompt = load_prompt(cfg)
 
-    rot = GeminiRotator(API_KEY, PROXY, MODELS, rpm=5, window=60, max_per_model=20, log=log)
-    progress = load_progress()
+    rot = GeminiRotator(get_api_key(cfg), cfg['summarize'].get('proxy') or PROXY,
+                        MODELS, rpm=5, window=60, max_per_model=20, log=log)
+    progress = load_progress(PROGRESS)
+
+    # 扫描工作目录 TXT 下所有 .txt（已写入文档的会被 process_session 的 has_section 跳过）
+    txt_dir = cfg['_dirs']['txt']
+    targets = []
+    if os.path.isdir(txt_dir):
+        for fn in sorted(os.listdir(txt_dir)):
+            if not fn.lower().endswith('.txt'):
+                continue
+            m = re.match(r'(\d{8})-', fn)
+            ds = '%s-%s-%s' % (m.group(1)[:4], m.group(1)[4:6], m.group(1)[6:8]) if m else ''
+            targets.append((fn, ds))
 
     if args.test_one:
-        txt_path = os.path.join(WORK, 'TXT', TARGETS[0][0])
+        if not targets:
+            print('[regen_gemini_v2] TXT 目录无 .txt 文件')
+            sys.exit(1)
+        txt_path = os.path.join(txt_dir, targets[0][0])
         chunks = S.load_and_chunk(txt_path, 30 * 60)
         c0 = chunks[0]
         label = f'{S.hms(c0[0])} - {S.hms(c0[0] + 30 * 60)}'
         user = build_user(label, 1, len(chunks), c0[1])
         out = rot.call(sys_prompt, user, tag='[TEST]')
-        print('\n========== RAW OUTPUT (8/9 block1) ==========')
+        print('\n========== RAW OUTPUT (%s block1) ==========' % targets[0][0])
         print(out)
         print('========== END ==========')
         os.close(lf)
         sys.exit(0)
 
     ok = 0
-    for fname, date_str in TARGETS:
-        touch_heartbeat()
+    for fname, date_str in targets:
+        touch_heartbeat({'_workdir': workdir})
         try:
             if process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress):
                 ok += 1
@@ -394,7 +470,7 @@ def main():
             import traceback
             log.error(f'{fname} 异常：{e}')
             traceback.print_exc()
-    log(f'Gemini 重建完成 {ok}/{len(TARGETS)}')
+    log(f'Gemini 重建完成 {ok}/{len(targets)}')
     try:
         os.close(lf)
         os.remove(DOC_LOCK)
