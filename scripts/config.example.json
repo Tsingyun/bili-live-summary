@@ -75,5 +75,15 @@
   "topic_separator": {
     "_comment": "一场直播总结成一整段不易阅读，在话题转折/结束处插入横向分隔线。判定：合并全部分块总结后，调模型在话题边界插入 §SEP§ 标记再切分，每个话题块之间写一条横线。enabled=false 可关闭（退回不分段）。",
     "enabled": true
+  },
+  "compress": {
+    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。默认输出 <原名>_compressed<ext> 新文件、保留原始；replace_original=true 才覆盖原文件（请确保已备份）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
+    "enabled": true,
+    "codec": "hevc_nvenc",
+    "target_size_gb": 5,
+    "cq": 24,
+    "preset": "p4",
+    "audio_mode": "copy",
+    "replace_original": false
   }
 }
