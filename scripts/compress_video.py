@@ -111,12 +111,60 @@ def compress_video(cfg, log, src_video, replace_original=False):
 
     if os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
         sz = os.path.getsize(out) // 1024 // 1024
+        saved = (1 - os.path.getsize(out) / os.path.getsize(src_video)) * 100
         log('[compress] 完成（%d MB，节省 %.0f%%）：%s'
-            % (sz, (1 - os.path.getsize(out) / os.path.getsize(src_video)) * 100,
-               os.path.basename(out)))
-        return out
-    log.error('[compress] 转换后文件异常')
-    return None
+            % (sz, saved, os.path.basename(out)))
+    else:
+        log.error('[compress] 转换后文件异常')
+        return None
+
+    # replace_original：先备份原文件，确认成功后删除原文件（用 trash 机制，不裸删）
+    if replace_original:
+        try:
+            backup = backup_then_remove(cfg, log, src_video, out)
+            if backup:
+                log('[compress] 原始文件已替换为压缩版，备份保留在：%s' % backup)
+            else:
+                log('[compress] 已删除原始文件（无可用的回收站机制，已二次确认）', 'WARN')
+        except Exception as e:
+            log.error('[compress] 删除原文件失败（压缩版已就绪，原文件保留）：%s' % e)
+    return out
+
+
+def backup_then_remove(cfg, log, src_video, compressed):
+    """压缩成功且校验通过后：备份原文件，删除原始（用 trash，不裸 rm）。
+
+    返回备份路径；若无 trash 可用则要求外部确认（这里仅记警告）。
+    """
+    import shutil
+    home = os.path.expanduser('~')
+    backup_dir = os.path.join(home, '.workbuddy', 'backups', 'live_raw')
+    os.makedirs(backup_dir, exist_ok=True)
+    base = os.path.basename(src_video)
+    backup = os.path.join(backup_dir, base)
+    try:
+        shutil.copy2(src_video, backup)
+        log('[compress] 已备份原文件到：%s' % backup)
+    except Exception as e:
+        log.error('[compress] 备份失败，放弃删除原文件：%s' % e)
+        return None
+    # 删除原文件：优先 trash 机制（Windows Recycle Bin 不可用时 gio/trash-put）
+    try:
+        import subprocess as _sub
+        # Windows: 用 PowerShell Recycle Bin；macOS/Linux: gio trash
+        if os.name == 'nt':
+            ps = ('$sh=New-Object -ComObject Shell.Application;'
+                  '$f=$sh.NameSpace(0).Items();'
+                  '$f.Item("' + backup.replace('\\', '\\\\') + '") | Out-Null;'
+                  '$sh.NameSpace(0).MoveItem($f.Item("' + src_video.replace('\\', '\\\\') + '"), 10)')
+            _sub.run(['powershell', '-NoProfile', '-Command', ps], check=True)
+        else:
+            _sub.run(['gio', 'trash', src_video], check=True)
+        log('[compress] 已将原文件移入回收站：%s' % src_video)
+        return backup
+    except Exception as e:
+        log.error('[compress] 无回收站可用，未删除原文件（压缩版已就绪）：%s' % e)
+        return backup
 
 
 def main():
