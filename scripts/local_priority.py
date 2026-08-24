@@ -407,6 +407,8 @@ def summarize_local_one(cfg, st, session, log, progress):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--date', default=None,
+                    help='只处理指定直播日期（YYYY-MM-DD），例如 2026-08-24；不指定则处理全部未处理场次')
     args = ap.parse_args()
 
     LOCK = os.path.join(WORK, '.local_priority.lock')
@@ -463,6 +465,13 @@ def main():
         st = load_state(cfg)
 
         sessions = scan_sessions(cfg, log, LOCAL_ROOT)
+
+        # --date 过滤：只处理指定直播日期（用于定向重跑 / 从某天开始）
+        if args.date:
+            sessions = [s for s in sessions if s['live_date'].isoformat() == args.date]
+            if not sessions:
+                log('未找到日期 %s 的本地录播，退出' % args.date)
+                return
 
         to_process, skipped = [], []
         for s in sessions:
