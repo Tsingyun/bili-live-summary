@@ -8,42 +8,65 @@ compress_video.py —— 总结完成后把原始录播视频压成更小的归�
 RTX 20 系及以后支持 hevc_nvenc，速度远快于 CPU 编码。
 
 设计原则（与 bili-live-summary 其它模块一致）：
-- 默认不覆盖原始文件，输出 `<原名>_compressed<ext>` 新文件，保留原始以便核对；
+- 默认（replace_original=false）：输出 `<原名>_compressed.mp4` 新文件，保留原始以便核对；
+- replace_original=true：压缩成功并备份后，把原始视频移入回收站（绝不裸删），压缩版保留在
+  `<原名>_compressed.mp4`（flv/mkv 等源因容器兼容性问题也统一输出 mp4）；
 - 幂等：目标已存在且体积合理则跳过；
-- 不抛异常，避免影响总结主流程；失败仅记日志返回 None。
+- 不抛异常，避免影响总结主流程；失败仅记日志返回 None，绝不破坏原文件。
 
 用法:
-  python compress_video.py --src "D:\\录播\\...\录制-xxx.mp4"
-  python compress_video.py --src "..." --replace   # 直接覆盖原文件（需先备份，见说明）
+  python compress_video.py --src "D:\\录播\\...\\录制-xxx.mp4"
+  python compress_video.py --src "..." --replace   # 压缩后删原视频（先备份）
 """
 
 import argparse
+import datetime
 import os
+import re
+import shutil
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import Logger, probe_duration, hms
+
+# 从文件名里提取 8 位日期（20260824），用于「按日期子目录输出」
+_DATE_RE = re.compile(r'(\d{8})')
+
+
+def _date_from_name(src):
+    fn = os.path.basename(src)
+    # 文件名里可能有多个 8 位数字（如 UID 25788785 排在日期 20260824 前），
+    # 必须找「第一个能解析成合法日期」的，而不是第一个 8 位数字。
+    for m in _DATE_RE.finditer(fn):
+        ymd = m.group(1)
+        try:
+            datetime.date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8]))
+            return ymd
+        except Exception:
+            continue
+    return None
 
 
 def _audio_codec_of(ffprobe, src):
     """返回音频流编码名，用于决定是否可无损 copy。"""
     try:
         out = os.popen('%s -hide_banner -v error -show_entries stream=codec_name '
-                       '-select_streams a:0 -of default=noprint_wrappers=1:nokey=1 "%s"'
+                       '-select_streams a: 0 -of default=noprint_wrappers=1:nokey=1 "%s"'
                        % (ffprobe, src)).read().strip()
         return out
     except Exception:
         return ''
 
 
-def compress_video(cfg, log, src_video, replace_original=False):
+def compress_video(cfg, log, src_video, replace_original=False, archive_root=None):
     """把 src_video 用 hevc_nvenc 压成更小的归档副本。
 
     返回输出文件路径；未启用 / 源不存在 / 转换失败返回 None。
 
-    replace_original=False（默认）：输出 src_video 同目录的 `<名>_compressed<ext>` 新文件，
-        保留原始文件，安全（不破坏原始数据）。
-    replace_original=True：直接覆盖 src_video（调用方需先备份，本函数不负责备份）。
+    replace_original=False（默认）：输出 `<名>_compressed.mp4` 新文件，保留原始（安全）。
+    replace_original=True：压缩成功后先备份原文件到 ~/.workbuddy/backups/live_raw/，
+        再把原视频移入回收站，压缩版保留在 _compressed.mp4。压缩失败不动原文件。
     """
     cc = cfg.get('compress') or {}
     if not cc.get('enabled', False):
@@ -72,16 +95,31 @@ def compress_video(cfg, log, src_video, replace_original=False):
     preset = cc.get('preset', 'p4')         # p4 = balanced；p1 最快/p7 最慢最省体积
     audio_mode = cc.get('audio_mode', 'copy')  # copy = 原始音频直接复用；aac = 重编码 192k
 
-    base, ext = os.path.splitext(src_video)
-    if replace_original or cc.get('replace_original', False):
-        out = src_video
+    base_noext, ext = os.path.splitext(src_video)
+    name = os.path.basename(base_noext)
+    # HEVC 在 flv/mkv 等容器兼容性差，统一输出为 mp4（hvc1）以保证可播放
+    out_ext = '.mp4'
+    out_mode = cc.get('out_dir_mode', 'next_to_source')
+    ymd = _date_from_name(src_video)
+    if out_mode == 'date_subfolder' and ymd:
+        # 用户 tips（2026-08-24）：压缩后的 MP4 放进「根目录/YYYY-MM-DD/」日期子目录。
+        # archive_root 缺省时用源文件所在目录（本地 flv 即在根目录），B站兜底显式传 LOCAL_ROOT。
+        base_dir = archive_root or os.path.dirname(src_video)
+        out_dir = os.path.join(base_dir, '%s-%s-%s' % (ymd[:4], ymd[4:6], ymd[6:8]))
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, name + '_compressed' + out_ext)
+        log('[compress] 输出到日期子目录：%s' % out_dir)
     else:
-        out = base + '_compressed' + ext
+        out = os.path.join(os.path.dirname(src_video), name + '_compressed' + out_ext)
+
+    replace = replace_original or cc.get('replace_original', False)
 
     # 幂等：已存在且体积正常则跳过
     if os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
         sz = os.path.getsize(out) // 1024 // 1024
         log('[compress] 已存在，跳过：%s（%d MB）' % (os.path.basename(out), sz))
+        if replace:
+            _replace_backup_then_delete(cfg, log, src_video, out)
         return out
 
     a_params = ['-c:a', 'copy']
@@ -118,53 +156,45 @@ def compress_video(cfg, log, src_video, replace_original=False):
         log.error('[compress] 转换后文件异常')
         return None
 
-    # replace_original：先备份原文件，确认成功后删除原文件（用 trash 机制，不裸删）
-    if replace_original:
-        try:
-            backup = backup_then_remove(cfg, log, src_video, out)
-            if backup:
-                log('[compress] 原始文件已替换为压缩版，备份保留在：%s' % backup)
-            else:
-                log('[compress] 已删除原始文件（无可用的回收站机制，已二次确认）', 'WARN')
-        except Exception as e:
-            log.error('[compress] 删除原文件失败（压缩版已就绪，原文件保留）：%s' % e)
+    # replace_original：压缩成功后先备份原文件，再删除原视频（用回收站，不裸删）
+    if replace:
+        ok = _replace_backup_then_delete(cfg, log, src_video, out)
+        if not ok:
+            log('[compress] 原文件保留（压缩版已就绪）：%s' % os.path.basename(out))
     return out
 
 
-def backup_then_remove(cfg, log, src_video, compressed):
-    """压缩成功且校验通过后：备份原文件，删除原始（用 trash，不裸 rm）。
+def _replace_backup_then_delete(cfg, log, src_video, compressed):
+    """压缩成功且校验通过后：备份原文件到 ~/.workbuddy/backups/live_raw/，再删除原始视频。
 
-    返回备份路径；若无 trash 可用则要求外部确认（这里仅记警告）。
+    返回 True 表示已成功删除原文件（压缩版保留在 compressed 路径）；
+    若回收站不可用则保留原文件并返回 False（绝不裸 rm）。
     """
-    import shutil
     home = os.path.expanduser('~')
     backup_dir = os.path.join(home, '.workbuddy', 'backups', 'live_raw')
     os.makedirs(backup_dir, exist_ok=True)
-    base = os.path.basename(src_video)
-    backup = os.path.join(backup_dir, base)
+    backup = os.path.join(backup_dir, os.path.basename(src_video))
     try:
         shutil.copy2(src_video, backup)
         log('[compress] 已备份原文件到：%s' % backup)
     except Exception as e:
         log.error('[compress] 备份失败，放弃删除原文件：%s' % e)
-        return None
-    # 删除原文件：优先 trash 机制（Windows Recycle Bin 不可用时 gio/trash-put）
+        return False
+    # 删除原文件：优先 OS 回收站（Windows Recycle Bin / Linux gio trash / macOS trash）
     try:
-        import subprocess as _sub
-        # Windows: 用 PowerShell Recycle Bin；macOS/Linux: gio trash
         if os.name == 'nt':
             ps = ('$sh=New-Object -ComObject Shell.Application;'
-                  '$f=$sh.NameSpace(0).Items();'
-                  '$f.Item("' + backup.replace('\\', '\\\\') + '") | Out-Null;'
-                  '$sh.NameSpace(0).MoveItem($f.Item("' + src_video.replace('\\', '\\\\') + '"), 10)')
-            _sub.run(['powershell', '-NoProfile', '-Command', ps], check=True)
+                  '$ns=$sh.NameSpace(0);'
+                  '$it=$ns.ParseName("' + src_video.replace('\\', '\\\\') + '");'
+                  'if($it){$ns.MoveItem($it,10)}')
+            subprocess.run(['powershell', '-NoProfile', '-Command', ps], check=True)
         else:
-            _sub.run(['gio', 'trash', src_video], check=True)
-        log('[compress] 已将原文件移入回收站：%s' % src_video)
-        return backup
+            subprocess.run(['gio', 'trash', src_video], check=True)
+        log('[compress] 已把原视频移入回收站：%s' % src_video)
+        return True
     except Exception as e:
-        log.error('[compress] 无回收站可用，未删除原文件（压缩版已就绪）：%s' % e)
-        return backup
+        log.error('[compress] 回收站删除失败，原文件保留（请手动清理）：%s' % e)
+        return False
 
 
 def main():

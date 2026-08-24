@@ -141,6 +141,114 @@ def single_to_mp3(ffmpeg, src, dst, log, max_seconds=None):
     return None
 
 
+def get_video_url(bvid, cid, cookies, log):
+    """取 DASH 视频流里码率最高的一条（HEVC/AVC 均可，后续统一重封装 mp4）。"""
+    for attempt in range(3):
+        d = bili_get('https://api.bilibili.com/x/player/playurl',
+                     {'bvid': bvid, 'cid': cid, 'qn': 0, 'fnval': 16, 'fnver': 0, 'fourk': 1},
+                     cookies)
+        if d.get('code') != 0:
+            log.error(f'playurl code={d.get("code")} {d.get("message")}')
+            time.sleep(5 * (2 ** attempt))
+            continue
+        dash = (d.get('data') or {}).get('dash') or {}
+        videos = list(dash.get('video') or [])
+        if not videos:
+            log.error('该分P没有可用视频流')
+            return None
+        best = max(videos, key=lambda x: (x.get('bandwidth', 0), x.get('height', 0)))
+        return best['baseUrl']
+    return None
+
+
+def download_video_one(cfg, video, log, max_seconds=None):
+    """下载单期录播视频（最佳 DASH 视频+音频），多P合并为单个 MP4。
+
+    供「B站兜底」路径使用：兜底时本地没有视频文件，需要从 B站把视频拉下来，
+    才能走「总结→中质量MP3→压缩HEVC」的完整交付。返回合并后的 MP4 路径；失败返回 None。
+    """
+    P = cfg['paths']
+    cookies = load_cookies(P.get('cookies'))
+    bvid = video['bvid']
+    stem = video.get('stem') or stem_for(video.get('pubdate', 0), video['title'])
+    final = os.path.join(cfg['_dirs']['tmp'], 'bilibili', stem + '.mp4')
+    if os.path.exists(final) and os.path.getsize(final) > 1024 * 1024:
+        log(f'合并视频已存在，跳过下载：{stem}')
+        return final
+
+    info = fetch_view(bvid, cookies)
+    pages = info.get('pages') or []
+    log(f'{bvid} 共 {len(pages)} 个分P（视频）：{info.get("title", "")[:50]}')
+
+    work = os.path.join(cfg['_dirs']['tmp'], 'bilibili', bvid)
+    os.makedirs(work, exist_ok=True)
+
+    parts = []
+    for pi, page in enumerate(pages, 1):
+        cid = page['cid']
+        log(f'  P{pi}/{len(pages)}  {hms(page.get("duration", 0))}  {page.get("part", "")[:40]}')
+        v_url = get_video_url(bvid, cid, cookies, log)
+        a_url = get_audio_url(bvid, cid, cookies, log)
+        if not v_url or not a_url:
+            log.error(f'  P{pi} 取流失败，整期中止')
+            return None
+        v_raw = aria2_download(P['aria2c'], v_url, work, f'p{pi:02d}.video.m4s', log)
+        a_raw = aria2_download(P['aria2c'], a_url, work, f'p{pi:02d}.audio.m4s', log)
+        if not v_raw or not a_raw:
+            log.error(f'  P{pi} 下载失败，整期中止')
+            return None
+        mux = os.path.join(work, f'p{pi:02d}.mp4')
+        r = run([P['ffmpeg'], '-y', '-hide_banner', '-loglevel', 'error',
+                 '-i', v_raw, '-i', a_raw, '-c', 'copy', mux], timeout=900)
+        if not (os.path.exists(mux) and os.path.getsize(mux) > 10240):
+            log.error(f'  P{pi} 封装失败：{(r.stderr or "")[-300:]}')
+            return None
+        try:
+            os.remove(v_raw)
+            os.remove(a_raw)
+        except Exception:
+            pass
+        parts.append(mux)
+        log(f'  P{pi} 完成 {os.path.getsize(mux) // 1024 // 1024}MB')
+
+    if not parts:
+        return None
+
+    t0 = time.time()
+    ffmpeg = P['ffmpeg']
+    if len(parts) > 1:
+        log(f'  合并 {len(parts)} 个分P → 单个 MP4 ...')
+        lst = os.path.join(work, '_concat_list.txt')
+        with open(lst, 'w', encoding='utf-8') as f:
+            for p in parts:
+                f.write("file '" + p.replace('\\', '/').replace("'", "'\\''") + "'\n")
+        r = run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                 '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', final], timeout=7200)
+        try:
+            os.remove(lst)
+        except Exception:
+            pass
+    else:
+        r = run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                 '-i', parts[0], '-c', 'copy', final], timeout=7200)
+    if not (os.path.exists(final) and os.path.getsize(final) > 1024 * 1024):
+        log.error(f'  生成合并视频失败：{(r.stderr or "")[-300:]}')
+        return None
+    dur = probe_duration(P['ffprobe'], final)
+    log(f'  合并视频就绪：{os.path.basename(final)}  {hms(dur)}  '
+        f'{os.path.getsize(final) // 1024 // 1024}MB  耗时 {time.time() - t0:.0f}s')
+    for p in parts:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+    try:
+        os.rmdir(work)
+    except Exception:
+        pass
+    return final
+
+
 def download_one(cfg, video, log, max_seconds=None):
     """下载单期录播 → 返回合并好的 MP3 路径。"""
     P = cfg['paths']
