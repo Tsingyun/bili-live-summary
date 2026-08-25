@@ -102,10 +102,16 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     out_mode = cc.get('out_dir_mode', 'next_to_source')
     ymd = _date_from_name(src_video)
     if out_mode == 'date_subfolder' and ymd:
-        # 用户 tips（2026-08-24）：压缩后的 MP4 放进「根目录/YYYY-MM-DD/」日期子目录。
-        # archive_root 缺省时用源文件所在目录（本地 flv 即在根目录），B站兜底显式传 LOCAL_ROOT。
-        base_dir = archive_root or os.path.dirname(src_video)
-        out_dir = os.path.join(base_dir, '%s-%s-%s' % (ymd[:4], ymd[4:6], ymd[6:8]))
+        # 用户规则（2026-08-24）：压缩后的 MP4 放进「根目录/YYYY-MM-DD/」日期子目录；
+        # 但若源文件已经位于该日期子目录内（录制器已把原文件放进 根/YYYY-MM-DD/），
+        # 则直接复用该目录，不要再新建一层 根/YYYY-MM-DD/YYYY-MM-DD/。
+        date_folder = '%s-%s-%s' % (ymd[:4], ymd[4:6], ymd[6:8])
+        parent = os.path.dirname(src_video)
+        if os.path.basename(parent) == date_folder:
+            out_dir = parent
+        else:
+            base_dir = archive_root or parent
+            out_dir = os.path.join(base_dir, date_folder)
         os.makedirs(out_dir, exist_ok=True)
         out = os.path.join(out_dir, name + '_compressed' + out_ext)
         log('[compress] 输出到日期子目录：%s' % out_dir)

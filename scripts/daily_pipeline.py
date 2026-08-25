@@ -408,6 +408,9 @@ def bilibili_fallback(cfg, st, log, cookies, progress):
 
     log('B站兜底：本次待处理 %d 期' % len(picked))
     for a in picked:
+        # fetch_series 返回的原始 dict 只有 _live_date（datetime.date），
+        # 没有字符串 date 键；补上供后续 log / process_video_source / mark_bilibili_done 使用
+        a['date'] = a['_live_date'].isoformat()
         bvid = a['bvid']
         log('=' * 68)
         log('B站兜底处理 %s  %s  %s' % (bvid, a['date'], a['title'][:46]))
