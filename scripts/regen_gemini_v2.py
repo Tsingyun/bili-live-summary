@@ -366,7 +366,7 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         log(f'  ✅ 已保存：{docx_path}（{len(all_blocks)} 块）')
         # 整场完成，清理该场进度缓存
         progress.pop(date_str, None)
-        save_progress(progress)
+        save_progress(progress, progress_path)
         return True
     finally:
         S._release_doc_lock(lock_path)
