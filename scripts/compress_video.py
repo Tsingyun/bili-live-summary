@@ -9,7 +9,8 @@ RTX 20 系及以后支持 hevc_nvenc，速度远快于 CPU 编码。
 
 设计原则（与 bili-live-summary 其它模块一致）：
 - 默认（replace_original=false）：输出 `<原名>_compressed.mp4` 新文件，保留原始以便核对；
-- replace_original=true：压缩成功并备份后，把原始视频移入回收站（绝不裸删），压缩版保留在
+- replace_original=true：压缩成功并备份（与原视频同盘，默认 <盘>:\\live_raw_backup，
+  可在 compress.backup_dir 覆盖）后，把原始视频可靠移入回收站（绝不裸删），压缩版保留在
   `<原名>_compressed.mp4`（flv/mkv 等源因容器兼容性问题也统一输出 mp4）；
 - 幂等：目标已存在且体积合理则跳过；
 - 不抛异常，避免影响总结主流程；失败仅记日志返回 None，绝不破坏原文件。
@@ -65,8 +66,9 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     返回输出文件路径；未启用 / 源不存在 / 转换失败返回 None。
 
     replace_original=False（默认）：输出 `<名>_compressed.mp4` 新文件，保留原始（安全）。
-    replace_original=True：压缩成功后先备份原文件到 ~/.workbuddy/backups/live_raw/，
-        再把原视频移入回收站，压缩版保留在 _compressed.mp4。压缩失败不动原文件。
+    replace_original=True：压缩成功后先备份原文件（与原视频同盘，默认 <盘>:\\live_raw_backup，
+        可在 compress.backup_dir 覆盖；按 max_backup_files/max_backup_gb 自动收敛），
+        再可靠移入回收站，压缩版保留在 _compressed.mp4。压缩失败不动原文件。
     """
     cc = cfg.get('compress') or {}
     if not cc.get('enabled', False):
@@ -170,32 +172,102 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     return out
 
 
-def _replace_backup_then_delete(cfg, log, src_video, compressed):
-    """压缩成功且校验通过后：备份原文件到 ~/.workbuddy/backups/live_raw/，再删除原始视频。
+def _default_backup_dir(src_video):
+    """备份目录：默认与原视频同盘（避免塞满系统盘 C:）。
 
-    返回 True 表示已成功删除原文件（压缩版保留在 compressed 路径）；
-    若回收站不可用则保留原文件并返回 False（绝不裸 rm）。
+    例：原视频在 D:\\录播\\... → D:\\live_raw_backup\\。
+    可在 compress.backup_dir 显式覆盖（建议指向大容量存档盘）。
     """
-    home = os.path.expanduser('~')
-    backup_dir = os.path.join(home, '.workbuddy', 'backups', 'live_raw')
+    drive = os.path.splitdrive(os.path.abspath(src_video))[0]
+    if drive:
+        return os.path.join(drive + os.sep, 'live_raw_backup')
+    return os.path.join(os.path.dirname(os.path.abspath(src_video)), 'live_raw_backup')
+
+
+def _send_to_recycle_bin(log, path):
+    """可靠地把文件移入系统回收站（绝不裸删）。
+
+    返回 True 表示成功；失败抛异常由调用方处理（保留原文件）。
+    Windows 用 VB Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(SendToRecycleBin)，
+    对超大文件可靠（旧实现用 COM ParseName 对超长中文路径/大文件静默失败，导致假成功）。
+    """
+    if os.name == 'nt':
+        ps = ('Add-Type -AssemblyName Microsoft.VisualBasic;'
+              '[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
+              '"' + path.replace('\\', '\\\\') + '",'
+              '"OnlyErrorDialogs","SendToRecycleBin")')
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps], check=True)
+    elif sys.platform == 'darwin':
+        subprocess.run(['osascript', '-e',
+                        'tell application "Finder" to delete POSIX file "%s"' % path],
+                       check=True)
+    else:
+        subprocess.run(['gio', 'trash', path], check=True)
+    return True
+
+
+def _prune_backups(log, backup_dir, cc):
+    """备份目录收敛：按文件数 / 总容量上限删除最旧备份，避免备份盘被撑爆。
+
+    备份副本是冗余（原件已压成 _compressed.mp4，必要时还可从回收站找回），
+    故直接 os.remove，不再进回收站（避免无限套娃）。
+    """
+    try:
+        files = [os.path.join(backup_dir, f) for f in os.listdir(backup_dir)
+                 if os.path.isfile(os.path.join(backup_dir, f))]
+    except Exception:
+        return
+    if not files:
+        return
+    files.sort(key=lambda p: os.path.getmtime(p))
+    max_files = int(cc.get('max_backup_files', 3))
+    max_bytes = float(cc.get('max_backup_gb', 60)) * 1024.0 ** 3
+    while len(files) > max_files:
+        old = files.pop(0)
+        try:
+            os.remove(old)
+            log('[compress] 备份超量，删除最旧：%s' % os.path.basename(old))
+        except Exception as e:
+            log.error('[compress] 删除旧备份失败：%s' % e)
+            break
+    while files:
+        total = sum(os.path.getsize(f) for f in files)
+        if total <= max_bytes or len(files) <= 1:
+            break
+        old = files.pop(0)
+        try:
+            os.remove(old)
+            log('[compress] 备份超容量，删除最旧：%s' % os.path.basename(old))
+        except Exception as e:
+            log.error('[compress] 删除旧备份失败：%s' % e)
+            break
+
+
+def _replace_backup_then_delete(cfg, log, src_video, compressed):
+    """压缩成功且校验通过后：备份原文件（与原视频同盘），再可靠移入回收站。
+
+    返回 True 表示原文件已移入回收站（压缩版保留在 compressed 路径）；
+    任意环节失败都保留原文件并返回 False（绝不裸 rm）。
+    """
+    cc = cfg.get('compress') or {}
+    backup_dir = cc.get('backup_dir') or _default_backup_dir(src_video)
     os.makedirs(backup_dir, exist_ok=True)
     backup = os.path.join(backup_dir, os.path.basename(src_video))
+    # 1) 备份原文件（冗余副本，用于极端情况下的原片找回）
     try:
         shutil.copy2(src_video, backup)
         log('[compress] 已备份原文件到：%s' % backup)
     except Exception as e:
         log.error('[compress] 备份失败，放弃删除原文件：%s' % e)
         return False
-    # 删除原文件：优先 OS 回收站（Windows Recycle Bin / Linux gio trash / macOS trash）
+    # 2) 收敛备份目录，防止备份盘被撑爆
     try:
-        if os.name == 'nt':
-            ps = ('$sh=New-Object -ComObject Shell.Application;'
-                  '$ns=$sh.NameSpace(0);'
-                  '$it=$ns.ParseName("' + src_video.replace('\\', '\\\\') + '");'
-                  'if($it){$ns.MoveItem($it,10)}')
-            subprocess.run(['powershell', '-NoProfile', '-Command', ps], check=True)
-        else:
-            subprocess.run(['gio', 'trash', src_video], check=True)
+        _prune_backups(log, backup_dir, cc)
+    except Exception as e:
+        log.error('[compress] 备份收敛异常（不影响原文件）：%s' % e)
+    # 3) 可靠移入回收站（Windows VB / macOS Finder / Linux gio）
+    try:
+        _send_to_recycle_bin(log, src_video)
         log('[compress] 已把原视频移入回收站：%s' % src_video)
         return True
     except Exception as e:
