@@ -103,6 +103,8 @@
     "preset": "p4",
     "audio_mode": "copy",
     "out_dir_mode": "date_subfolder",
-    "replace_original": false
+    "replace_original": false,
+    "replace_mode": "recycle",
+    "_comment_replace_mode": "replace_original=true 时如何处理原视频：recycle=先备份再移回收站（默认，安全）；delete=压缩成功后直接永久删除原视频（省空间，不进回收站/不备份）。"
   }
 }

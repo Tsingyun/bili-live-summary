@@ -9,15 +9,17 @@ RTX 20 系及以后支持 hevc_nvenc，速度远快于 CPU 编码。
 
 设计原则（与 bili-live-summary 其它模块一致）：
 - 默认（replace_original=false）：输出 `<原名>_compressed.mp4` 新文件，保留原始以便核对；
-- replace_original=true：压缩成功并备份（与原视频同盘，默认 <盘>:\\live_raw_backup，
-  可在 compress.backup_dir 覆盖）后，把原始视频可靠移入回收站（绝不裸删），压缩版保留在
-  `<原名>_compressed.mp4`（flv/mkv 等源因容器兼容性问题也统一输出 mp4）；
+- replace_original=true 且 replace_mode=recycle（默认）：压缩成功并备份（与原视频同盘，
+  默认 <盘>:\\live_raw_backup，可在 compress.backup_dir 覆盖）后，把原始视频可靠移入回收站
+  （绝不裸删），压缩版保留在 `<原名>_compressed.mp4`；
+- replace_original=true 且 replace_mode=delete：压缩成功后直接永久删除原视频
+  （省空间，不进回收站 / 不备份），压缩版保留在 `<原名>_compressed.mp4`；
 - 幂等：目标已存在且体积合理则跳过；
 - 不抛异常，避免影响总结主流程；失败仅记日志返回 None，绝不破坏原文件。
 
 用法:
   python compress_video.py --src "D:\\录播\\...\\录制-xxx.mp4"
-  python compress_video.py --src "..." --replace   # 压缩后删原视频（先备份）
+  python compress_video.py --src "..." --replace   # 压缩后替换原视频（默认进回收站；replace_mode=delete 则直接删）
 """
 
 import argparse
@@ -66,9 +68,12 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     返回输出文件路径；未启用 / 源不存在 / 转换失败返回 None。
 
     replace_original=False（默认）：输出 `<名>_compressed.mp4` 新文件，保留原始（安全）。
-    replace_original=True：压缩成功后先备份原文件（与原视频同盘，默认 <盘>:\\live_raw_backup，
-        可在 compress.backup_dir 覆盖；按 max_backup_files/max_backup_gb 自动收敛），
-        再可靠移入回收站，压缩版保留在 _compressed.mp4。压缩失败不动原文件。
+    replace_original=True：压缩成功后按 compress.replace_mode 处理原文件——
+        - replace_mode=recycle（默认）：先备份原文件（与原视频同盘，默认 <盘>:\\live_raw_backup，
+          可在 compress.backup_dir 覆盖；按 max_backup_files/max_backup_gb 自动收敛），
+          再可靠移入回收站；
+        - replace_mode=delete：直接永久删除原视频（不进回收站 / 不备份，省空间）；
+        压缩版均保留在 _compressed.mp4。压缩失败不动原文件。
     """
     cc = cfg.get('compress') or {}
     if not cc.get('enabled', False):
@@ -127,7 +132,7 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
         sz = os.path.getsize(out) // 1024 // 1024
         log('[compress] 已存在，跳过：%s（%d MB）' % (os.path.basename(out), sz))
         if replace:
-            _replace_backup_then_delete(cfg, log, src_video, out)
+            _replace_by_mode(cfg, log, src_video, out)
         return out
 
     a_params = ['-c:a', 'copy']
@@ -164,9 +169,9 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
         log.error('[compress] 转换后文件异常')
         return None
 
-    # replace_original：压缩成功后先备份原文件，再删除原视频（用回收站，不裸删）
+    # replace_original：压缩成功后按需处理原文件（replace_mode 决定方式）
     if replace:
-        ok = _replace_backup_then_delete(cfg, log, src_video, out)
+        ok = _replace_by_mode(cfg, log, src_video, out)
         if not ok:
             log('[compress] 原文件保留（压缩版已就绪）：%s' % os.path.basename(out))
     return out
@@ -272,6 +277,37 @@ def _replace_backup_then_delete(cfg, log, src_video, compressed):
         return True
     except Exception as e:
         log.error('[compress] 回收站删除失败，原文件保留（请手动清理）：%s' % e)
+        return False
+
+
+def _replace_by_mode(cfg, log, src_video, compressed):
+    """按 compress.replace_mode 决定「压缩成功后如何处理原视频」。
+
+    - recycle（默认）：备份后移入回收站（见 _replace_backup_then_delete）；
+    - delete：直接永久删除（见 _replace_direct_delete）。
+    返回 True 表示原文件已移除；失败则保留原文件返回 False。
+    """
+    cc = cfg.get('compress') or {}
+    mode = (cc.get('replace_mode') or 'recycle').lower()
+    if mode == 'delete':
+        return _replace_direct_delete(cfg, log, src_video, compressed)
+    return _replace_backup_then_delete(cfg, log, src_video, compressed)
+
+
+def _replace_direct_delete(cfg, log, src_video, compressed):
+    """压缩成功且校验通过后：直接永久删除原视频（用户规则 2026-08-28：省空间，不进回收站/不备份）。
+
+    仅在 compressed 校验通过后才删除；任何异常都保留原文件并返回 False（绝不误删）。
+    """
+    if not (os.path.exists(compressed) and os.path.getsize(compressed) > 1024 * 1024):
+        log.error('[compress] 压缩产物不可用，保留原文件：%s' % os.path.basename(src_video))
+        return False
+    try:
+        os.remove(src_video)
+        log('[compress] 已直接删除原视频（压缩版已就绪）：%s' % os.path.basename(src_video))
+        return True
+    except Exception as e:
+        log.error('[compress] 删除原视频失败，原文件保留：%s' % e)
         return False
 
 
