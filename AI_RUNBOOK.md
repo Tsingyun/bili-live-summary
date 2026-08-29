@@ -11,7 +11,9 @@
 
 1. **AI 总结的 Word 文档**（放在桌面/指定目录，按月归档）
 2. **中质量 MP3**（192k / 44.1k，体积不大，音质够文字识别，用户另有他用）
-3. **压缩后的 HEVC MP4**（~5GB，放到 `本地录播根目录/YYYY-MM-DD/`）
+3. **视频文件**（放到 `本地录播根目录/YYYY-MM-DD/`）
+   - **本地录播** → 压缩后的 HEVC MP4（~5GB，`<原名>_compressed.mp4`）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）
+   - **B站兜底下载的录播** → **不压缩**，跑完流程后**原样保留 MP4**（用户规则 2026-08-29）
 
 来源优先级：**本地录播目录优先；本地没有才去 B站合集兜底**。
 
@@ -78,11 +80,13 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 |---|---|---|---|
 | 1 | **监测本地根目录**（`config.local.root`）的新录播（flv/mp4，直接放根目录） | `scan_root_sessions` | 待处理 session 列表；录制中/已处理的自动跳过 |
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
-| 3 | **无本地新文件 → B站兜底**：抓合集最近未处理录播，下载合并多 P 视频 → 同一条总结流程 | `bilibili_fallback` + `download_merge.download_video_one` | 同上（源是下载的视频） |
+| 3 | **无本地新文件 → B站兜底**：抓合集最近未处理录播，下载合并多 P 视频 → 同一条总结流程 | `bilibili_fallback` + `download_merge.download_video_one` | 同上（源是下载的视频）；**MP4 跑完后保留、不压缩** |
 | 4 | **导出中质量 MP3**（192k/44.1k） | `mp3_export.export_for_local` | 根目录下的 `.mp3` |
-| 5 | **压缩 HEVC MP4**（~5GB）→ 日期子目录 | `compress_video.compress_video` | `根目录/YYYY-MM-DD/*_compressed.mp4` |
+| 5 | **压缩 HEVC MP4**（~5GB）→ 日期子目录（**仅本地录播**） | `compress_video.compress_video` | `根目录/YYYY-MM-DD/*_compressed.mp4` |
+| 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `根目录/YYYY-MM-DD/<原名>.mp4` |
 
 > 第 1 步有文件 → 走第 2 步；第 1 步**没有任何可处理文件** → 才走第 3 步 B站兜底（二者互斥，不会重复）。
+> **用户规则（2026-08-29）**：本地磁盘没有当天录播、但 B站有时（走第 3 步），跑完流程之后要**留下 B站录播的 MP4**，且这类 MP4 **不用压缩**。由 `config.bilibili` 的 `keep_mp4`（默认 true）与 `compress`（默认 false）控制。
 
 ---
 
@@ -94,13 +98,13 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
   命名规则：`录制-<UID>-<YYYYMMDD>-<HHMMSS>-<idx>-<标题>.<ext>`
   （自定义命名需在 config.local.name_regex 里提供含 `date`/`time`/`title` 命名组的正则）
 - **flv 通常是录制中的临时格式，且可能在录制过程中被监测到**——脚本用「大小稳定 + 修改时间够老」判定文件已写完，否则整段跳过，避免截半。
-- 处理完成后根目录会留下：中质量 `.mp3`（交付物）+ 各 `YYYY-MM-DD\` 子目录（里面是压缩后的 `_compressed.mp4` 交付物）。
+- 处理完成后根目录会留下：中质量 `.mp3`（交付物）+ 各 `YYYY-MM-DD\` 子目录（里面是视频交付物：本地录播 = 压缩后的 `_compressed.mp4`；B站兜底 = 原样保留的 MP4）。
 
-### 压缩产物位置（`compress.out_dir_mode = "date_subfolder"`）
-- 压缩后 MP4 进 **`根目录/YYYY-MM-DD/`** 子目录（子目录不存在则新建；已存在则跳过这步）。
+### 视频产物位置（`compress.out_dir_mode = "date_subfolder"`）
+- 视频进 **`根目录/YYYY-MM-DD/`** 子目录（子目录不存在则新建；已存在则跳过这步）。
 - 日期从文件名里的 8 位日期 `20260824` 解析（自动跳过 UID 等非法日期串）。
-- 本地源：`replace_original=true` → 压缩成功后原视频先备份到 `~/.workbuddy/backups/live_raw/` 再移入**回收站**（绝不裸删）。
-- B站源：是临时下载文件，压缩成功后直接删除。
+- **本地源**：压缩后 `<原名>_compressed.mp4`；`replace_original=true` 时按 `replace_mode` 处理原视频——`recycle` = 先备份到 `~/.workbuddy/backups/live_raw/` 再移入**回收站**；`delete` = **直接永久删除**（省空间，岁己当前配置）。
+- **B站源**：**不压缩**，原样保留下载到的 MP4，按直播日期归档到 `根目录/YYYY-MM-DD/`（默认 `bilibili.keep_mp4=true`）。设 `keep_mp4=false` 才删除下载视频。
 
 ### 工作目录 `D:\岁己直播自动总结`（运行时产物，config 所在）
 ```
@@ -117,7 +121,8 @@ prompt_original.txt    # 总结用的 system prompt
 |---|---|
 | Word 总结 | 桌面 `岁己直播总结_{year}年{month}月.docx`（同月同一文档，分页追加） |
 | 中质量 MP3 | `本地根目录\<原名>.mp3` |
-| 压缩 HEVC MP4 | `本地根目录\YYYY-MM-DD\<原名>_compressed.mp4` |
+| 视频（本地录播） | `本地根目录\YYYY-MM-DD\<原名>_compressed.mp4`（压缩后的 HEVC） |
+| 视频（B站兜底） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（**不压缩，原样保留**） |
 
 ---
 
@@ -136,8 +141,10 @@ prompt_original.txt    # 总结用的 system prompt
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
 | `mp3_export` | `enabled/bitrate/ar` | `true` / `192k` / `44100`；`out_dir` = 录播根目录 |
 | `local_merge` | `enabled/max_gap_sec/exclude_dates` | 同日期连续段合并；`exclude_dates` 显式强制不合并 |
-| `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder` / `true`（压缩后回收站删原视频） |
+| `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder` / `true`（**仅本地录播**压缩后处理原视频） |
+| `compress` | `replace_mode` | `delete` = 直接永久删原视频（岁己当前，省空间）；`recycle` = 先备份再移回收站 |
 | `compress` | `codec/target_size_gb/cq` | `hevc_nvenc` / `5` / `24` |
+| `bilibili` | `keep_mp4` / `compress` | `true` / `false`（B站兜底录播**保留 MP4、不压缩**，归档到 `根目录/YYYY-MM-DD/`） |
 | `cleanup` | `delete_mp3_after_success` | `true`（删 16k 临时音频，不影响中质量 MP3） |
 
 > API Key 在 `summarize.api_key`（仅本机 config，勿提交）。Gemini 免费层每模型每日 20 次硬上限、RPM=5，脚本已内置轮换 + 限流。
@@ -193,7 +200,8 @@ prompt_original.txt    # 总结用的 system prompt
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |
 | `scripts/summarize_gemini.py` | Word 排版底层（粗体总结、斜体金句、章节元数据、话题分隔线） |
 | `scripts/mp3_export.py` | 中质量 MP3 导出 |
-| `scripts/compress_video.py` | HEVC 压缩（日期子目录输出 + 回收站删原视频） |
+| `scripts/compress_video.py` | HEVC 压缩（仅本地录播；日期子目录输出 + `replace_mode` 决定原视频处理方式） |
+| `scripts/daily_pipeline._archive_bilibili_mp4` | B站录播 MP4 归档（不压缩，原样挪到 `根目录/YYYY-MM-DD/`） |
 | `scripts/download_merge.py` | B站音频下载(`download_one`) + **视频下载合并**(`download_video_one`，兜底用) |
 | `scripts/fetch_latest.py` | B站合集选片逻辑（`latest_by_live_date` 等） |
 | `scripts/common.py` | 配置/状态/日志/B站接口/标点清洗/数字归一 |

@@ -83,6 +83,11 @@
     "root": "",
     "name_regex": ""
   },
+  "bilibili": {
+    "_comment": "步骤3 B站兜底（本地没有该日录播、B站有时）。用户规则(2026-08-29)：跑完流程之后要留下 B站录播的 MP4 文件——这类 MP4 不再压缩，原样归档到「录播根目录/YYYY-MM-DD/」（与本地压缩版同一个视频库；该目录不在根目录监测的扫描范围，不会被误判成新录播）。keep_mp4=false 才删除下载视频；compress=true 才对 B站视频也做 HEVC 压缩。",
+    "keep_mp4": true,
+    "compress": false
+  },
   "local_merge": {
     "_comment": "同日期目录下多个录播文件若时间连续（网络波动断开重连），先合并成单一时间线再总结。判定：按文件名时间排序，相邻段间隙<=max_gap_sec 且能取到时长则并入同一场；否则各自总结。",
     "enabled": true,

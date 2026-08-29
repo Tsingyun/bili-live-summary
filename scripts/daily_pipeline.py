@@ -14,10 +14,15 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
      搜索最近未处理的录播，下载并合并多 P 为单个视频，再走总结流程。
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
      （192k / 44.1k，体积不大，音质满足文字识别即可，用户另有他用）。
-  5. 以上全部结束后 → 把视频压成体积约 5GB 的 HEVC(H.265) MP4 文件。
-     flv/mkv 等统一输出为 mp4，并放进 `根目录/YYYY-MM-DD/` 日期子目录。
+  5. 以上全部结束后（仅本地录播）→ 把视频压成体积约 5GB 的 HEVC(H.265) MP4 文件，
+     放进 `根目录/YYYY-MM-DD/` 日期子目录；压缩成功后按 compress.replace_mode
+     处理原视频（recycle=备份后移回收站，delete=直接永久删除）。
 
-最终每场成品只有三样：① AI 总结的 Word 文档  ② 中质量 MP3  ③ 压缩后的 HEVC MP4。
+B站兜底（步骤3）的录播不压缩：跑完流程后原样保留下载到的 MP4，并按直播日期归档到
+`录播根目录/YYYY-MM-DD/`（见 config.bilibili：keep_mp4=true / compress=false）。
+
+最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3
+             ③ 视频（本地录播=压缩后的 HEVC MP4；B站兜底=原样保留的 MP4）。
 
 用法:
   python daily_pipeline.py              # 正式运行（监测→本地或B站→MP3→压缩）
@@ -27,6 +32,7 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
 
 import argparse
 import datetime
+import json
 import os
 import re
 import shutil
@@ -302,6 +308,46 @@ def merge_videos(cfg, log, session, out_path):
 
 
 # ---------------------------------------------------------------------------
+# B站录播 MP4 归档（用户规则 2026-08-29：本地没录播而B站有时，跑完流程要留下 MP4）
+# ---------------------------------------------------------------------------
+def _archive_bilibili_mp4(cfg, log, src_video, date_iso):
+    """把 B站下载的录播 MP4 归档留存（不做压缩，原样保留）。
+
+    用户规则（2026-08-29）：本地磁盘没有这一天录播、但 B站有时，跑完流程之后
+    要留下 B站录播的 MP4 文件；这类 MP4 不需要再压缩。
+
+    下载产物默认落在 workdir/tmp/bilibili/（临时目录，不适合长期留存），
+    故按直播日期归档到「录播根目录/YYYY-MM-DD/」——与本地压缩版同一个视频库。
+    该目录不在根目录监测的扫描范围内（只扫根级文件），不会被误判成新录播。
+
+    返回归档后的路径；任何失败都保留原文件、绝不删除。
+    """
+    try:
+        local_root = (cfg.get('local') or {}).get('root') or ''
+        if local_root:
+            out_dir = os.path.join(local_root, date_iso)
+        else:
+            out_dir = os.path.join(cfg['_dirs']['root'], 'bilibili', date_iso)
+        os.makedirs(out_dir, exist_ok=True)
+        dst = os.path.join(out_dir, os.path.basename(src_video))
+        if os.path.abspath(dst) == os.path.abspath(src_video):
+            return src_video
+        if os.path.exists(dst) and os.path.getsize(dst) >= os.path.getsize(src_video):
+            log('[bilibili] 归档 MP4 已存在：%s' % dst)
+            try:
+                os.remove(src_video)
+            except Exception:
+                pass
+            return dst
+        shutil.move(src_video, dst)
+        log('[bilibili] 已保留 B站录播 MP4 → %s' % dst)
+        return dst
+    except Exception as e:
+        log.error('[bilibili] 归档 MP4 失败（原文件保留，不删除）：%s' % e)
+        return src_video
+
+
+# ---------------------------------------------------------------------------
 # 核心：对「一个视频源」跑完 转写→总结→MP3→压缩
 # ---------------------------------------------------------------------------
 def extract_16k_audio(cfg, log, src, dst):
@@ -357,12 +403,16 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     # 4) 总结后导出中质量 MP3（192k/44.1k，供文字识别/其他用途）
     mp3_export.export_for_local(cfg, log, src_video)
 
-    # 5) 压缩成 ~5GB HEVC MP4（按 config.compress；默认输出到 根/YYYY-MM-DD/ 日期子目录）
-    cc = cfg.get('compress') or {}
-    replace = (src_kind == 'local') and cc.get('replace_original', False)
-    local_root = (cfg.get('local') or {}).get('root') or ''
-    compress_video.compress_video(cfg, log, src_video, replace_original=replace,
-                                  archive_root=local_root or None)
+    # 5) 压缩成 ~5GB HEVC MP4（仅本地录播；B站录播按用户规则不压缩，直接保留原 MP4）
+    bz = cfg.get('bilibili') or {}
+    if src_kind == 'bilibili' and not bz.get('compress', False):
+        log('[bilibili] 按规则（bilibili.compress=false）：B站录播不压缩，保留原始 MP4 作为成品')
+    else:
+        cc = cfg.get('compress') or {}
+        replace = (src_kind == 'local') and cc.get('replace_original', False)
+        local_root = (cfg.get('local') or {}).get('root') or ''
+        compress_video.compress_video(cfg, log, src_video, replace_original=replace,
+                                      archive_root=local_root or None)
 
     # 清理 16k 临时音频（与中质量归档 MP3 无关）
     if cfg['cleanup'].get('delete_mp3_after_success', True):
@@ -371,14 +421,17 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         except Exception:
             pass
 
-    # B站源是临时下载文件，压缩成功后即可删除（压缩版已是交付物）
+    # B站源：按配置保留/删除下载视频（默认保留，归档到 录播根目录/YYYY-MM-DD/）
     if src_kind == 'bilibili':
-        try:
-            if os.path.exists(src_video):
-                os.remove(src_video)
-                log('[bilibili] 已删除临时下载视频：%s' % os.path.basename(src_video))
-        except Exception as e:
-            log('[bilibili] 删除临时下载视频失败（不影响成品）：%s' % e)
+        if bz.get('keep_mp4', True):
+            _archive_bilibili_mp4(cfg, log, src_video, date_iso)
+        else:
+            try:
+                if os.path.exists(src_video):
+                    os.remove(src_video)
+                    log('[bilibili] 已删除临时下载视频：%s' % os.path.basename(src_video))
+            except Exception as e:
+                log.error('[bilibili] 删除临时下载视频失败（不影响成品）：%s' % e)
 
     try:
         RD.reorder()
