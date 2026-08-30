@@ -265,9 +265,26 @@ def already_done_local(cfg, st, session):
     fname = session_fname(session['live_date'], session['clean_title'],
                           session['hour'], session['chain_index'])
     txt_dir = cfg['_dirs'].get('txt') or st.get('_dirs', {}).get('txt')
-    if txt_dir and os.path.isdir(txt_dir) and os.path.exists(os.path.join(txt_dir, fname)):
-        return True, '本场 TXT 已存在'
-    return False, ''
+    if not (txt_dir and os.path.isdir(txt_dir)
+            and os.path.exists(os.path.join(txt_dir, fname))):
+        return False, ''
+
+    # TXT 存在还不够：必须 Word 里已有对应章节才算真完成。
+    # 否则「转写成功、但总结中途失败（崩溃 / 被杀 / 写锁抢占失败）」会留下 TXT 却没有章节，
+    # 旧逻辑据此判定已处理 → 该场被永久跳过（2026-08-31 的 8/29 场即踩此坑）。
+    try:
+        heading = fname.split('-', 1)[1].rsplit('.txt', 1)[0] if '-' in fname else fname[:-4]
+        doc_path = S.doc_path_for(cfg, session['live_date'])
+        if not os.path.exists(doc_path):
+            return False, ''
+        from docx import Document as _Docx
+        if S.has_section(_Docx(doc_path), heading):
+            return True, 'Word 已存在该章节'
+        return False, ''
+    except Exception:
+        # 校验出问题时按「未完成」更安全：重跑时 process_session 内部还有
+        # has_section 二次把关，不会重复写章节。
+        return False, ''
 
 
 def prepare_session(cfg, log, session):

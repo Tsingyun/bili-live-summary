@@ -365,6 +365,10 @@ def _acquire_doc_lock(lock_path, timeout=180):
     """跨进程写锁：用 O_EXCL 原子创建锁文件，避免多个进程同时写同一个 docx。
     若锁由已死亡进程持有（被强杀留下的孤儿），视为失效并抢占，避免后续运行空等 180s。"""
     deadline = time.time() + timeout
+    # 抢占阶段的绝对上限。旧实现在软超时后只靠 os.remove 抢占，若锁文件被其它程序
+    # （例如腾讯文档编辑器正在预览该 docx）占用而删不掉，会以 0.2s 无限重试、
+    # 进程静默挂死且无任何日志。故加硬上限，超时即放弃并让调用方明确报错。
+    hard_deadline = time.time() + timeout + 30
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
@@ -403,6 +407,10 @@ def _acquire_doc_lock(lock_path, timeout=180):
                     continue
                 # 过期或超时 -> 当作孤儿抢占
             # 持有者已死 / 过期 -> 孤儿锁，抢占后重试
+            if time.time() > hard_deadline:
+                # 抢占阶段也超时：锁文件被外部程序占用且删不掉，放弃并上报，
+                # 绝不回到「0.2s 无限重试」的老路。
+                return False
             try:
                 os.remove(lock_path)
             except OSError:
