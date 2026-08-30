@@ -5,8 +5,9 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
 
 默认由自动化每天触发一次，跑完整条流水线（具体触发时间由调用方/自动化决定）：
 
-  1. 监测本地录播根目录（config.local.root）下的新录播文件
-     （通常是 flv 或 mp4，直接放在根目录，不在日期子目录里）。
+  1. 监测本地录播目录（config.local.root）下的新录播文件（flv / mp4）。
+     扫描范围 = **根目录 + 各 `YYYY-MM-DD` 日期子目录**：录制器录完会把最终文件
+     移动进日期子目录，根目录常常为空，只扫根目录会漏掉所有录播（2026-08-31 修正）。
        · 已处理过（state 占位 / TXT 命中）的跳过；
        · 正在录制中的临时文件（大小不稳定 / 修改时间太新）跳过，避免截半。
   2. 若有新本地文件 → 直接走本地总结流程（FunASR 转写 → 热词 → Gemini 切块总结 → 写 Word）。
@@ -61,6 +62,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_NAME_PATTERN = r'^(?:录制-)?(?P<uid>\d+)-(?P<date>\d{8})-(?P<time>\d{6})-(?P<num>\d+)-(?P<title>.+)\.(?P<ext>mp4|flv|mkv|mov|MP4|FLV|MKV|MOV)$'
 DEFAULT_NAME_RE = re.compile(DEFAULT_NAME_PATTERN)
 MEDIA_EXT = ('.mp4', '.flv', '.mkv', '.mov')
+
+# 录制器实际行为（2026-08-31 确认）：录制中的临时文件在根目录，录完后最终文件会被
+# 移动进「根目录/YYYY-MM-DD/」日期子目录，导致根目录反而为空、本地监测扫不到任何东西。
+# 故监测范围 = 根目录 + 各 YYYY-MM-DD 日期子目录（只看一层，不递归更深）。
+_DATE_DIR_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 
 def resolve_config_arg(args):
@@ -153,11 +159,18 @@ def is_file_stable(path, log, delay=8, min_age_sec=120):
 
 
 # ---------------------------------------------------------------------------
-# 步骤 1：监测本地根目录新录播
+# 步骤 1：监测本地新录播（根目录 + 日期子目录）
 # ---------------------------------------------------------------------------
 def scan_root_sessions(cfg, log):
-    """扫描本地录播根目录（直接是 flv/mp4 文件，不在日期子目录），
-    按直播实际日期分组、相邻连续段合并为 chain，返回待处理 session 列表。
+    """扫描本地录播目录，按直播实际日期分组、相邻连续段合并为 chain，返回待处理 session 列表。
+
+    扫描范围（2026-08-31 修正）：**根目录 + 各 `YYYY-MM-DD` 日期子目录**（只看一层）。
+    录制器会把录完的最终文件移动进日期子目录，根目录常常是空的，只扫根目录会漏掉所有录播。
+
+    日期子目录里同时会有两类「不是新录播」的文件，必须排除：
+      · 压缩产物 `<原名>_compressed.mp4`——注意默认正则的 title 组会吃掉 `_compressed`
+        从而误匹配，必须显式过滤；
+      · B站兜底归档的 MP4（命名不符合录制器规则，会被正则自然过滤掉）。
 
     同时过滤：已处理（state 占位 / TXT 命中）、正在录制中（不稳定）的文件。
     """
@@ -171,26 +184,43 @@ def scan_root_sessions(cfg, log):
     ffprobe = cfg['paths']['ffprobe']
     name_re = re.compile((cfg.get('local') or {}).get('name_regex') or DEFAULT_NAME_PATTERN)
 
-    files = []
+    # 扫描目录集合：根目录 + 一层 YYYY-MM-DD 日期子目录
+    scan_dirs = [local_root]
     for fn in sorted(os.listdir(local_root)):
-        fp = os.path.join(local_root, fn)
-        if not os.path.isfile(fp):
-            continue
-        if not fn.lower().endswith(MEDIA_EXT):
-            continue
-        mm = name_re.match(fn)
-        if not mm:
-            log('[monitor] 根目录文件 %s 不匹配命名规则，跳过' % fn, 'WARN')
-            continue
-        ymd = mm.group('date')
-        hhmmss = mm.group('time')
-        title = mm.group('title').strip()
-        y, mo, d = int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8])
-        hh, mi, ss = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
-        live_date = datetime.date(y, mo, d)
-        start = datetime.datetime(y, mo, d, hh, mi, ss)
-        files.append({'path': fp, 'start': start, 'live_date': live_date,
-                      'title': title, 'hour': hh, 'fn': fn})
+        sub = os.path.join(local_root, fn)
+        if os.path.isdir(sub) and _DATE_DIR_RE.match(fn):
+            scan_dirs.append(sub)
+    if len(scan_dirs) > 1:
+        log('[monitor] 扫描范围：根目录 + %d 个日期子目录' % (len(scan_dirs) - 1))
+
+    files = []
+    seen = set()
+    for scan_d in scan_dirs:
+        for fn in sorted(os.listdir(scan_d)):
+            fp = os.path.join(scan_d, fn)
+            if not os.path.isfile(fp):
+                continue
+            if not fn.lower().endswith(MEDIA_EXT):
+                continue
+            # 压缩产物不是新录播（默认正则的 title 组会吃掉 _compressed 从而误匹配）
+            if re.sub(r'\.\w+$', '', fn).lower().endswith('_compressed'):
+                continue
+            if fn in seen:
+                continue
+            mm = name_re.match(fn)
+            if not mm:
+                log('[monitor] 文件 %s 不匹配命名规则，跳过' % fn, 'WARN')
+                continue
+            seen.add(fn)
+            ymd = mm.group('date')
+            hhmmss = mm.group('time')
+            title = mm.group('title').strip()
+            y, mo, dd = int(ymd[:4]), int(ymd[4:6]), int(ymd[6:8])
+            hh, mi, ss = int(hhmmss[:2]), int(hhmmss[2:4]), int(hhmmss[4:6])
+            live_date = datetime.date(y, mo, dd)
+            start = datetime.datetime(y, mo, dd, hh, mi, ss)
+            files.append({'path': fp, 'start': start, 'live_date': live_date,
+                          'title': title, 'hour': hh, 'fn': fn})
     if not files:
         return sessions
 
