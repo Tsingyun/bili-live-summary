@@ -45,7 +45,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 from common import (load_config, load_state, save_state, load_cookies, Logger,
-                    probe_duration, stem_for, fetch_series)
+                    probe_duration, stem_for, fetch_series,
+                    force_unlink, force_rmtree)
 import fetch_latest
 import download_merge
 import hotwords
@@ -54,6 +55,7 @@ import compress_video
 import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
+import cleanup
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -331,7 +333,7 @@ def merge_videos(cfg, log, session, out_path):
         log('[merge] concat demuxer 失败（%s），尝试重编码合并' % e, 'WARN')
     finally:
         try:
-            os.remove(list_path)
+            force_unlink(list_path)
         except Exception:
             pass
     try:
@@ -382,7 +384,7 @@ def _archive_bilibili_mp4(cfg, log, src_video, date_iso):
         if os.path.exists(dst) and os.path.getsize(dst) >= os.path.getsize(src_video):
             log('[bilibili] 归档 MP4 已存在：%s' % dst)
             try:
-                os.remove(src_video)
+                force_unlink(src_video)
             except Exception:
                 pass
             return dst
@@ -429,6 +431,11 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     else:
         log('转写结果已存在，跳过')
 
+    # 转写完成 → 16k 单声道音频已完成使命（TXT/SRT 已落盘），立即释放 ~0.5GB。
+    # 关键改动（2026-09-01）：不再等「总结成功」才删。原先写在成功路径上，
+    # 一旦 Gemini 配额耗尽 return False，每场就永久留下 0.5GB 的死文件。
+    cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
+
     # 2) 热词纠正（转写后、送 AI 前）
     if cfg.get('hotwords', {}).get('enabled', True):
         if os.path.exists(txt_path):
@@ -445,6 +452,8 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
                            src_path=src_video)
     if not ok:
         log.error('%s 总结未完全成功（可能配额耗尽），未写完成标记，可重跑' % stem)
+        # 失败也要清干净：ASR 切块、B站下载残留不因失败而赖在磁盘上
+        cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
         return False
 
     # 4) 总结后导出中质量 MP3（192k/44.1k，供文字识别/其他用途）
@@ -461,12 +470,8 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         compress_video.compress_video(cfg, log, src_video, replace_original=replace,
                                       archive_root=local_root or None)
 
-    # 清理 16k 临时音频（与中质量归档 MP3 无关）
-    if cfg['cleanup'].get('delete_mp3_after_success', True):
-        try:
-            os.remove(mp3_16k)
-        except Exception:
-            pass
+    # 收尾兜底：16k 音频 / ASR 切块 / B站已归档副本（正常在转写后已删，这里再确认一次）
+    cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
 
     # B站源：按配置保留/删除下载视频（默认保留，归档到 录播根目录/YYYY-MM-DD/）
     if src_kind == 'bilibili':
@@ -475,8 +480,12 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         else:
             try:
                 if os.path.exists(src_video):
-                    os.remove(src_video)
-                    log('[bilibili] 已删除临时下载视频：%s' % os.path.basename(src_video))
+                    # 必须判返回值：这是 ~9GB 的下载文件，误报「已删除」会让垃圾一直堆着
+                    if force_unlink(src_video, log):
+                        log('[bilibili] 已删除临时下载视频：%s' % os.path.basename(src_video))
+                    else:
+                        log.error('[bilibili] 删除临时下载视频失败（不影响成品，但会占磁盘）：%s'
+                                  % os.path.basename(src_video))
             except Exception as e:
                 log.error('[bilibili] 删除临时下载视频失败（不影响成品）：%s' % e)
 
@@ -642,6 +651,15 @@ def main():
     try:
         cfg = load_config(cfg_path)
         log = Logger(cfg, 'daily')
+
+        # ---- 步骤 0：开跑前先清一遍垃圾 + 磁盘水位检查 ----
+        # （上一轮如果中途失败，9GB 的下载残留 / ASR 切块会一直躺在 tmp 里）
+        cu = cleanup.cfg_cleanup(cfg)
+        if cu.get('enabled', True) and cu.get('sweep_on_start', True):
+            cleanup.sweep(cfg, log, dry_run=args.dry_run)
+        if not args.dry_run:
+            cleanup.check_disk_guard(cfg, log, dry_run=False)
+
         if not args.dry_run and not wait_network(log, cfg):
             sys.exit(3)
         st = load_state(cfg)
@@ -704,14 +722,21 @@ def main():
             # ---- 步骤 3：B站兜底 ----
             bilibili_fallback(cfg, st, log, cookies, progress)
 
+        # ---- 收尾清扫：无论成败，把本轮产生的中间文件清干净 ----
+        try:
+            if cleanup.cfg_cleanup(cfg).get('sweep_on_finish', True):
+                cleanup.sweep(cfg, log, dry_run=args.dry_run)
+        except Exception as e:
+            log('收尾清扫失败（不影响交付物）：%s' % e, 'WARN')
+
         log('daily_pipeline 本次完成')
     finally:
         try:
-            os.remove(LOCK)
+            force_unlink(LOCK)
         except Exception:
             pass
         try:
-            os.remove(HB)
+            force_unlink(HB)
         except Exception:
             pass
 

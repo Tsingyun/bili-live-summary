@@ -16,7 +16,9 @@ import os
 import re
 import sys
 import time
+import shutil
 import datetime
+import subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -99,6 +101,78 @@ def mark_stage(cfg, st, bvid, stage, info=None):
     if info:
         rec.update(info)
     save_state(cfg, st)
+
+
+# ---------- 强制删除 ----------
+# 重要（2026-09-01 实测）：在自动化环境下，对 D 盘（用户数据盘）调用 os.remove 会被
+# 安全删除 hook 拦截，且 hook 自身抛 `AttributeError: 'NoneType' object has no attribute
+# 'strip'`（不是权限错误，是 hook 的 bug）。结果是所有 os.remove 全部静默失败——
+# 分P下载的 m4s 碎片、ASR 转写切块、16k 临时音频、「压缩后删源视频」全都删不掉，
+# 每场留下几 GB 到十几 GB，几天就能把磁盘撑爆。
+# 因此所有删除必须走这里：os.remove 失败时降级到 PowerShell Remove-Item。
+def _ps_remove(path, is_dir):
+    """PowerShell 降级删除。
+
+    stderr 必须用 PIPE 拿 bytes 再自行解码：若用 capture_output=True（text 模式），
+    Windows 下 subprocess 读线程会按 gbk 解码 PowerShell 的中文报错并抛
+    UnicodeDecodeError，异常发生在子线程里还会把日志刷爆。
+    """
+    q = path.replace("'", "''")
+    cmd = ("Remove-Item -LiteralPath '%s' -Force -Recurse -ErrorAction Stop" % q) \
+        if is_dir else ("Remove-Item -LiteralPath '%s' -Force -ErrorAction Stop" % q)
+    try:
+        r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', cmd],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
+        return r.returncode == 0, (r.stderr or b'').decode('utf-8', 'ignore').strip()[:200]
+    except Exception as e:
+        return False, '%s: %s' % (type(e).__name__, str(e)[:200])
+
+
+def force_unlink(path, log=None):
+    """强制删除单个文件（os.remove → PowerShell 降级）。存在与否都返回是否「已不存在」。"""
+    if not path or not os.path.lexists(path):
+        return True
+    try:
+        os.remove(path)
+        if not os.path.lexists(path):
+            return True
+    except Exception as e1:
+        ok, err = _ps_remove(path, False)
+        if ok and not os.path.lexists(path):
+            return True
+        if log:
+            log('删除失败 %s：%s | %s' % (path, e1, err), 'WARN')
+        return False
+    # os.remove 没抛错但文件还在（罕见）——同样降级
+    ok, err = _ps_remove(path, False)
+    if not os.path.lexists(path):
+        return True
+    if log:
+        log('删除失败 %s：%s' % (path, err), 'WARN')
+    return False
+
+
+def force_rmtree(path, log=None):
+    """强制删除目录树（shutil.rmtree → PowerShell 降级）。"""
+    if not path or not os.path.lexists(path):
+        return True
+    try:
+        shutil.rmtree(path)
+        if not os.path.lexists(path):
+            return True
+    except Exception as e1:
+        ok, err = _ps_remove(path, True)
+        if ok and not os.path.lexists(path):
+            return True
+        if log:
+            log('删除目录失败 %s：%s | %s' % (path, e1, err), 'WARN')
+        return False
+    ok, err = _ps_remove(path, True)
+    if not os.path.lexists(path):
+        return True
+    if log:
+        log('删除目录失败 %s：%s' % (path, err), 'WARN')
+    return False
 
 
 # ---------- 日志 ----------

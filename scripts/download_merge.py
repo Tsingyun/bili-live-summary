@@ -20,7 +20,8 @@ import sys
 import time
 
 from common import (load_config, load_cookies, bili_get, fetch_view, Logger,
-                    stem_for, probe_duration, hms)
+                    stem_for, probe_duration, hms,
+                    force_unlink, force_rmtree)
 
 
 def run(cmd, timeout=1800):
@@ -95,7 +96,7 @@ def concat_to_mp3(ffmpeg, parts, dst, log, max_seconds=None):
     r = run(base + tail + [dst], timeout=7200)
     if os.path.exists(dst) and os.path.getsize(dst) > 10240:
         try:
-            os.remove(lst)
+            force_unlink(lst)
         except Exception:
             pass
         return dst
@@ -119,11 +120,11 @@ def concat_to_mp3(ffmpeg, parts, dst, log, max_seconds=None):
             ['-c:a', 'libmp3lame', '-b:a', '64k', dst], timeout=7200)
     for w in wavs:
         try:
-            os.remove(w)
+            force_unlink(w)
         except Exception:
             pass
     try:
-        os.remove(lst)
+        force_unlink(lst)
     except Exception:
         pass
     return dst if os.path.exists(dst) and os.path.getsize(dst) > 10240 else None
@@ -204,8 +205,8 @@ def download_video_one(cfg, video, log, max_seconds=None):
             log.error(f'  P{pi} 封装失败：{(r.stderr or "")[-300:]}')
             return None
         try:
-            os.remove(v_raw)
-            os.remove(a_raw)
+            force_unlink(v_raw)
+            force_unlink(a_raw)
         except Exception:
             pass
         parts.append(mux)
@@ -225,7 +226,7 @@ def download_video_one(cfg, video, log, max_seconds=None):
         r = run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                  '-f', 'concat', '-safe', '0', '-i', lst, '-c', 'copy', final], timeout=7200)
         try:
-            os.remove(lst)
+            force_unlink(lst)
         except Exception:
             pass
     else:
@@ -239,11 +240,11 @@ def download_video_one(cfg, video, log, max_seconds=None):
         f'{os.path.getsize(final) // 1024 // 1024}MB  耗时 {time.time() - t0:.0f}s')
     for p in parts:
         try:
-            os.remove(p)
+            force_unlink(p)
         except Exception:
             pass
     try:
-        os.rmdir(work)
+        force_rmtree(work)
     except Exception:
         pass
     return final
@@ -284,7 +285,7 @@ def download_one(cfg, video, log, max_seconds=None):
         if not m4a:
             return None
         try:
-            os.remove(raw)
+            force_unlink(raw)
         except Exception:
             pass
         parts.append(m4a)
@@ -313,11 +314,11 @@ def download_one(cfg, video, log, max_seconds=None):
     # 清理分P临时文件
     for p in parts:
         try:
-            os.remove(p)
+            force_unlink(p)
         except Exception:
             pass
     try:
-        os.rmdir(work)
+        force_rmtree(work)
     except Exception:
         pass
     return out

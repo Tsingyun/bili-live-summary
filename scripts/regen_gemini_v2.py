@@ -32,7 +32,8 @@ import requests
 
 # 复用技能库里的 Word 排版 / 文档函数（粗体总结、斜体金句、写锁等）
 import summarize_gemini as S
-from common import load_config, Logger, clean_punctuation, normalize_numbers
+from common import (load_config, Logger, clean_punctuation, normalize_numbers,
+                    force_unlink, force_rmtree)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -411,11 +412,11 @@ def main():
             sys.exit(0)
         # 孤儿锁：持有者心跳已失效，强制清除后重试
         try:
-            os.remove(DOC_LOCK)
+            force_unlink(DOC_LOCK)
         except OSError:
             pass
         try:
-            os.remove(HEARTBEAT)
+            force_unlink(HEARTBEAT)
         except OSError:
             pass
         lf = grab_lock()
@@ -473,11 +474,11 @@ def main():
     log(f'Gemini 重建完成 {ok}/{len(targets)}')
     try:
         os.close(lf)
-        os.remove(DOC_LOCK)
+        force_unlink(DOC_LOCK)
     except Exception:
         pass
     try:
-        os.remove(HEARTBEAT)
+        force_unlink(HEARTBEAT)
     except Exception:
         pass
 

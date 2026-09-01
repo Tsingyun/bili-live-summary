@@ -29,7 +29,8 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 
-from common import load_config, Logger, hms, parse_hms, live_date
+from common import (load_config, Logger, hms, parse_hms, live_date,
+                    force_unlink, force_rmtree)
 
 API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 
@@ -412,7 +413,7 @@ def _acquire_doc_lock(lock_path, timeout=180):
                 # 绝不回到「0.2s 无限重试」的老路。
                 return False
             try:
-                os.remove(lock_path)
+                force_unlink(lock_path)
             except OSError:
                 pass
             time.sleep(0.2)
@@ -424,7 +425,7 @@ def _release_doc_lock(lock_path):
             with open(lock_path) as _f:
                 _cur = _f.read().strip()
             if _cur == str(os.getpid()):
-                os.remove(lock_path)
+                force_unlink(lock_path)
     except Exception:
         pass
 

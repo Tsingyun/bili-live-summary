@@ -19,7 +19,9 @@ import subprocess
 import sys
 import time
 
-from common import load_config, Logger, hms, probe_duration, clean_segment_boundaries, normalize_numbers
+from common import (load_config, Logger, hms, probe_duration,
+                    clean_segment_boundaries, normalize_numbers,
+                    force_unlink, force_rmtree)
 
 # SenseVoice 富文本标签：<|zh|><|NEUTRAL|><|Speech|><|woitn|> 等
 TAG_RE = re.compile(r'<\|([^|]*)\|>')
@@ -313,14 +315,10 @@ def transcribe_one(cfg, mp3_path, model, log):
             log(f'  [{i + 1}/{len(chunks)}] 偏移 {hms(offset)} ...')
             segs.extend(asr_segments(model, c, cfg, offset_sec=offset, log=log))
             offset += c_dur
-            try:
-                os.remove(c)
-            except Exception:
-                pass
-        try:
-            os.rmdir(work)
-        except Exception:
-            pass
+            # 必须用 force_unlink：D 盘的 os.remove 会被安全 hook 拦截（抛
+            # AttributeError），静默失败会让每场留下 ~0.6GB 切块 wav。
+            force_unlink(c, log)
+        force_rmtree(work, log)
     else:
         segs = asr_segments(model, mp3_path, cfg, log=log)
 

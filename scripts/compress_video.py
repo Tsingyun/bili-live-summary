@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import Logger, probe_duration, hms
+from common import Logger, probe_duration, hms, force_unlink, force_rmtree
 
 # 从文件名里提取 8 位日期（20260824），用于「按日期子目录输出」
 _DATE_RE = re.compile(r'(\d{8})')
@@ -230,7 +230,7 @@ def _prune_backups(log, backup_dir, cc):
     while len(files) > max_files:
         old = files.pop(0)
         try:
-            os.remove(old)
+            force_unlink(old)
             log('[compress] 备份超量，删除最旧：%s' % os.path.basename(old))
         except Exception as e:
             log.error('[compress] 删除旧备份失败：%s' % e)
@@ -241,7 +241,7 @@ def _prune_backups(log, backup_dir, cc):
             break
         old = files.pop(0)
         try:
-            os.remove(old)
+            force_unlink(old)
             log('[compress] 备份超容量，删除最旧：%s' % os.path.basename(old))
         except Exception as e:
             log.error('[compress] 删除旧备份失败：%s' % e)
@@ -302,13 +302,14 @@ def _replace_direct_delete(cfg, log, src_video, compressed):
     if not (os.path.exists(compressed) and os.path.getsize(compressed) > 1024 * 1024):
         log.error('[compress] 压缩产物不可用，保留原文件：%s' % os.path.basename(src_video))
         return False
-    try:
-        os.remove(src_video)
+    # 必须检查返回值：force_unlink 失败时不抛异常（内部已兜底），若不判返回值就会
+    # 误报「已删除」，20GB 的源视频悄悄留在磁盘上——这正是以前磁盘爆掉的原因之一。
+    if force_unlink(src_video, log):
         log('[compress] 已直接删除原视频（压缩版已就绪）：%s' % os.path.basename(src_video))
         return True
-    except Exception as e:
-        log.error('[compress] 删除原视频失败，原文件保留：%s' % e)
-        return False
+    log.error('[compress] 删除原视频失败，原文件保留（会持续占用磁盘，需手工删除）：%s'
+              % os.path.basename(src_video))
+    return False
 
 
 def main():

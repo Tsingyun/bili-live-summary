@@ -40,7 +40,8 @@ import transcribe as T
 import reorder_doc as RD
 import mp3_export
 import compress_video
-from common import load_config, Logger, load_state, save_state, probe_duration
+from common import (load_config, Logger, load_state, save_state, probe_duration,
+                    force_unlink, force_rmtree)
 
 WORK = R.WORK
 # 本地录播根目录（用户提供的本地 mp4/flv 放这里，按 YYYY-MM-DD 分子目录）
@@ -252,7 +253,7 @@ def merge_videos(cfg, log, session, out_path):
         log('[merge] concat demuxer 失败（%s），尝试重编码合并' % e, 'WARN')
     finally:
         try:
-            os.remove(list_path)
+            force_unlink(list_path)
         except Exception:
             pass
     # 回退：重编码合并（同 recorder 通常命中上面的快路径，这里兜底）
@@ -386,14 +387,14 @@ def summarize_local_one(cfg, st, session, log, progress):
 
     try:
         if os.path.exists(mp3_path):
-            os.remove(mp3_path)
+            force_unlink(mp3_path)
     except Exception:
         pass
     # 合并产出的中间视频：按配置决定是否保留
     mc = cfg.get('local_merge') or {}
     if not mc.get('keep_merged', True) and session['is_merged'] and src and os.path.exists(src):
         try:
-            os.remove(src)
+            force_unlink(src)
             log('[merge] 已删除中间合并视频（keep_merged=false）')
         except Exception:
             pass
@@ -511,11 +512,11 @@ def main():
         log('本地优先扫描完成')
     finally:
         try:
-            os.remove(LOCK)
+            force_unlink(LOCK)
         except Exception:
             pass
         try:
-            os.remove(HB)
+            force_unlink(HB)
         except Exception:
             pass
 

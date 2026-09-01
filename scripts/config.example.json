@@ -65,9 +65,22 @@
     "chunk_minutes": 30
   },
   "cleanup": {
+    "_comment": "自动清理中间文件，防止磁盘被撑爆。每跑一场临时占用 25~30GB（源视频+压缩产物+B站下载+ASR切块+16k音频），必须回收。sweep 只删 workdir 下的中间产物（tmp / MP3 / logs / backups / __pycache__ 及超期 TXT、SRT），并清理已归档的 B站下载副本与残留 ASR 切块；绝不碰成品（录播根目录里 YYYY-MM-DD/ 的 MP4、归档 MP3）和桌面 Word。天数按文件最后修改时间计算；-1 = 永久保留。",
+    "enabled": true,
     "delete_mp3_after_success": true,
     "keep_txt": true,
-    "keep_srt": true
+    "keep_srt": true,
+    "tmp_days": 2,
+    "mp3_days": 0,
+    "log_days": 30,
+    "txt_days": -1,
+    "srt_days": -1,
+    "backup_days": 30,
+    "pycache_days": 0,
+    "orphan_lock_hours": 2,
+    "disk_guard_gb": 40,
+    "sweep_on_start": true,
+    "sweep_on_finish": true
   },
   "mp3_export": {
     "_comment": "总结之后，把该场录播视频转成中质量 MP3 留档（默认 192k/44.1k，供文字识别/其他用途）。out_dir 为输出根目录；strip_prefix 用于去掉录制器文件名前缀，使输出文件名直接以日期开头。",
