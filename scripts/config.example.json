@@ -43,7 +43,7 @@
   },
   "output": {
     "_comment": "Word 文档目录与命名。{year}/{month}/{streamer} 均会被替换；月份取自直播实际日期。",
-    "doc_dir": "C:\\Users\\Tsing\\Desktop",
+    "doc_dir": "C:\\Users\\Tsing\\DeskBox\\文档",
     "doc_name_pattern": "{streamer}直播总结_{year}年{month}月.docx",
     "font": "思源宋体CN Light"
   },
@@ -113,7 +113,7 @@
     "enabled": true
   },
   "compress": {
-    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder 时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」日期子目录（默认）；next_to_source 则输出到源文件旁。replace_original=true 才把原视频移入回收站（先备份）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
+    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder 时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」日期子目录；mp4_folder 时统一输出到「根目录/MP4/」（自动创建，用户规则2026-09-05 推荐）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 决定 recycle=备份+回收站 / delete=直接永久删除）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
     "enabled": true,
     "codec": "hevc_nvenc",
     "target_size_gb": 5,
@@ -121,8 +121,38 @@
     "preset": "p4",
     "audio_mode": "copy",
     "out_dir_mode": "date_subfolder",
+    "mp4_folder_name": "MP4",
     "replace_original": false,
     "replace_mode": "recycle",
     "_comment_replace_mode": "replace_original=true 时如何处理原视频：recycle=先备份再移回收站（默认，安全）；delete=压缩成功后直接永久删除原视频（省空间，不进回收站/不备份）。"
+  },
+  "darkpy": {
+    "_comment": "第二备份源 rec.darkpy.cn（用户规则 2026-09-05：备份顺序 本地 → rec.darkpy.cn → B站）。站点是 phpstudy+自研PHP文件浏览器：5144=页面、5143=文件服务；列表走 file.php（需 dir/dir_s/dir_f/dir_file 四参数），下载直链 http://host:file_port/file/<room_dir>/<文件名>.flv。一场直播常切成多个 FLV，按 max_gap_sec 时间间隙（段末时间到下一段开始）归组后 concat 无损合并（不重编码）。room_dir 填主播在 rec站的目录名（一般是 uid-主播名）。",
+    "enabled": false,
+    "host": "rec.darkpy.cn",
+    "port": 5144,
+    "file_port": 5143,
+    "room_dir": "",
+    "max_gap_sec": 1800,
+    "min_session_sec": 600,
+    "timeout": 30,
+    "retries": 3,
+    "work_dir": "",
+    "keep_flv_after_merge": false
+  },
+  "backfill": {
+    "_comment": "缺失录播自动检查/补档（用户规则 2026-09-05）：步骤3 每天对照「实际直播日历」（rec站文件日期 ∪ 本地文件日期 ∪ B站标题日期）找缺失日期，缺失的按 本地→rec.darkpy.cn→B站 顺序补。已完整处理（state.done_dates / Word 已有章节 / 本地有完整视频）的不会重复处理。",
+    "enabled": true,
+    "start_date": "",
+    "end_date": "",
+    "max_dates_per_run": 3,
+    "min_cover_video_mb": 20
+  },
+  "live_calendar": {
+    "_comment": "实际开播日期日历（判断「哪些天真播了」）。多源取并集：darkpy(rec站文件按场次起始日) + local(本地文件名) + bilibili(B站标题解析)。danmakus 若配了可用 JSON 接口也纳入（该站是纯前端 SPA，默认接口不稳定，可留空自动跳过）。lookback_days 只影响窗口外不查。",
+    "sources": ["darkpy", "local", "bilibili"],
+    "danmakus_api": "",
+    "uid": 0,
+    "lookback_days": 45
   }
 }

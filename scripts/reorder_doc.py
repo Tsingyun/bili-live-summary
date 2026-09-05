@@ -19,7 +19,7 @@ import re
 from docx import Document
 from docx.oxml.ns import qn
 
-DOC = r'C:\Users\Tsing\Desktop\岁己直播总结_2026年8月.docx'
+DOC = r'C:\Users\Tsing\DeskBox\文档\岁己直播总结_2026年8月.docx'
 
 
 def heading_text(el):

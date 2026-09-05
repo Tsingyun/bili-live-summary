@@ -21,7 +21,7 @@ DEFAULTS = {
     'ffprobe': r'D:\ffmpeg\bin\ffprobe.exe',
     'aria2c': r'C:\Users\Tsing\AppData\Local\Microsoft\WinGet\Packages\aria2.aria2_Microsoft.Winget.Source_8wekyb3d8bbwe\aria2-1.37.0-win-64bit-build1\aria2c.exe',
     'cookies': r'C:\Users\Tsing\.bilibili_cookies.txt',
-    'doc_dir': r'C:\Users\Tsing\Desktop',
+    'doc_dir': r'C:\Users\Tsing\DeskBox\文档',
 }
 
 

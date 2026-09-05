@@ -16,7 +16,7 @@ import time
 import subprocess
 
 WORK = r'D:\岁己直播自动总结'
-DOC = r'C:\Users\Tsing\Desktop\岁己直播总结_2026年8月.docx'
+DOC = r'C:\Users\Tsing\DeskBox\文档\岁己直播总结_2026年8月.docx'
 LOCK = os.path.join(WORK, '.regen_gemini_v2.lock')
 HEARTBEAT = os.path.join(WORK, '.regen_gemini_v2.heartbeat')
 SCRIPT = r'C:\Users\Tsing\.workbuddy\skills\bili-live-summary\scripts\regen_gemini_v2.py'

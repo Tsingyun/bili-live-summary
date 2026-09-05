@@ -14,9 +14,9 @@ agent_created: true
 
 把「某位 B站主播合集里的新录播」变成「带时间轴的 Word 总结文档」，全流程无需人工干预。
 
-管道（**统一入口 `daily_pipeline.py`**，通用 skill、配置驱动）：**每天由自动化触发一次，先监测本地录播根目录（`config.local.root`）的新文件 → 有则本地转写总结、无则去 B站合集（`config.series`）兜底下载合并 → 总结后导出中质量 MP3 → 最后压成 ~5GB HEVC MP4**。
+管道（**统一入口 `daily_pipeline.py`**，通用 skill、配置驱动）：**每天由自动化触发一次，先监测本地录播根目录（`config.local.root`）的新文件 → 有则本地转写总结 → 随后做「缺失录播检查」并按三级备份顺序补档（本地 → rec.darkpy.cn 第二备份 → B站第三）→ 每场总结后导出中质量 MP3 → 最后压成 ~5GB HEVC MP4 到「录播根目录/MP4/」**。
 
-全流程：监测本地根目录(flv/mp4) → FunASR 转写(带 `[HH:MM:SS]`) → 热词表纠正替换 → 大模型按 30 分钟切块逐块总结 → 追加写入月度 Word（每场分页 + 标题区分）→ 导出中质量 MP3 → **本地录播**压成 HEVC MP4 到「根目录/YYYY-MM-DD/」日期子目录（**B站兜底下载的录播不压缩、原样保留 MP4**）。
+全流程：监测本地根目录(flv/mp4) → FunASR 转写(带 `[HH:MM:SS]`) → 热词表纠正替换 → 大模型按 30 分钟切块逐块总结 → 追加写入月度 Word（每场分页 + 标题区分）→ 导出中质量 MP3 → 压缩 HEVC MP4 到「录播根目录/MP4/」（**B站兜底下载的录播不压缩、原样保留 MP4**）。新增能力（2026-09-05）：**每日自动对照「实际直播日历」检查缺失日期**（rec站文件日期 ∪ 本地文件日期 ∪ B站标题日期），缺失的自动从 **rec.darkpy.cn（FLV 分段下载→无损合并→同一转录总结流程）→ B站** 顺序补档，全程幂等断点续跑，末尾输出逐日补档结论。
 
 > 本 skill **完全配置驱动、零主播专有数据**：每个主播用一个独立「工作目录」（含各自 `config.json` / `state.json` / `hotwords.md` / `prompt_original.txt`），无需改任何代码即可套用任意新主播。脚本通过 `--workdir` / `--config` / 环境变量 `BILI_WORKDIR` / skill 内 `_workdir.json` 指针 这四级回退确定用哪份配置，**绝不在代码里写死主播信息**。
 
@@ -39,7 +39,7 @@ python SKILL_DIR/scripts/setup.py \
   --series-url "https://space.bilibili.com/MID/lists/SERIES_ID?type=series" \
   --api-key "API_KEY" \
   --streamer "主播名" --audience "观众名" \
-  --doc-dir "C:/Users/xxx/Desktop" \
+  --doc-dir "C:/Users/xxx/Documents" \
   --schedule-hours "2,10,18"
 ```
 
@@ -63,6 +63,9 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 ## 配置要点（config.json，位于工作目录根）
 - **series**：合集 mid / series_id / url（B站兜底用）
 - **local**：`root` = 本地录制根目录（flv/mp4 直接放这，不在日期子目录）；`name_regex` 留空用默认（`录制-<UID>-<YYYYMMDD>-<HHMMSS>-<序号>-<标题>.<ext>`），自定义须含命名组 `date(YYYYMMDD)`/`time(HHMMSS)`/`title`
+- **darkpy**（可选，第二备份源 rec.darkpy.cn）：`enabled` / `host` / `port`(5144 页面) / `file_port`(5143 文件) / `room_dir`(rec站目录名，一般 `<uid>-主播名`) / `max_gap_sec`(段归组间隙) / `min_session_sec`(不完整阈值) / `work_dir`(下载临时目录)。未配 `room_dir` 时该源自动跳过。
+- **backfill**：缺失检查/补档窗口与阈值：`enabled` / `start_date`(留空=用 `latest_mode.since_live_date`) / `end_date`(留空=今天) / `max_dates_per_run` / `min_cover_video_mb`(本地文件小于此值视为不完整)。
+- **live_calendar**：实际开播日期日历：`sources`(默认 `["darkpy","local","bilibili"]`) / `danmakus_api`(可插拔，默认空则跳过 danmakus) / `uid`。
 - **bilibili**：B站兜底录播的处置（用户规则 2026-08-29）。`keep_mp4`（默认 `true`）= 跑完流程后**保留 B站录播的 MP4**，原样归档到「录播根目录/YYYY-MM-DD/」；`compress`（默认 `false`）= **不压缩**这类 MP4
 - **latest_mode.mode**：「最新录播」判定（见下）
 - **summarize**：`provider` / `model` / `api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
@@ -75,9 +78,9 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 - **数字归一（规格数字中文读法→阿拉伯）**：FunASR 常把规格数字读成中文（`三零五零显卡`→`3050显卡`、`七十五赫兹`→`75Hz`、`八G`→`8G`）。脚本在**写出 TXT/SRT 前**（`normalize_numbers`）与**写 Word 前**（每块总结+概要各再做一遍）两处把"紧邻规格单位（显卡/GPU/Hz/赫兹/G/GB/寸/英寸/K/p/ti 等）的中国数字"转回阿拉伯，**仅对紧邻规格单位的读数生效，普通计数不动**，已是阿拉伯的文本幂等不受影响。若日后要增删单位，改 `common.py` 的 `_NUM_TRIGGERS` 即可。
 - **话题分隔符（横向分隔线）**：一场直播总结成一整段不易阅读。脚本在写完 Word 前，把全场总结合并后**调一次模型**识别话题边界（吃饭↔打游戏↔看电影等），在边界插入 `§SEP§` 标记并切分成多个话题块，相邻话题块之间写一条**灰色横线**（`add_horizontal_rule`，段落下边框）。实现：`summarize_gemini.py` 的 `segment_topics_with` + `append_section(topic_sep=True)`。config.json 的 `topic_separator.enabled=false` 可关闭（退回不分段）；模型若异常/改动了原文行则自动退回单块（不丢内容、不加线）。
 - **原始录播压缩（HEVC 归档）**：在「导出 MP3」之后，用 **NVIDIA NVENC HEVC(H.265)** 把原始录播压成更小归档副本（需 NVIDIA 独显；RTX 20 系+ 支持 `hevc_nvenc`，速度远快于 CPU）。目标体积由 `target_size_gb`（默认 5GB）做软上限，质量由 `cq`（默认 24，越小越清晰）保证。音频默认 `copy` 无损复用，设 `audio_mode="aac"` 则重编码 192k。实现：`scripts/compress_video.py` 的 `compress_video()`，已在 `daily_pipeline.py` 的 `process_video_source` 末尾调用。
-  - **输出位置**由 `compress.out_dir_mode` 控制：`date_subfolder`（默认）= 把压缩后 MP4 放进「根目录/YYYY-MM-DD/」日期子目录（文件名 `<原名>_compressed.mp4`）；`next_to_source` = 输出到源文件旁。日期从文件名里的 8 位日期解析，自动跳过 UID 等非法日期串。
-  - **是否删除原视频**由 `compress.replace_original` + `compress.replace_mode` 控制（**仅本地录播**）：`true` 时压缩成功后处理原视频——`replace_mode=recycle` 先备份到 `~/.workbuddy/backups/live_raw/` 再移入回收站；`replace_mode=delete` **直接永久删除原视频**（省空间，用户 2026-08-28 选定）。设为 `false` 则只生成 `_compressed` 副本、保留原始。不论哪种模式，压缩失败都不会动原文件。幂等：目标已存在则跳过。
-  - **B站兜底录播：不压缩、保留 MP4**（用户规则 2026-08-29）：本地磁盘没有当天录播而 B站有时，跑完流程后要留下 B站录播的 MP4。由 `bilibili.keep_mp4`（默认 `true`，归档到「录播根目录/YYYY-MM-DD/」）与 `bilibili.compress`（默认 `false`）控制。
+  - **输出位置**由 `compress.out_dir_mode` 控制：`mp4_folder`（推荐，用户规则 2026-09-05）= 统一输出到「录播根目录/MP4/」（自动创建；文件名 `<原名>_compressed.mp4`）；`date_subfolder`（旧默认）= 放进「根目录/YYYY-MM-DD/」日期子目录；`next_to_source` = 输出到源文件旁。日期从文件名里的 8 位日期解析，自动跳过 UID 等非法日期串。
+  - **是否删除原视频**由 `compress.replace_original` + `compress.replace_mode` 控制（**本地录播与 rec站补档**）：`true` 时压缩成功后处理原视频——`replace_mode=recycle` 先备份到 `~/.workbuddy/backups/live_raw/` 再移入回收站；`replace_mode=delete` **直接永久删除原视频**（省空间，用户 2026-08-28 选定）。设为 `false` 则只生成 `_compressed` 副本、保留原始。不论哪种模式，压缩失败都不会动原文件。幂等：目标已存在则跳过。rec站补档的源视频位于工作目录 `_darkpy/` 临时区，压缩成功后被同样规则删除（省盘），压缩失败则保留供下次续压。
+  - **B站兜底录播：不压缩、保留 MP4**（用户规则 2026-08-29）：本地/rec站都没有当天录播而 B站有时，跑完流程后要留下 B站录播的 MP4。由 `bilibili.keep_mp4`（默认 `true`，归档到「录播根目录/YYYY-MM-DD/」）与 `bilibili.compress`（默认 `false`）控制。
 
 ## 大模型调用约定（首选 Google / Gemini）
 
@@ -121,19 +124,52 @@ gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash → gemini-3-flash �
 `daily_pipeline.py` 是每日自动化的**唯一入口**（自动化触发后，命令见上「第 3 步」）。
 它内置完整 5 步，无需再拆成多个脚本：
 
-1. **监测本地根目录**：扫描 `config.local.root` 根目录下的新录播（`*.flv`/`*.mp4`/`*.mkv`/`*.mov`，直接放根目录、不在日期子目录）。
+1. **监测本地根目录**：扫描 `config.local.root` 根目录 + 各 `YYYY-MM-DD` 日期子目录下的新录播（`*.flv`/`*.mp4`/`*.mkv`/`*.mov`）。
    · 已处理（state 占位 / TXT 命中）的跳过；
    · **正在录制中**（文件大小不稳定 / 修改时间太新）的整段跳过，避免截半——这是防「录到一半就被拿去转写」的关键。
 2. **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word，并写 `state.json` 占位（`LOCAL-YYYYMMDD[-N]`，`date` 推高一天，使 B站兜底不会重复抓同场，避免重复消耗 token）。
-3. **无本地新文件 → B站兜底**：去合集（`config.series` 的 `mid`+`series_id`）抓最近未处理的录播，用 `download_merge.download_video_one` 下载并合并多 P 为单个视频，再走同一条总结流程。**这类录播跑完流程后保留原 MP4、不压缩**（`bilibili.keep_mp4=true`），按直播日期归档到「录播根目录/YYYY-MM-DD/」。
-4. **导出中质量 MP3**：总结完成后，把视频转一份 192k/44.1k 的中质量 MP3（体积不大、音质满足文字识别即可，用户另有他用），落在 `mp3_export.out_dir`（默认根目录）。
-5. **压缩 HEVC MP4（仅本地录播）**：最后把视频压成 ~5GB 的 HEVC(H.265) MP4，按 `compress.out_dir_mode=date_subfolder` 输出到「根目录/YYYY-MM-DD/」日期子目录；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）。**B站兜底录播跳过本步骤，原样保留 MP4。**
+3. **缺失检查 + 三级补档**（用户规则 2026-09-05）：用 `backfill.py` 对照「实际直播日历」（`live_calendar.py`：rec站文件日期 ∪ 本地文件日期 ∪ B站标题日期）找出**本地 / Word 月度总结 / state 都没覆盖**的直播日期，按 **本地 → rec.darkpy.cn → B站** 顺序补档：
+   · **rec.darkpy.cn**（第二备份，`darkpy_rec.py`）：FLV 分段**断点续传下载** → 按段结束时间归组（跨午夜尾巴归前一场）→ ffmpeg `concat demuxer -c copy` **无损合并**（编码不一致才回退重编码）→ 完整性校验 → **同一总结流程**（转写→热词→总结→Word→MP3→压缩）。
+   · **B站**（第三备份，原有功能不变）：仅当 rec站也没有该日时才抓（`bilibili_fallback(only_dates=...)` 限定目标日期）。跑完流程保留原 MP4、不压缩（`bilibili.keep_mp4=true`），归档到「录播根目录/YYYY-MM-DD/」。
+   · 结束输出逐日结论（`2026-09-01：本地缺失 → rec.darkpy.cn → 成功`）。
+4. **导出中质量 MP3**：总结完成后，把视频转一份 192k/44.1k 的中质量 MP3（落在 `mp3_export.out_dir` = 录播根目录，文件名直接以日期开头）。
+5. **压缩 HEVC MP4**：把视频压成 ~5GB 的 HEVC(H.265) MP4，按 `compress.out_dir_mode=mp4_folder` 输出到「录播根目录/MP4/」（自动创建；`date_subfolder` 兼容旧行为输出到日期子目录）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）。**B站兜底录播跳过本步骤，原样保留 MP4。**
 
-**最终每场交付物三样**：① AI 总结的 Word 文档（桌面）② 中质量 MP3（根目录）③ 视频——**本地录播**=压缩后的 HEVC MP4；**B站兜底**=原样保留的 MP4（均落在「根目录/YYYY-MM-DD/」）。
+**最终每场交付物三样**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 中质量 MP3（录播根目录）③ 视频——**本地录播 / rec站补档**=压缩后的 HEVC MP4（「录播根目录/MP4/」）；**B站兜底**=原样保留的 MP4（「根目录/YYYY-MM-DD/」）。
 
-落地实现（已生效）：`daily_pipeline.py` 同时包含「根目录监测 + 本地总结 + B站兜底 + MP3 + 压缩」，单实例锁防并发，断点续跑靠 state 占位与 TXT/SRT 存在性判定。手动运行：`python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览不处理。
+落地实现（已生效）：`daily_pipeline.py` 内置「根目录监测 + 本地总结 + 缺失补档(rec→B站) + MP3 + 压缩」+ 单实例锁 + 断点续跑（state 占位与 TXT/SRT 存在性判定）。手动运行：`python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览不处理。
 
 > 踩过的坑：曾因本地脚本没真实执行、占位没写，导致次日自动化重复抓 B站、多花 token。根因：**「本地脚本写入 state 占位」才是跳过某场的唯一有效开关**。故自动化必须真实跑成功（看日志确认 `LOCAL-*` 占位已写入）后再依赖它。
+
+### 缺失录播自动检查 + 三级备份补档（2026-09-05 新增）
+
+**目标**：不漏任何一场直播。即使本地录制器没录上、或换机器没录，只要 rec.darkpy.cn 或 B站
+有，第二天自动化就会自动补档；两边都还没有就等到有为止。
+
+- **判断「缺失」的依据** = 实际直播日历（`live_calendar.py`，多源取并集）− 已覆盖：
+  - 实际直播日历来源：rec站文件（**按场次起始日**，跨午夜尾巴归前一场，不会把 8/27 00:01 误判成 8/27 独立直播）∪ 本地文件日期 ∪ B站标题日期；danmakus 接口可插拔（默认未配，自动跳过不阻塞）。
+  - 已覆盖 = `state.done_dates` 有该日 **或** `doc_dir` 的 Word 月度文档已有该日章节 **或** 本地有该日完整视频（> `backfill.min_cover_video_mb`，默认 20MB；文件过小视为录制 bug 产物，仍判缺失）。
+  - **一天多场**按天判断：当天有任意一场已覆盖即不算缺失；rec站当天多场会逐场补（`DARKPY-YYYYMMDD[-N]` 占位）。
+- **补档顺序**：rec.darkpy.cn（第二备份，优先于 B站，因更新及时）→ B站（第三备份）。本地永远第一优先。
+- **rec.darkpy.cn 站点协议**（已实测，勿凭猜测改动）：phpstudy+自研 PHP 文件浏览器，**5144=页面、5143=文件服务**；列表走 `file.php?dir=<room_dir>/&dir_s=1&dir_f=./file/<room_dir>&dir_file={"1":".\\/file\\/"}`；下载直链 `http://rec.darkpy.cn:5143/file/<room_dir>/<文件名>.flv`；命名 `YYYYMMDD-HHMMSS-序号-标题.flv`，一场常切多段。
+- **幂等/断点**：FLV 已下载不重下（`.part` Range 续传）、已合并不重合并、TXT/SRT 在则跳过转写、Word 章节在则跳过总结、压缩产物在则跳过压缩——某步失败下次从失败步继续。
+- 配置：`config.json` 的 `darkpy`（enabled/host/port/file_port/room_dir/max_gap_sec…）、`backfill`（enabled/start_date/end_date/max_dates_per_run/min_cover_video_mb）、`live_calendar`（sources/danmakus_api/uid）。
+
+命令：
+
+```bash
+# 只打印「检查报告」（不下载、不写任何东西）——推荐先跑这个看缺失情况
+python scripts/backfill.py --workdir "<工作目录>" --from 2026-09-01 --to 2026-09-30
+
+# 实际补档（rec.darkpy.cn → B站）
+python scripts/backfill.py --workdir "<工作目录>" --from 2026-09-01 --to 2026-09-30 --fill
+
+# 也可以走主入口（定向只补某一天；找不到本地录播就会自动尝试 rec → B站）
+python scripts/daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01
+# daily 支持 --from/--to（补档窗口）、--no-backfill（只做本地，跳过缺失补档）
+```
+
+> 未配置 `darkpy.room_dir` / `darkpy.enabled=false` 时自动降级为旧的「本地 → B站」两源行为，不影响原功能。
 
 ### 自动清理（防磁盘被撑爆，2026-09-01 新增）
 
@@ -155,7 +191,7 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 以及根目录的 `*.bak` 和孤儿 `.lock`/`.heartbeat`。
 
 **绝不碰（黑名单）**：录播根目录（`local.root`）里的任何文件——压缩成品 MP4、归档 MP3、
-源视频；桌面的 Word 总结；`config.json` / `state.json` / `hotwords.md`。
+源视频；`doc_dir` 的 Word 总结；`config.json` / `state.json` / `hotwords.md`。
 源视频只允许 `compress_video` 在「压缩成功且 ffprobe 校验通过」后删除。
 
 配置项（`config.json` 的 `cleanup` 段，天数按文件最后修改时间算，`-1` = 永久保留）：
@@ -215,9 +251,12 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 
 ## 运行与调试
 - `daily_pipeline.py --workdir "<工作目录>" --bvid BVxxx` 手动指定某期
-- `daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览会处理/跳过哪些
+- `daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览会处理/跳过哪些（含缺失检查报告）
+- `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
+- `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
 - 日志在 `WORKDIR/logs/`，错误在 `errors.log`；状态 / 基线在 `WORKDIR/state.json`
+- rec站下载的 FLV / 合并中间 MP4 在 `darkpy.work_dir`（默认 `WORKDIR/_darkpy/`）：FLV 合并成功后即删（`keep_flv_after_merge=false`），中间 MP4 压缩成功后被删；补档失败时保留供断点重跑
 
 ## 依赖与环境
 详见 `references/environment.md`：需 GPU(PyTorch/FunASR)、FFmpeg、aria2c、B站 cookies；模型首次运行从 ModelScope 自动下载。

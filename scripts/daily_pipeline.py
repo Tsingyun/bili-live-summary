@@ -11,24 +11,28 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
        · 已处理过（state 占位 / TXT 命中）的跳过；
        · 正在录制中的临时文件（大小不稳定 / 修改时间太新）跳过，避免截半。
   2. 若有新本地文件 → 直接走本地总结流程（FunASR 转写 → 热词 → Gemini 切块总结 → 写 Word）。
-  3. 若没有新本地文件 → 去 B站合集（config.series：mid + series_id）
-     搜索最近未处理的录播，下载并合并多 P 为单个视频，再走总结流程。
+  3. 若没有新本地文件 / 本地处理后仍有缺失日期 → 按三级备份顺序补档：
+       **本地 → rec.darkpy.cn（第二备份）→ B站（第三）**（用户规则 2026-09-05）。
+       缺失判定依据「实际直播日期」日历（live_calendar：rec站文件日期 ∪ 本地文件日期
+       ∪ B站标题日期），与 本地文件/Word月度总结/state.done_dates 比对得出。
+       · rec.darkpy.cn：FLV 分段下载 → 按段结束时间归组 → concat 无损合并（不重编码）
+         → 同一总结流程（backfill.py / darkpy_rec.py）；
+       · B站：仅当 rec站也没有该日时才抓（bilibili_fallback，限定目标日期）。
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
-     （192k / 44.1k，体积不大，音质满足文字识别即可，用户另有他用）。
-  5. 以上全部结束后（仅本地录播）→ 把视频压成体积约 5GB 的 HEVC(H.265) MP4 文件，
-     放进 `根目录/YYYY-MM-DD/` 日期子目录；压缩成功后按 compress.replace_mode
-     处理原视频（recycle=备份后移回收站，delete=直接永久删除）。
+     （192k / 44.1k，留在录播根目录）。
+  5. 压缩归档（本地录播 & rec站补档）：压成约 5GB 的 HEVC(H.265) MP4，
+     输出到「录播根目录/MP4/」（out_dir_mode=mp4_folder，自动创建）；
+     压缩成功后按 compress.replace_mode 处理原视频（delete=直接永久删除）。
+     B站兜底录播默认不压缩、原样保留 MP4（config.bilibili，见步骤3旧规则）。
 
-B站兜底（步骤3）的录播不压缩：跑完流程后原样保留下载到的 MP4，并按直播日期归档到
-`录播根目录/YYYY-MM-DD/`（见 config.bilibili：keep_mp4=true / compress=false）。
-
-最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3
-             ③ 视频（本地录播=压缩后的 HEVC MP4；B站兜底=原样保留的 MP4）。
+最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（录播根目录）
+             ③ 压缩后 HEVC MP4（录播根目录/MP4/；B站兜底=原样保留的 MP4）。
 
 用法:
-  python daily_pipeline.py              # 正式运行（监测→本地或B站→MP3→压缩）
+  python daily_pipeline.py              # 正式运行（监测→本地/rec/B站→MP3→压缩）
   python daily_pipeline.py --dry-run    # 只打印会处理哪些、跳过哪些，不触碰任何文件
-  python daily_pipeline.py --date 2026-08-24   # 只处理指定直播日期（定向重跑/排障）
+  python daily_pipeline.py --date 2026-09-01   # 只处理指定直播日期（定向补档/重跑）
+  python backfill.py --from 2026-09-01 --to 2026-09-30 [--fill]   # 缺失检查/补档
 """
 
 import argparse
@@ -52,6 +56,7 @@ import download_merge
 import hotwords
 import mp3_export
 import compress_video
+import backfill
 import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
@@ -459,16 +464,29 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     # 4) 总结后导出中质量 MP3（192k/44.1k，供文字识别/其他用途）
     mp3_export.export_for_local(cfg, log, src_video)
 
-    # 5) 压缩成 ~5GB HEVC MP4（仅本地录播；B站录播按用户规则不压缩，直接保留原 MP4）
+    # 5) 压缩归档：
+    #    · local  —— 压成 ~5GB HEVC MP4（out_dir_mode 决定放 根/YYYY-MM-DD/ 或 根/MP4/）
+    #    · darkpy —— 与本地一致（用户规则 2026-09-05：rec站补档也要压缩归档到 根/MP4/）；
+    #                压缩开关被关掉时按 B站规则保留原始 MP4 归档（不删）。
+    #    · bilibili —— 按用户规则不压缩，直接保留原 MP4
+    local_root = (cfg.get('local') or {}).get('root') or ''
+    cc = cfg.get('compress') or {}
     bz = cfg.get('bilibili') or {}
-    if src_kind == 'bilibili' and not bz.get('compress', False):
-        log('[bilibili] 按规则（bilibili.compress=false）：B站录播不压缩，保留原始 MP4 作为成品')
-    else:
-        cc = cfg.get('compress') or {}
-        replace = (src_kind == 'local') and cc.get('replace_original', False)
-        local_root = (cfg.get('local') or {}).get('root') or ''
+    if src_kind in ('local', 'darkpy') and cc.get('enabled', True):
+        replace = cc.get('replace_original', False) and src_kind == 'local'
+        if src_kind == 'darkpy':
+            # rec站源在临时目录，压缩成功后源文件按本地规则删除（省盘）；
+            # 压缩失败则保留，下次重跑时 merge 幂等跳过、直接续压。
+            replace = cc.get('replace_original', False)
         compress_video.compress_video(cfg, log, src_video, replace_original=replace,
                                       archive_root=local_root or None)
+    elif src_kind in ('darkpy', 'bilibili'):
+        log('[compress] %s 源：compress.enabled=false，按 B站规则保留原始 MP4 不压缩' % src_kind)
+        if bz.get('keep_mp4', True):
+            _archive_bilibili_mp4(cfg, log, src_video, date_iso)
+        elif src_kind == 'darkpy':
+            # 用户没关 keep_mp4，但此处被压缩关闭分支触达——保守保留，不删
+            log('[compress] darkpy 源 keep_mp4=false 但压缩关闭，保留原始文件避免丢档', 'WARN')
 
     # 收尾兜底：16k 音频 / ASR 切块 / B站已归档副本（正常在转写后已删，这里再确认一次）
     cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
@@ -499,22 +517,42 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
 # ---------------------------------------------------------------------------
 # 步骤 3：B站兜底
 # ---------------------------------------------------------------------------
-def bilibili_fallback(cfg, st, log, cookies, progress):
-    """本地没有新录播时，去 B站合集抓最近未处理的录播，下载合并视频后走总结流程。"""
+def bilibili_fallback(cfg, st, log, cookies, progress, only_dates=None):
+    """本地/rec站都没有的缺失日期，去 B站合集抓对应录播（第三备份源）。
+
+    only_dates：限定只处理这些直播日期（由 backfill 缺失补档驱动）；
+                None 时保持旧行为（抓最新未处理）。
+    返回成功处理的直播日期列表。
+    """
     s = cfg['series']
     horizon = fetch_latest.scan_horizon(cfg, st)
     archives = fetch_series(s['mid'], s['series_id'], cookies, stop_before_pubdate=horizon)
     log('B站兜底：扫描到 %d 期，最新：%s' % (len(archives),
         (archives[0]['title'][:50] if archives else '无')))
-    picked = fetch_latest.pick_videos(cfg, st, archives, log)
-    # 已处理过的日期不再从 B站抓（本地/此前已处理）
     done_dates = set(st.get('done_dates', []))
-    picked = [a for a in picked if a.get('_live_date') is None
-              or a['_live_date'].isoformat() not in done_dates]
+    if only_dates is not None:
+        want = set(only_dates)
+        picked = [a for a in archives
+                  if a.get('_live_date') and a['_live_date'].isoformat() in want
+                  and a['_live_date'].isoformat() not in done_dates]
+        # 标题解析不出日期的，尝试用 pubdate 前一日近似兜底（避免漏）
+        for a in archives:
+            if a in picked or a.get('_live_date'):
+                continue
+            pd = datetime.date.fromtimestamp(a.get('pubdate', 0))
+            if pd.isoformat() in want and pd.isoformat() not in done_dates:
+                a['_live_date'] = pd
+                picked.append(a)
+        log('B站兜底：限定 %d 个缺失日期，匹配到 %d 期' % (len(want), len(picked)))
+    else:
+        picked = fetch_latest.pick_videos(cfg, st, archives, log)
+        # 已处理过的日期不再从 B站抓（本地/此前已处理）
+        picked = [a for a in picked if a.get('_live_date') is None
+                  or a['_live_date'].isoformat() not in done_dates]
     if not picked:
         log('B站兜底：无新录播，收工。')
-        return
-
+        return []
+    ok_dates = []
     log('B站兜底：本次待处理 %d 期' % len(picked))
     for a in picked:
         # fetch_series 返回的原始 dict 只有 _live_date（datetime.date），
@@ -533,8 +571,10 @@ def bilibili_fallback(cfg, st, log, cookies, progress):
         ok = process_video_source(cfg, st, src, a['date'], fname, 'bilibili', log, progress)
         if ok:
             mark_bilibili_done(st, cfg, a, fname)
+            ok_dates.append(a['date'])
         else:
             log.error('%s 处理失败（保留临时视频，下次重试）：%s' % (bvid, src))
+    return ok_dates
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +616,34 @@ def mark_bilibili_done(st, cfg, video, fname):
     _finalize_state(st, cfg, ld)
 
 
+def mark_darkpy_done(st, cfg, date_iso, res, session_index=0):
+    """rec.darkpy.cn 补档成功后的占位写入（与 LOCAL 占位同语义）。
+
+    · key = DARKPY-YYYYMMDD（多场追加 -N），date 故意 +1 天挡住 B站日后上传的同场；
+    · live_date 存真实直播日期，done_dates 只收录一次。
+    """
+    ld = datetime.date.fromisoformat(date_iso)
+    ymd = ld.strftime('%Y%m%d')
+    key = 'DARKPY-%s' % ymd if session_index == 0 else 'DARKPY-%s-%d' % (ymd, session_index + 1)
+    base = os.path.basename(res['src_video'])
+    stem = base[:-4]
+    title = res.get('title') or stem
+    rec = st['processed'].setdefault(key, {'stages': []})
+    rec.update({
+        'stages': ['transcribe', 'summarize', 'cleanup', 'compress'],
+        'title': '%s %s' % (title, ld.strftime('%Y年%m月%d日')),
+        'date': (ld + datetime.timedelta(days=1)).isoformat(),
+        'live_date': ld.isoformat(),
+        'stem': stem,
+        'doc': S.doc_path_for(cfg, ld),
+        'darkpy': True,
+        'lossless': res.get('lossless', False),
+        'parts': res.get('n_segments', 0),
+        'note': 'daily_pipeline rec.darkpy.cn 补档（%s）' % base,
+    })
+    _finalize_state(st, cfg, ld)
+
+
 def _finalize_state(st, cfg, live_date):
     st.setdefault('done_dates', [])
     iso = live_date.isoformat()
@@ -597,6 +665,12 @@ def main():
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--date', default=None,
                     help='只处理指定直播日期（YYYY-MM-DD）；不指定则处理全部未处理')
+    ap.add_argument('--from', dest='frm', default=None,
+                    help='缺失补档窗口开始（YYYY-MM-DD）；默认 backfill.start_date/since_live_date')
+    ap.add_argument('--to', default=None,
+                    help='缺失补档窗口结束（YYYY-MM-DD）；默认今天')
+    ap.add_argument('--no-backfill', action='store_true',
+                    help='跳过缺失检查/补档（rec.darkpy.cn → B站），只做本地')
     ap.add_argument('--workdir', default=None,
                     help='工作目录（含 config.json）；不传则按 BILI_WORKDIR / _workdir.json / BILI_LIVE_CONFIG 推断')
     ap.add_argument('--config', default=None, help='直接指定 config.json 路径（优先级最高）')
@@ -696,12 +770,18 @@ def main():
                    ', '.join(os.path.basename(p) for p in s['member_files'])))
 
         if args.dry_run:
+            if not args.no_backfill:
+                log('---- 步骤 3（dry-run）：缺失检查报告 ----')
+                backfill.stage(cfg, st, log, {}, cookies=cookies,
+                               only_date=args.date, frm=args.frm, to=args.to,
+                               dry_run=True, do_bilibili=False)
             log('dry-run，未实际处理。')
             return
 
+        # ---- 步骤 2：本地优先总结 ----
         progress = {}
         if to_process:
-            # ---- 步骤 2：本地优先总结 ----
+            log('---- 步骤 2：本地录播优先总结 ----')
             for s in to_process:
                 touch()
                 src = prepare_session(cfg, log, s)
@@ -718,9 +798,17 @@ def main():
                     log.error('处理 %s 失败：%s' % (s['live_date'].isoformat(), ex))
                 time.sleep(int(cfg.get('summarize', {}).get('inter_video_delay_sec', 15)))
             log('本地优先扫描完成')
+            touch()
+
+        # ---- 步骤 3：缺失检查 + 补档（本地 → rec.darkpy.cn → B站）----
+        # 用户规则（2026-09-05）：每天对照「实际直播日历」找缺失，rec.darkpy.cn 优先于 B站。
+        if not args.no_backfill:
+            log('---- 步骤 3：缺失检查/补档（backfill） ----')
+            backfill.stage(cfg, st, log, progress, cookies=cookies,
+                           only_date=args.date, frm=args.frm, to=args.to,
+                           dry_run=False, do_bilibili=True)
         else:
-            # ---- 步骤 3：B站兜底 ----
-            bilibili_fallback(cfg, st, log, cookies, progress)
+            log('---- 步骤 3：已跳过（--no-backfill） ----')
 
         # ---- 收尾清扫：无论成败，把本轮产生的中间文件清干净 ----
         try:
