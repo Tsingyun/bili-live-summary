@@ -13,13 +13,17 @@ reorder_doc.py —— 按直播日期重排《岁己直播总结_YYYY年M月.doc
 - 文档结尾的 body 级 <w:sectPr> 单独剥离，重排后永远放回最后，避免 sectPr 落到正文中间。
 
 用法:
-  python reorder_doc.py
+  python reorder_doc.py [docx路径]   （缺省用 8 月文档）
+
+示例:
+  python reorder_doc.py "C:\\Users\\Tsing\\DeskBox\\文档\\岁己直播总结_2026年9月.docx"
 """
 import re
+import sys
 from docx import Document
 from docx.oxml.ns import qn
 
-DOC = r'C:\Users\Tsing\DeskBox\文档\岁己直播总结_2026年8月.docx'
+DOC = sys.argv[1] if len(sys.argv) > 1 else r'C:\Users\Tsing\DeskBox\文档\岁己直播总结_2026年8月.docx'
 
 
 def heading_text(el):
