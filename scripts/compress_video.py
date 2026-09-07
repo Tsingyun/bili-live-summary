@@ -110,8 +110,8 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     ymd = _date_from_name(src_video)
     if out_mode == 'mp4_folder':
         # 用户规则（2026-09-05）：压缩后的 MP4 统一输出到「录播根目录/MP4/」（自动创建）。
-        # 与 date_subfolder 二选一；archive_root 优先（B站/rec站补档的源在临时目录，
-        # 必须归档到录播根目录），否则用源所在盘根/本地 root。
+        # ★ 2026-09-08 起搁置：用户决定不用 MP4/ 文件夹，统一改用 date_subfolder（根/YYYY-MM-DD/）。
+        # archive_root 优先（B站/rec站补档的源在临时目录，必须归档到录播根目录），否则用源所在盘根/本地 root。
         base_dir = archive_root or os.path.dirname(src_video)
         folder = cc.get('mp4_folder_name', 'MP4')
         if os.path.basename(base_dir) == folder:
@@ -121,6 +121,17 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
         os.makedirs(out_dir, exist_ok=True)
         out = os.path.join(out_dir, name + '_compressed' + out_ext)
         log('[compress] 输出到 MP4 统一目录：%s' % out_dir)
+    elif out_mode == 'mp4_date_folder' and ymd:
+        # 用户规则（2026-09-06）：压缩后的 MP4 输出到「录播根目录/MP4/YYYY-MM-DD/」——
+        # 在 mp4_folder 基础上按直播日期再建一层文件夹。★ 2026-09-08 起搁置（同 mp4_folder，
+        # 用户决定统一用 date_subfolder，产物直接进 根/YYYY-MM-DD/ 日期文件夹）。
+        base_dir = archive_root or os.path.dirname(src_video)
+        folder = cc.get('mp4_folder_name', 'MP4')
+        date_folder = '%s-%s-%s' % (ymd[:4], ymd[4:6], ymd[6:8])
+        out_dir = os.path.join(base_dir, folder, date_folder)
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir, name + '_compressed' + out_ext)
+        log('[compress] 输出到 MP4/日期子目录：%s' % out_dir)
     elif out_mode == 'date_subfolder' and ymd:
         # 用户规则（2026-08-24）：压缩后的 MP4 放进「根目录/YYYY-MM-DD/」日期子目录；
         # 但若源文件已经位于该日期子目录内（录制器已把原文件放进 根/YYYY-MM-DD/），

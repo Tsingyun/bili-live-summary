@@ -113,7 +113,7 @@
     "enabled": true
   },
   "compress": {
-    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder 时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」日期子目录；mp4_folder 时统一输出到「根目录/MP4/」（自动创建，用户规则2026-09-05 推荐）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 决定 recycle=备份+回收站 / delete=直接永久删除）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
+    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder（当前规则，用户2026-09-08：不用 MP4/ 文件夹，直接用日期文件夹）时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」；mp4_folder/mp4_date_folder（2026-09-05/06 曾用，已搁置）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 决定 recycle=备份+回收站 / delete=直接永久删除）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
     "enabled": true,
     "codec": "hevc_nvenc",
     "target_size_gb": 5,

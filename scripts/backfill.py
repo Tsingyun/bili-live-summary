@@ -12,7 +12,8 @@
    · rec.darkpy.cn：FLV 分段下载 → 按段结束时间归组 → concat 无损合并（不重编码）；
    · B站：下载合并多 P 后走同一总结流程（原 bilibili_fallback 逻辑，仅限定目标日期）；
 4. 补档成功的场次复用 daily_pipeline.process_video_source（转写→热词→总结→Word→
-   MP3→压缩），压缩后的 MP4 归档到「录播根目录/MP4/」，MP3 留在录播根目录；
+   MP3→压缩），压缩后的 MP4 归档到「录播根目录/YYYY-MM-DD/」日期文件夹
+   （out_dir_mode=date_subfolder，当前规则；MP3 留在录播根目录）；
 5. 全程幂等/断点续跑：已下载不重下、已合并不重合并、转写/总结产物存在即跳过。
 
 对外接口
@@ -128,7 +129,8 @@ def local_status(cfg, log, start, end):
         for n in names:
             if not n.lower().endswith(MEDIA_EXT):
                 continue
-            # 压缩产物不在日期文件夹里（统一到 root/MP4/），忽略无关日期目录下的 _compressed
+            # 媒体文件名里的 8 位日期用于归日。date_subfolder 模式下压缩产物
+            # *_compressed.mp4 就落在该日期子目录里，会被正常计入（本地已覆盖）。
             m = re.search(r'(20\d{2})(\d{2})(\d{2})', n)
             d = _norm('%s%s%s' % (m.group(1), m.group(2), m.group(3))) if m else None
             if not d or not (start <= d <= end):

@@ -21,12 +21,13 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
      （192k / 44.1k，留在录播根目录）。
   5. 压缩归档（本地录播 & rec站补档）：压成约 5GB 的 HEVC(H.265) MP4，
-     输出到「录播根目录/MP4/」（out_dir_mode=mp4_folder，自动创建）；
+     输出到「录播根目录/YYYY-MM-DD/」日期文件夹（out_dir_mode=date_subfolder，
+     当前规则，用户 2026-09-08：不用 MP4/ 文件夹，直接用日期命名文件夹）；
      压缩成功后按 compress.replace_mode 处理原视频（delete=直接永久删除）。
      B站兜底录播默认不压缩、原样保留 MP4（config.bilibili，见步骤3旧规则）。
 
 最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（录播根目录）
-             ③ 压缩后 HEVC MP4（录播根目录/MP4/；B站兜底=原样保留的 MP4）。
+             ③ 压缩后 HEVC MP4（录播根目录/YYYY-MM-DD/；B站兜底=原样保留的 MP4）。
 
 用法:
   python daily_pipeline.py              # 正式运行（监测→本地/rec/B站→MP3→压缩）
@@ -165,6 +166,58 @@ def is_file_stable(path, log, delay=8, min_age_sec=120):
     return st2.st_size == sz1
 
 
+def _absorb_ultrashort(cfg, log, mc, flist, chains, dur):
+    """把极短片段并入相邻长场，避免独立成场出废稿（用户规则 2026-09-06）。
+
+    判定：chain 总时长 <= ultrashort_sec 视为超短；若与另一 chain 时间重叠或间隙
+    绝对值 <= absorb_window_sec，则吸收进该相邻 chain（按时间序合并文件，后续
+    prepare_session 仍以 is_merged 续压）。找不到相邻长场则保留为独立场次。
+    """
+    us = int(mc.get('ultrashort_sec', 0) or 0)
+    if us <= 0:
+        return chains
+    win = int(mc.get('absorb_window_sec', 600) or 600)
+
+    def chain_dur(ch):
+        return sum(dur.get(f['path'], 0) for f in ch)
+
+    def ch_start(ch):
+        return ch[0]['start']
+
+    def ch_end(ch):
+        last = ch[-1]
+        return last['start'] + datetime.timedelta(seconds=dur.get(last['path'], 0))
+
+    anchors = [ch for ch in chains if chain_dur(ch) > us]
+    shorts = [ch for ch in chains if chain_dur(ch) <= us]
+    if not anchors or not shorts:
+        return chains
+
+    new_chains = list(anchors)
+    for sh in shorts:
+        s0, e0 = ch_start(sh), ch_end(sh)
+        best, best_dist = None, None
+        for a in new_chains:
+            a0, a1 = ch_start(a), ch_end(a)
+            if (s0 < a1) and (a0 < e0):          # 时间重叠
+                dist = 0
+            else:
+                gap = (a0 - e0).total_seconds() if a0 >= e0 else (s0 - a1).total_seconds()
+                dist = abs(gap)
+            if dist <= win and (best_dist is None or dist < best_dist):
+                best, best_dist = a, dist
+        if best is not None:
+            merged = sorted(best + sh, key=lambda f: f['start'])
+            i = new_chains.index(best)
+            new_chains[i] = merged
+            log('[merge] 超短片段(%ds)并入相邻长场：%s'
+                % (int(chain_dur(sh)), os.path.basename(sh[0]['path'])))
+        else:
+            new_chains.append(sh)
+    new_chains.sort(key=lambda ch: ch_start(ch))
+    return new_chains
+
+
 # ---------------------------------------------------------------------------
 # 步骤 1：监测本地新录播（根目录 + 日期子目录）
 # ---------------------------------------------------------------------------
@@ -237,26 +290,27 @@ def scan_root_sessions(cfg, log):
 
     excl = set(mc.get('exclude_dates') or [])
     for ld, flist in sorted(by_date.items()):
+        flist.sort(key=lambda x: x['start'])
+        dur = {f['path']: probe_duration(ffprobe, f['path']) for f in flist}
         if ld.isoformat() in excl:
             chains = [[f] for f in flist]
+        elif any(dur.get(f['path'], 0) <= 0 for f in flist):
+            log('[merge] %s 有文件取不到时长，按独立场次（不合并）' % ld.isoformat(), 'WARN')
+            chains = [[f] for f in flist]
         else:
-            dur = {f['path']: probe_duration(ffprobe, f['path']) for f in flist}
-            flist.sort(key=lambda x: x['start'])
-            if any(dur.get(f['path'], 0) <= 0 for f in flist):
-                log('[merge] %s 有文件取不到时长，按独立场次（不合并）' % ld.isoformat(), 'WARN')
-                chains = [[f] for f in flist]
-            else:
-                chains, cur = [], [flist[0]]
-                for nxt in flist[1:]:
-                    prev = cur[-1]
-                    prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
-                    gap = (nxt['start'] - prev_end).total_seconds()
-                    if 0 <= gap <= max_gap:
-                        cur.append(nxt)
-                    else:
-                        chains.append(cur)
-                        cur = [nxt]
-                chains.append(cur)
+            chains, cur = [], [flist[0]]
+            for nxt in flist[1:]:
+                prev = cur[-1]
+                prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
+                gap = (nxt['start'] - prev_end).total_seconds()
+                if 0 <= gap <= max_gap:
+                    cur.append(nxt)
+                else:
+                    chains.append(cur)
+                    cur = [nxt]
+            chains.append(cur)
+        # 超短片段吸收：极短且紧贴/重叠的片段并入相邻长场，避免独立成场出废稿
+        chains = _absorb_ultrashort(cfg, log, mc, flist, chains, dur)
         for idx, chain in enumerate(chains):
             first = chain[0]
             sessions.append({'live_date': ld, 'clean_title': first['title'], 'hour': first['hour'],
@@ -465,8 +519,9 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     mp3_export.export_for_local(cfg, log, src_video)
 
     # 5) 压缩归档：
-    #    · local  —— 压成 ~5GB HEVC MP4（out_dir_mode 决定放 根/YYYY-MM-DD/ 或 根/MP4/）
-    #    · darkpy —— 与本地一致（用户规则 2026-09-05：rec站补档也要压缩归档到 根/MP4/）；
+    #    · local  —— 压成 ~5GB HEVC MP4（out_dir_mode=date_subfolder → 根/YYYY-MM-DD/，
+    #                当前规则；源已在日期目录则复用，不重复建层）
+    #    · darkpy —— 与本地一致（用户规则 2026-09-05：rec站补档也要同等压缩归档）；
     #                压缩开关被关掉时按 B站规则保留原始 MP4 归档（不删）。
     #    · bilibili —— 按用户规则不压缩，直接保留原 MP4
     local_root = (cfg.get('local') or {}).get('root') or ''

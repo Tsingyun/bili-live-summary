@@ -82,13 +82,14 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
 | 3 | **缺失检查 + 三级补档**：对照「实际直播日历」（rec站 ∪ 本地 ∪ B站标题）找缺失日期，按 本地 → rec.darkpy.cn → B站 顺序补 | `backfill.stage` + `darkpy_rec.fetch_and_prepare` + `bilibili_fallback(only_dates=…)` | 补齐的场次也写 Word/state 占位；输出逐日结论 |
 | 4 | **导出中质量 MP3**（192k/44.1k） | `mp3_export.export_for_local` | 根目录下的 `.mp3` |
-| 5 | **压缩 HEVC MP4**（~5GB）→ 「录播根目录/MP4/」（本地录播 + rec站补档都压） | `compress_video.compress_video` | `录播根目录/MP4/*_compressed.mp4` |
+| 5 | **压缩 HEVC MP4**（~5GB）→ 「录播根目录/YYYY-MM-DD/」日期文件夹（本地录播 + rec站补档都压） | `compress_video.compress_video` | `录播根目录/YYYY-MM-DD/*_compressed.mp4` |
 | 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `录播根目录/YYYY-MM-DD/<原名>.mp4` |
 
 > 第 2 步处理完本地新文件后，**始终执行第 3 步**（不再互斥）：第 3 步只处理「本地没有 / 已处理但 Word 也没有 / 文件过小疑似残缺」的日期，已覆盖的日期不会重复处理。
 > **备份优先级（2026-09-05）**：本地 → rec.darkpy.cn（第二备份，更新及时，优先于 B站）→ B站（第三备份）。
 > **用户规则（2026-08-29）**：B站兜底录播跑完流程后**留下 MP4、不压缩**（`bilibili.keep_mp4=true`、`compress=false`）。
-> **用户规则（2026-09-05）**：压缩后的视频统一放「录播根目录/MP4/」；rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
+> **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
+> **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。
 
 ---
 
@@ -102,9 +103,9 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 - **flv 通常是录制中的临时格式，且可能在录制过程中被监测到**——脚本用「大小稳定 + 修改时间够老」判定文件已写完，否则整段跳过，避免截半。
 - 处理完成后根目录会留下：中质量 `.mp3`（交付物）+ 各 `YYYY-MM-DD\` 子目录（里面是视频交付物：本地录播 = 压缩后的 `_compressed.mp4`；B站兜底 = 原样保留的 MP4）。
 
-### 视频产物位置（`compress.out_dir_mode = "mp4_folder"`，2026-09-05 起）
-- **本地录播 & rec站补档**：压缩后统一进 **`录播根目录/MP4/`**（不存在则自动创建），文件 `<原名>_compressed.mp4`（用户规则 2026-09-05）。
-- 兼容旧模式：`out_dir_mode="date_subfolder"` 时输出到 `根目录/YYYY-MM-DD/`；`next_to_source` 输出到源旁。
+### 视频产物位置（`compress.out_dir_mode = "date_subfolder"`，2026-09-08 起为当前规则）
+- **本地录播 & rec站补档**：压缩后输出到 **`录播根目录/YYYY-MM-DD/`** 日期文件夹（源已在同日期目录则直接复用、不重复建层），文件 `<原名>_compressed.mp4`（用户规则 2026-09-08：**不要 MP4/ 文件夹，直接用日期命名文件夹**）。
+- 曾被试用又搁置的模式（代码仍兼容、配置勿再用）：`mp4_folder`（2026-09-05，统一 `根/MP4/`）、`mp4_date_folder`（2026-09-06，`根/MP4/YYYY-MM-DD/`）。
 - 日期从文件名里的 8 位日期 `20260824` 解析（自动跳过 UID 等非法日期串）。
 - `replace_original=true` 时按 `replace_mode` 处理原视频——`recycle` = 先备份到 `~/.workbuddy/backups/live_raw/` 再移入**回收站**；`delete` = **直接永久删除**（省空间，岁己当前配置）。**压缩失败不动原文件**。
 - **B站源**：**不压缩**，原样保留下载到的 MP4，按直播日期归档到 `根目录/YYYY-MM-DD/`（默认 `bilibili.keep_mp4=true`）。设 `keep_mp4=false` 才删除下载视频。
@@ -146,7 +147,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
 | `mp3_export` | `enabled/bitrate/ar` | `true` / `192k` / `44100`；`out_dir` = 录播根目录 |
 | `local_merge` | `enabled/max_gap_sec/exclude_dates` | 同日期连续段合并；`exclude_dates` 显式强制不合并 |
-| `compress` | `enabled/out_dir_mode/replace_original` | `true` / `mp4_folder`(→`录播根目录/MP4/`) / `true`（本地 & rec站补档压缩后处理原视频） |
+| `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
 | `compress` | `replace_mode` | `delete` = 直接永久删原视频（岁己当前，省空间）；`recycle` = 先备份再移回收站 |
 | `compress` | `codec/target_size_gb/cq` | `hevc_nvenc` / `5` / `24` |
 | `bilibili` | `keep_mp4` / `compress` | `true` / `false`（B站兜底录播**保留 MP4、不压缩**，归档到 `根目录/YYYY-MM-DD/`） |
@@ -240,7 +241,7 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |
 | `scripts/summarize_gemini.py` | Word 排版底层（粗体总结、斜体金句、章节元数据、话题分隔线） |
 | `scripts/mp3_export.py` | 中质量 MP3 导出 |
-| `scripts/compress_video.py` | HEVC 压缩（本地录播 & rec站补档；`out_dir_mode` 支持 `mp4_folder`→根/MP4/、`date_subfolder`→根/日期/、`next_to_source`；`replace_mode` 决定原视频处理方式） |
+| `scripts/compress_video.py` | HEVC 压缩（本地录播 & rec站补档；`out_dir_mode` 当前用 `date_subfolder`→根/YYYY-MM-DD/；兼容 `mp4_folder`/`mp4_date_folder`(已搁置)、`next_to_source`；`replace_mode` 决定原视频处理方式） |
 | `scripts/daily_pipeline._archive_bilibili_mp4` | B站录播 MP4 归档（不压缩，原样挪到 `根目录/YYYY-MM-DD/`） |
 | `scripts/darkpy_rec.py` | **rec.darkpy.cn 第二备份客户端**：`fetch_index`(列表,10min缓存) → `sessions_for_date`(全局归组,跨午夜归前场) → `download_one`(Range断点续传) → `merge_flvs`(concat copy 无损优先) → `fetch_and_prepare`(一站式) |
 | `scripts/live_calendar.py` | 实际直播日历：`actual_live_dates`（rec站文件/本地/B站标题/danmakus 多源并集；rec站按场次起始日） |
