@@ -81,7 +81,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 | 1 | **监测本地根目录**（`config.local.root`）的新录播（flv/mp4，直接放根目录） | `scan_root_sessions` | 待处理 session 列表；录制中/已处理的自动跳过 |
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
 | 3 | **缺失检查 + 三级补档**：对照「实际直播日历」（rec站 ∪ 本地 ∪ B站标题）找缺失日期，按 本地 → rec.darkpy.cn → B站 顺序补 | `backfill.stage` + `darkpy_rec.fetch_and_prepare` + `bilibili_fallback(only_dates=…)` | 补齐的场次也写 Word/state 占位；输出逐日结论 |
-| 4 | **导出中质量 MP3**（192k/44.1k） | `mp3_export.export_for_local` | 根目录下的 `.mp3` |
+| 4 | **导出中质量 MP3**（192k/44.1k）→ `mp3_export.out_dir`（与 Word 同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`） | `mp3_export.export_for_local` | `文档目录\<原名>.mp3` |
 | 5 | **压缩 HEVC MP4**（~5GB）→ 「录播根目录/YYYY-MM-DD/」日期文件夹（本地录播 + rec站补档都压） | `compress_video.compress_video` | `录播根目录/YYYY-MM-DD/*_compressed.mp4` |
 | 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `录播根目录/YYYY-MM-DD/<原名>.mp4` |
 
@@ -90,6 +90,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 > **用户规则（2026-08-29）**：B站兜底录播跑完流程后**留下 MP4、不压缩**（`bilibili.keep_mp4=true`、`compress=false`）。
 > **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
 > **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。
+> **用户规则（2026-09-08，最新）**：归档 MP3 输出到 `C:\Users\Tsing\DeskBox\文档`（与 Word 总结同目录，`mp3_export.out_dir`），不再放录播根目录。
 
 ---
 
@@ -125,7 +126,7 @@ prompt_original.txt    # 总结用的 system prompt
 | 交付物 | 位置 |
 |---|---|
 | Word 总结 | `C:\Users\Tsing\DeskBox\文档\岁己直播总结_{year}年{month}月.docx`（同月同一文档，分页追加） |
-| 中质量 MP3 | `本地根目录\<原名>.mp3` |
+| 中质量 MP3 | `mp3_export.out_dir\<原名>.mp3`（岁己 = `C:\Users\Tsing\DeskBox\文档`，与 Word 同目录） |
 | 视频（本地录播） | `本地根目录\MP4\<原名>_compressed.mp4`（压缩后的 HEVC） |
 | 视频（rec站补档） | `本地根目录\MP4\<原名>_compressed.mp4`（压缩后的 HEVC） |
 | 视频（B站兜底） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（**不压缩，原样保留**） |
@@ -145,7 +146,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `output` | `doc_dir` / `doc_name_pattern` | `C:\Users\Tsing\DeskBox\文档` / `岁己直播总结_{year}年{month}月.docx` |
 | `transcribe` | `chunk_hours_threshold` | `2`（>2h 音频先切块再转写，规避 FunASR VAD 截断） |
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
-| `mp3_export` | `enabled/bitrate/ar` | `true` / `192k` / `44100`；`out_dir` = 录播根目录 |
+| `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
 | `local_merge` | `enabled/max_gap_sec/exclude_dates` | 同日期连续段合并；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
 | `compress` | `replace_mode` | `delete` = 直接永久删原视频（岁己当前，省空间）；`recycle` = 先备份再移回收站 |
@@ -208,7 +209,7 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 
 - **只删**：workdir 下 `tmp/`（下载碎片、ASR 切块）、`MP3/`（16k 转写临时音频）、`logs/`、
   `backups/`、`__pycache__`、超期 `TXT/`/`SRT/`、根目录 `*.bak`、孤儿 `.lock`/`.heartbeat`。
-- **绝不碰**：录播根目录的任何文件（压缩 MP4 / 归档 MP3 / 源视频）、`doc_dir` 的 Word 总结、
+- **绝不碰**：录播根目录的任何文件（压缩 MP4 / 源视频）、`doc_dir` 与 `mp3_export.out_dir` 的成品（Word 总结 / 归档 MP3）、
   `config.json` / `state.json` / `hotwords.md`。
 - `disk_guard_gb`（默认 40）：磁盘剩余低于该值时，开跑前强制清扫并在日志告警；
   清扫后仍不足会明确提示「成品太多，需人工处理」——**本模块永不自动删成品**。

@@ -22,7 +22,8 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
 1. 白名单：只允许删 workdir 下的 tmp/ MP3/ logs/ SRT/ TXT/ backups/ __pycache__
    以及 workdir 根的历史 *.bak / 孤儿 .lock/.heartbeat。
 2. 黑名单（永不触碰）：config.json、state.json、hotwords.md、Word 文档目录、
-   录播根目录（local.root）下的任何成品——压缩 MP4、归档 MP3、源 flv/mp4。
+   录播根目录（local.root）下的任何成品——压缩 MP4、源 flv/mp4；以及 mp3_export.out_dir
+   的归档 MP3（用户规则 2026-09-08 起与 Word 总结同目录，不在录播根目录）。
    源视频只允许 compress 模块在「压缩成功且校验通过」后删除，本模块不碰。
 3. 删除三级降级：os.remove → shutil.rmtree → PowerShell Remove-Item。
    某些沙箱/占用场景 os.remove 会失败，降级保证真的删掉。
@@ -94,7 +95,8 @@ def protected_paths(cfg):
             except Exception:
                 pass
 
-    # 录播根目录：压缩成品 / 归档 MP3 / 源视频 都在这里，本模块一律不碰
+    # 录播根目录：压缩成品 / 源视频 都在这里，本模块一律不碰
+    # （归档 MP3 2026-09-08 起改到 mp3_export.out_dir，见下方 add）
     add((cfg.get('local') or {}).get('root'))
     add((cfg.get('mp3_export') or {}).get('out_dir'))
     add((cfg.get('output') or {}).get('doc_dir'))

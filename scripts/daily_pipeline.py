@@ -19,14 +19,14 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
          → 同一总结流程（backfill.py / darkpy_rec.py）；
        · B站：仅当 rec站也没有该日时才抓（bilibili_fallback，限定目标日期）。
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
-     （192k / 44.1k，留在录播根目录）。
+     （192k / 44.1k，落在 mp3_export.out_dir；岁己 = C:/Users/Tsing/DeskBox/文档，与 Word 同目录）。
   5. 压缩归档（本地录播 & rec站补档）：压成约 5GB 的 HEVC(H.265) MP4，
      输出到「录播根目录/YYYY-MM-DD/」日期文件夹（out_dir_mode=date_subfolder，
      当前规则，用户 2026-09-08：不用 MP4/ 文件夹，直接用日期命名文件夹）；
      压缩成功后按 compress.replace_mode 处理原视频（delete=直接永久删除）。
      B站兜底录播默认不压缩、原样保留 MP4（config.bilibili，见步骤3旧规则）。
 
-最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（录播根目录）
+最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（mp3_export.out_dir，与 Word 同目录）
              ③ 压缩后 HEVC MP4（录播根目录/YYYY-MM-DD/；B站兜底=原样保留的 MP4）。
 
 用法:

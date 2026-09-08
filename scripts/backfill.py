@@ -13,7 +13,7 @@
    · B站：下载合并多 P 后走同一总结流程（原 bilibili_fallback 逻辑，仅限定目标日期）；
 4. 补档成功的场次复用 daily_pipeline.process_video_source（转写→热词→总结→Word→
    MP3→压缩），压缩后的 MP4 归档到「录播根目录/YYYY-MM-DD/」日期文件夹
-   （out_dir_mode=date_subfolder，当前规则；MP3 留在录播根目录）；
+   （out_dir_mode=date_subfolder，当前规则；MP3 输出到 mp3_export.out_dir，与 Word 同目录）；
 5. 全程幂等/断点续跑：已下载不重下、已合并不重合并、转写/总结产物存在即跳过。
 
 对外接口
