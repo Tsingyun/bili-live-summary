@@ -147,7 +147,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `transcribe` | `chunk_hours_threshold` | `2`（>2h 音频先切块再转写，规避 FunASR VAD 截断） |
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
 | `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
-| `local_merge` | `enabled/max_gap_sec/exclude_dates` | 同日期连续段合并；`exclude_dates` 显式强制不合并 |
+| `local_merge` | `enabled/max_gap_sec/allow_overlap_sec/exclude_dates` | 多段**先合并再总结**（禁止逐段总结）；场次判定**只看相邻间隙、不看日期变更**，跨 0 点连续段归属开播那一场；`allow_overlap_sec`(默认60) 容忍重连时的轻微负间隙；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
 | `compress` | `replace_mode` | `delete` = 直接永久删原视频（岁己当前，省空间）；`recycle` = 先备份再移回收站 |
 | `compress` | `codec/target_size_gb/cq` | `hevc_nvenc` / `5` / `24` |
@@ -236,7 +236,7 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 | 文件 | 职责 |
 |---|---|
 | `scripts/daily_pipeline.py` | **主编排器**：监测 → 本地/B站 → MP3 → 压缩，含锁/断点/状态写入（通用，零主播硬编码） |
-| `scripts/scan_root_sessions`（在 daily_pipeline 内） | 根目录监测 + 连续段合并 + 录制中跳过 |
+| `scripts/scan_root_sessions`（在 daily_pipeline 内） | 根目录监测 + **全局按时间排序、间隙阈值切分场次**（跨午夜归前一场）+ 合并 + 录制中跳过；合并依赖外部命令 ffmpeg/ffprobe，缺失时显式报错并降级/跳过 |
 | `scripts/transcribe.py` | FunASR 转写（带时间轴 TXT/SRT），`chunk_hours_threshold` 切块 |
 | `scripts/hotwords.py` | 转写后热词替换（路径相对工作目录解析） |
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |

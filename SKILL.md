@@ -217,17 +217,29 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 > 另外降级调用 PowerShell 时 stderr 必须 `subprocess.PIPE` 拿 bytes 再自行解码，
 > 否则 Windows 读线程会按 gbk 解码中文报错并抛 `UnicodeDecodeError` 刷爆日志。
 
-### 同日期多段连续录播 → 先合并再总结
-网络波动会导致录播器断流重连，于是**同一日期根目录下出现多个录播文件**。规则：
-- `scan_root_sessions` 扫描根目录，按文件名里的时间(`HHMMSS`)排序，用 ffprobe 取每段时长算出结束时间。
-- **相邻两段「前段结束 ≈ 后段开始」且间隙 ≤ `local_merge.max_gap_sec`（默认 600s）、且能取到时长** → 视为同一场（网络断开重连），并入同一 chain。
-- 间隙过大、或某段取不到时长 → 视为**独立场次**，各自成 chain、各自总结（同日期多场用编号占位 `LOCAL-YYYYMMDD-2`、`-3`… 区分）。
+### 多段录播 → 先合并再总结（**禁止逐段分别总结**）
+
+网络波动会让录播器断流重连，于是一场直播被切成**多个文件**。规则（2026-09-14 修正）：
+
+- **场次判定只看「相邻片段间隙」，不看日期变更**（旧实现按文件名日期硬分组，导致跨 0 点的后半段被当成新一天、独立产出第二份总结——已修）：
+  全部候选文件**全局**按开始时间排序 → 用 ffprobe 取时长算结束时刻 →
+  间隙 ∈ [`-allow_overlap_sec`, `max_gap_sec`] 即视为同一场。
+- **跨午夜但连续** → 归属**开播那一场**（`crosses_midnight=True`），合并后**只出一份总结**；
+  **同一天但间隔很久**（如下午场 + 晚上场）→ 正确切成两场。
+- 取不到时长时**回退用文件 mtime 估算**结束时刻（打 WARN）；两者都失败 → 该片段保守独立成场，绝不猜测性合并。
+- 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；失败回退 `concat filter` 重编码兜底。
+- **合并失败 = 整场跳过且不写完成标记（下次自动重试），绝不退化成逐段分别总结**——那会给一场直播产出多份残缺总结。
 - 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；编码不一致导致失败时回退 `concat filter` 重编码兜底。
 - 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
-- 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限) / `keep_merged`(是否保留合并视频) / `exclude_dates`(日期列表，**显式强制不合并**，优先级高于 `max_gap_sec`，用于确认是「多场独立直播」而非断流重连的日期)。
+- 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限，默认 600) / `allow_overlap_sec`(允许的负间隙，默认 60，容忍录制器重连时几秒回退/重叠) / `keep_merged`(是否保留合并视频) / `exclude_dates`(日期列表，**显式强制不合并**，优先级高于 `max_gap_sec`，用于确认是「多场独立直播」而非断流重连的日期)。
 - **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
 - ⚠️ **临界风险**：若某日期多文件真实间隙只比 `max_gap_sec` 略大（如 609s vs 600s），ffprobe 时长精度波动可能让间隙跌破阈值而被误合并。对确认是独立多场的日期务必加入 `exclude_dates`（如 `"exclude_dates": ["2026-08-22"]`），不依赖阈值侥幸。
 - 复用：因合并视频已留档（`keep_merged=true`），重跑不会重复合并；已写占位(`LOCAL-*`)的场次仍会被跳过。
+- **外部依赖（显式声明）**：合并与时长探测强依赖 `paths.ffmpeg` / `paths.ffprobe`。
+  缺失时日志会明确报「外部工具缺失」并说明后果——**ffprobe 缺失降级用 mtime；ffmpeg 缺失则该场跳过（不崩溃、不逐段总结）**，请检查 `config.paths` 后重跑。
+- ⚠️ **占位 key 冲突（2026-09-14 修）**：同一 `live_date` 可能残留旧占位（典型是跨午夜尾巴留下的 `merged_into` 占位）。
+  判定「已处理」时会比对**成员文件是否相交**，无交集则视为同一天的另一场；写入时 key 自动顺延（`LOCAL-20260913-2`），**绝不覆盖**旧记录。
+  曾发生 9/13 晚场被 9/12 尾巴占位 `LOCAL-20260913` 整场挡住、一直没总结的事故。
 
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |

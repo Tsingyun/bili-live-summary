@@ -218,6 +218,56 @@ def _absorb_ultrashort(cfg, log, mc, flist, chains, dur):
     return new_chains
 
 
+def _log_err(log, msg):
+    """记一条错误级日志。兼容两种 log 形态：Logger 对象（.error 方法）或
+    普通 callable（第二参为级别字符串）。"""
+    try:
+        log.error(msg)
+    except AttributeError:
+        log(msg, 'ERROR')
+
+
+def _tool_ready(path, log, name):
+    """显式检查外部工具（ffmpeg / ffprobe）是否可用。
+
+    合并强依赖这两个命令，缺失时必须**明确报错并说明后果**，而不是让后面的
+    subprocess 抛一个看不懂的 FileNotFoundError。
+    """
+    if not path or not os.path.exists(path):
+        _log_err(log, '[merge] 外部工具缺失：%s 未配置或路径不存在（%s）——'
+                      '本轮无法判断片段时长/合并，相关片段将按独立场次处理（不会崩溃）。'
+                      '请检查 config.paths.%s' % (name, path, name.lower()))
+        return False
+    return True
+
+
+def _file_end(f, ffprobe, log):
+    """估算单个片段的结束时刻，返回 (end_datetime, source)。
+
+    source ∈ {'duration', 'mtime', 'none'}：
+      · 'duration' —— ffprobe 拿到真实时长，最可靠；
+      · 'mtime'    —— ffprobe 失败/缺失时回退用「文件最后修改时间」近似结束时刻
+                      （录制器写完后不再改文件，mtime ≈ 录制结束时刻）。这是**降级**
+                      手段，仅用于让跨午夜场次仍有机会被正确合并，日志会显式标注；
+      · 'none'     —— 两种手段都失败，该片段无法参与间隙判断，**保守独立成场**，
+                      绝不猜测性合并。
+    """
+    if ffprobe:
+        try:
+            d = probe_duration(ffprobe, f['path'])
+            if d and d > 0:
+                return f['start'] + datetime.timedelta(seconds=float(d)), 'duration'
+        except Exception:
+            pass
+    try:
+        mt = datetime.datetime.fromtimestamp(os.path.getmtime(f['path']))
+        if mt > f['start']:
+            return mt, 'mtime'
+    except Exception:
+        pass
+    return None, 'none'
+
+
 # ---------------------------------------------------------------------------
 # 步骤 1：监测本地新录播（根目录 + 日期子目录）
 # ---------------------------------------------------------------------------
@@ -284,47 +334,157 @@ def scan_root_sessions(cfg, log):
     if not files:
         return sessions
 
-    by_date = {}
-    for f in files:
-        by_date.setdefault(f['live_date'], []).append(f)
+    # ------------------------------------------------------------------
+    # 场次归组（2026-09-14 重构：不再以「日期变更」作为切分依据）
+    #
+    # 【旧实现的问题】先按文件名里的 8 位日期 by_date 硬分组，再在**同一天内部**
+    # 用间隙阈值合并。断流重连后若录制跨过 0 点，后半段文件名日期变为次日，
+    # 于是被丢进另一个日期桶，永远无法和前一晚的尾巴合并 → 一场直播被切成两个
+    # session → 产出两份总结（用户反馈的问题）。
+    #
+    # 【新实现】全部候选文件**全局**按开始时间排序，只用「相邻片段的间隙阈值」
+    # 判断是否同一场，与日历日期完全无关：
+    #   · 跨午夜但连续（间隙 <= max_gap_sec）→ 归属前一场，合并后只出一份总结；
+    #   · 同一天但间隔很久（如下午场 + 晚上场）→ 正确切成两场；
+    #   · 场次归属日期 = chain 第一个片段的日期（即**开播那天**）。
+    # ------------------------------------------------------------------
+    files.sort(key=lambda x: x['start'])
+    merge_on = bool(mc.get('enabled', True))
+    if not _tool_ready(ffprobe, log, 'ffprobe'):
+        ffprobe = None                      # 缺失时降级用 mtime，不中断流程
 
+    # 每个片段的结束时刻（优先真实时长，失败回退 mtime，都失败则独立成场）
+    end_of, dur = {}, {}
+    degraded = []
+    for f in files:
+        end, src = _file_end(f, ffprobe, log)
+        if end is None:
+            degraded.append(f['fn'])
+            end = f['start']                # 时长视作 0 → 间隙必然超限 → 独立成场
+        f['_end_src'] = src
+        end_of[f['path']] = end
+        dur[f['path']] = (end - f['start']).total_seconds()
+    if degraded:
+        log('[merge] %d 个片段取不到时长且无法用 mtime 估算，保守按独立场次处理：%s'
+            % (len(degraded), ', '.join(degraded)), 'WARN')
+    if ffprobe is None and files:
+        log('[merge] 已降级：用文件修改时间(mtime)近似片段结束时刻来判断间隙', 'WARN')
+
+    # 允许轻微负间隙（录制器重连可能回退几秒/轻微重叠），默认 60s 内仍算同一场
+    allow_overlap = int(mc.get('allow_overlap_sec', 60))
     excl = set(mc.get('exclude_dates') or [])
-    for ld, flist in sorted(by_date.items()):
-        flist.sort(key=lambda x: x['start'])
-        dur = {f['path']: probe_duration(ffprobe, f['path']) for f in flist}
-        if ld.isoformat() in excl:
-            chains = [[f] for f in flist]
-        elif any(dur.get(f['path'], 0) <= 0 for f in flist):
-            log('[merge] %s 有文件取不到时长，按独立场次（不合并）' % ld.isoformat(), 'WARN')
-            chains = [[f] for f in flist]
+    if not merge_on:
+        log('[merge] local_merge.enabled=false，每个片段独立成场（不合并）')
+
+    def _excluded(f):
+        return f['live_date'].isoformat() in excl
+
+    chains, cur = [], [files[0]]
+    for nxt in files[1:]:
+        prev = cur[-1]
+        gap = (nxt['start'] - end_of[prev['path']]).total_seconds()
+        same_session = (
+            merge_on
+            and not _excluded(prev) and not _excluded(nxt)
+            and prev['_end_src'] != 'none'          # 前一段结束时刻不可知 → 不敢合并
+            and (-allow_overlap) <= gap <= max_gap
+        )
+        if same_session:
+            cur.append(nxt)
         else:
-            chains, cur = [], [flist[0]]
-            for nxt in flist[1:]:
-                prev = cur[-1]
-                prev_end = prev['start'] + datetime.timedelta(seconds=dur[prev['path']])
-                gap = (nxt['start'] - prev_end).total_seconds()
-                if 0 <= gap <= max_gap:
-                    cur.append(nxt)
-                else:
-                    chains.append(cur)
-                    cur = [nxt]
             chains.append(cur)
-        # 超短片段吸收：极短且紧贴/重叠的片段并入相邻长场，避免独立成场出废稿
-        chains = _absorb_ultrashort(cfg, log, mc, flist, chains, dur)
-        for idx, chain in enumerate(chains):
-            first = chain[0]
-            sessions.append({'live_date': ld, 'clean_title': first['title'], 'hour': first['hour'],
-                             'member_files': [f['path'] for f in chain], 'is_merged': len(chain) > 1,
-                             'chain_index': idx, 'merged_src': None})
+            cur = [nxt]
+    chains.append(cur)
+
+    # 超短片段吸收：极短且紧贴/重叠的片段并入相邻长场，避免独立成场出废稿
+    if merge_on:
+        chains = _absorb_ultrashort(cfg, log, mc, files, chains, dur)
+
+    # chain_index 按「开播日期」分组编号：跨午夜合并出的 chain 归属其首段的日期，
+    # 保证同一天有多场时编号稳定，并与 state 里的占位 key 兼容。
+    per_date_counter = {}
+    for chain in chains:
+        chain.sort(key=lambda x: x['start'])
+        first, last = chain[0], chain[-1]
+        ld = first['live_date']
+        idx = per_date_counter.get(ld, 0)
+        per_date_counter[ld] = idx + 1
+        span_end = end_of[last['path']]
+        crosses_midnight = any(f['live_date'] != ld for f in chain)
+        sessions.append({'live_date': ld, 'clean_title': first['title'], 'hour': first['hour'],
+                         'member_files': [f['path'] for f in chain], 'is_merged': len(chain) > 1,
+                         'chain_index': idx, 'merged_src': None,
+                         # date_seq = 该场次在「本日」内的序号，只用于生成 Word/TXT 标题；
+                         # chain_index 可能会被 _next_free_key 顺延（避让旧占位），
+                         # 两者必须分开，否则顺延会让标题凭空多出「（第2场）」。
+                         'date_seq': idx,
+                         'crosses_midnight': crosses_midnight,
+                         'span_start': first['start'], 'span_end': span_end})
+        if crosses_midnight:
+            log('[merge] 跨午夜场次已合并为一场（归属 %s，共 %d 段，%s → %s）'
+                % (ld.isoformat(), len(chain),
+                   first['start'].strftime('%m-%d %H:%M:%S'),
+                   span_end.strftime('%m-%d %H:%M:%S')))
+    # 全局按开播时间排序输出，保证处理顺序即时间顺序
+    sessions.sort(key=lambda s: s['span_start'])
     return sessions
+
+
+def _members_of(rec):
+    """取占位记录里的成员文件名集合（用于判断两条记录是不是同一场）。"""
+    try:
+        return set(os.path.basename(x) for x in (rec.get('members') or []))
+    except Exception:
+        return set()
+
+
+def _same_session_as_record(rec, session):
+    """判断 state 里的占位记录是否就是「当前这一场」。
+
+    同一个 live_date 可能残留多条占位（典型：跨午夜尾巴被合并进前一天时留下的
+    `merged_into` 占位）。若只按 key 判定，前一天留下的占位会**永久挡住**当天
+    真正的直播（2026-09-13 晚场即因此被整场跳过）。
+
+    判定：占位记录的成员文件与当前场次有交集 → 同一场；无交集 → 同日另一场。
+    记录里没有 members（很老的记录）时保守按「同一场」处理，保持旧行为。
+    """
+    prev = _members_of(rec)
+    if not prev:
+        return True
+    cur = set(os.path.basename(p) for p in session['member_files'])
+    return bool(prev & cur)
+
+
+def _next_free_key(st, session, log=None):
+    """为本场挑一个不与既有占位冲突的 key（返回顺延后的 chain_index）。
+
+    目标 key 被占且成员无交集（= 同一天的另一场）时，把 chain_index 往后顺延，
+    **绝不覆盖**旧记录——旧记录承载着「某段已并入哪场」的信息，覆盖会丢。
+    """
+    ld = session['live_date']
+    ci = int(session.get('chain_index', 0))
+    for _ in range(50):
+        key = session_key(ld, ci)
+        rec = (st.get('processed') or {}).get(key)
+        if not rec or _same_session_as_record(rec, session):
+            if ci != session.get('chain_index') and log:
+                log('[monitor] %s 占位冲突（同日另有已处理场次），key 顺延为 %s'
+                    % (ld.isoformat(), key))
+            return ci
+        ci += 1
+    return ci
 
 
 def already_done_local(cfg, st, session):
     key = session_key(session['live_date'], session['chain_index'])
-    if key in st.get('processed', {}):
-        return True, '%s 占位已存在' % key
+    rec = (st.get('processed') or {}).get(key)
+    if rec:
+        if _same_session_as_record(rec, session):
+            return True, '%s 占位已存在' % key
+        # 占位属于同一天的另一场（如跨午夜尾巴的 merged_into 占位），不能挡住本场
+        return False, ''
     fname = session_fname(session['live_date'], session['clean_title'],
-                          session['hour'], session['chain_index'])
+                          session['hour'], session.get('date_seq', session['chain_index']))
     txt_dir = cfg['_dirs'].get('txt') or st.get('_dirs', {}).get('txt')
     if not (txt_dir and os.path.isdir(txt_dir)
             and os.path.exists(os.path.join(txt_dir, fname))):
@@ -367,16 +527,49 @@ def prepare_session(cfg, log, session):
     t0 = time.time()
     res = merge_videos(cfg, log, session, out_path)
     if not res:
+        # 关键：合并失败**绝不退回「逐段分别总结」**——那会给一场直播产出多份
+        # 残缺总结。这里整场跳过且不写完成标记，下次运行自动重试（幂等）。
+        _log_err(log, '[merge] 合并失败，本场整场跳过、不写完成标记（下次自动重试），'
+                      '不会逐段分别总结：%s'
+                      % ', '.join(os.path.basename(p) for p in session['member_files']))
         return None
     log('[merge] 合并完成（%.0fs）：%s' % (time.time() - t0, os.path.basename(out_path)))
     session['merged_src'] = res
     return res
 
 
+def _merged_ok(out_path, ffprobe):
+    """校验合并产物是否可用：有 ffprobe 则校验时长 > 0，否则只能校验非空。"""
+    if not os.path.exists(out_path) or os.path.getsize(out_path) <= 0:
+        return False
+    if not ffprobe:
+        return True
+    try:
+        return (probe_duration(ffprobe, out_path) or 0) > 0
+    except Exception:
+        return False
+
+
 def merge_videos(cfg, log, session, out_path):
-    """多段连续录播合并为单一视频（优先 concat demuxer 不重编码，失败回退重编码）。"""
+    """多段连续录播合并为单一视频（优先 concat demuxer 不重编码，失败回退重编码）。
+
+    **外部依赖（显式声明）**：本函数强依赖 `config.paths.ffmpeg` 与
+    `config.paths.ffprobe` 两个外部命令。
+      · ffmpeg  —— 真正执行合并（concat demuxer / filter_complex 两条路径）；
+      · ffprobe —— 合并后校验产物时长，防止产出 0 字节/损坏文件被当成成功。
+    任一缺失或执行失败都会记录明确错误并返回 None，**由调用方决定跳过整场**，
+    绝不会退化成「逐段分别总结」。
+    """
     ffmpeg = cfg['paths']['ffmpeg']
     ffprobe = cfg['paths']['ffprobe']
+    if not _tool_ready(ffmpeg, log, 'ffmpeg'):
+        _log_err(log, '[merge] 缺少 ffmpeg，无法把 %d 段录播合并为单一时间线；'
+                      '本场跳过（不会逐段总结），请检查 config.paths.ffmpeg 后重跑。'
+                      % len(session['member_files']))
+        return None
+    if not _tool_ready(ffprobe, log, 'ffprobe'):
+        log('[merge] 缺少 ffprobe，合并后无法校验产物时长，将改用「文件非空」作为成功判据', 'WARN')
+        ffprobe = None
     list_path = out_path + '.list.txt'
     try:
         with open(list_path, 'w', encoding='utf-8') as f:
@@ -385,8 +578,7 @@ def merge_videos(cfg, log, session, out_path):
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                         '-f', 'concat', '-safe', '0', '-i', list_path,
                         '-c', 'copy', out_path], check=True)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 \
-                and (probe_duration(ffprobe, out_path) or 0) > 0:
+        if _merged_ok(out_path, ffprobe):
             return out_path
     except Exception as e:
         log('[merge] concat demuxer 失败（%s），尝试重编码合并' % e, 'WARN')
@@ -407,8 +599,7 @@ def merge_videos(cfg, log, session, out_path):
                        ['-filter_complex', fc, '-map', '[v]', '-map', '[a]',
                         '-c:v', 'libx264', '-preset', 'veryfast',
                         '-c:a', 'aac', '-b:a', '192k', out_path], check=True)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 \
-                and (probe_duration(ffprobe, out_path) or 0) > 0:
+        if _merged_ok(out_path, ffprobe):
             return out_path
     except Exception as e2:
         log.error('[merge] 重编码合并也失败：%s' % e2)
@@ -800,6 +991,11 @@ def main():
         if args.date:
             sessions = [s for s in sessions if s['live_date'].isoformat() == args.date]
 
+        # 占位 key 顺延：同一 live_date 可能已有旧占位（典型是跨午夜尾巴留下的
+        # merged_into 占位），不能让它顶掉当天真正的直播，也不能覆盖旧记录。
+        for s in sessions:
+            s['chain_index'] = _next_free_key(st, s, log)
+
         # 过滤已处理 + 跳过录制中文件
         to_process, skipped = [], []
         for s in sessions:
@@ -820,7 +1016,9 @@ def main():
         for s in skipped:
             log('  跳过 %s：%s' % (s[0]['live_date'].isoformat(), s[1]))
         for s in to_process:
-            tag = ('合并 %d 段' % len(s['member_files'])) if s['is_merged'] else '单文件'
+            tag = ('合并 %d 段%s' % (len(s['member_files']),
+                                    '（跨午夜）' if s.get('crosses_midnight') else '')
+                   ) if s['is_merged'] else '单文件'
             log('  将处理 %s %s [%s] (%s)'
                 % (s['live_date'].isoformat(), s['clean_title'], tag,
                    ', '.join(os.path.basename(p) for p in s['member_files'])))
@@ -844,7 +1042,10 @@ def main():
                 if not src:
                     log.error('准备源文件失败，跳过：%s' % s['live_date'].isoformat())
                     continue
-                fname = session_fname(s['live_date'], s['clean_title'], s['hour'], s['chain_index'])
+                # 标题用 date_seq（本日场次序号）而非 chain_index——后者可能因
+                # 避让旧占位被顺延，用它会让标题凭空多出「（第2场）」。
+                fname = session_fname(s['live_date'], s['clean_title'], s['hour'],
+                                      s.get('date_seq', s['chain_index']))
                 try:
                     ok = process_video_source(cfg, st, src, s['live_date'].isoformat(),
                                              fname, 'local', log, progress)

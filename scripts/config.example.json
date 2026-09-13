@@ -102,9 +102,13 @@
     "compress": false
   },
   "local_merge": {
-    "_comment": "同日期目录下多个录播文件若时间连续（网络波动断开重连），先合并成单一时间线再总结。判定：按文件名时间排序，相邻段间隙<=max_gap_sec 且能取到时长则并入同一场；否则各自总结。",
+    "_comment": "★ 用户规则(2026-09-14 修正)：多个录播文件必须**先合并再总结**，绝不逐段分别总结。场次判定**不看日期变更**，只用「相邻片段间隙」：全部文件全局按开始时间排序后，间隙在 [-allow_overlap_sec, max_gap_sec] 之间即视为同一场。因此断流跨过 0 点的后半段（文件名日期为次日）仍归属开播那一场，只产出一份总结；同一天间隔很久的下午场/晚上场则正确切成两场。取不到时长时回退用文件 mtime 估算结束时刻（会打 WARN），两者都失败则该片段保守独立成场。合并依赖外部命令 paths.ffmpeg / paths.ffprobe，缺失会显式报错并跳过该场（不崩溃、不逐段总结）。",
     "enabled": true,
     "max_gap_sec": 600,
+    "allow_overlap_sec": 60,
+    "absorb_ultrashort": true,
+    "ultrashort_sec": 300,
+    "absorb_window_sec": 600,
     "keep_merged": true,
     "exclude_dates": []
   },
