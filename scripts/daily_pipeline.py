@@ -563,7 +563,8 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
                 log.error('[bilibili] 删除临时下载视频失败（不影响成品）：%s' % e)
 
     try:
-        RD.reorder()
+        # 必须重排「本场实际写入的月度文档」，不能落回 reorder_doc 的默认文档（曾导致当月章节顺序错乱）
+        RD.reorder(S.doc_path_for(cfg, live_date))
     except Exception as e:
         log('重排 Word 失败（不影响总结）：%s' % e)
     return True

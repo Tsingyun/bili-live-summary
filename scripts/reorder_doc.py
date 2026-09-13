@@ -40,8 +40,13 @@ def parse_key(txt):
     return (y, mo, d, h)
 
 
-def reorder():
-    doc = Document(DOC)
+def reorder(doc_path=None):
+    """把文档里的章节按直播日期升序重排。
+
+    doc_path：要重排的 docx；不传则用模块级 DOC（命令行 argv[1] 或默认）。
+    调用方（daily_pipeline）务必传入本场实际写入的月度文档，否则会误排默认文档。
+    """
+    doc = Document(doc_path or DOC)
     body = doc.element.body
     children = list(body)
 
