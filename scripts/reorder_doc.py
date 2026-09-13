@@ -16,14 +16,21 @@ reorder_doc.py —— 按直播日期重排《岁己直播总结_YYYY年M月.doc
   python reorder_doc.py [docx路径]   （缺省用 8 月文档）
 
 示例:
-  python reorder_doc.py "C:\\Users\\Tsing\\DeskBox\\文档\\岁己直播总结_2026年9月.docx"
+  python reorder_doc.py "C:/Users/Tsing/DeskBox/文档/岁己直播总结_2026年9月.docx"
+
+⚠️ 陷阱（2026-09-14 修复）：本模块会被 daily_pipeline 以 `import` 方式调用，
+    此时 sys.argv[1] 是 daily_pipeline 自己的命令行参数（如 `--date`），**不是文档路径**。
+    因此模块级绝不能出现 `DOC = sys.argv[1]` —— 否则保存时会把文档写到名为
+    `--date` 的垃圾文件里，真正的月度文档却没被重排。
+    正确做法：默认值只作常量，命令行参数只在 __main__ 分支里解析。
 """
 import re
 import sys
 from docx import Document
 from docx.oxml.ns import qn
 
-DOC = sys.argv[1] if len(sys.argv) > 1 else r'C:\Users\Tsing\DeskBox\文档\岁己直播总结_2026年8月.docx'
+# 仅作为「命令行未给路径时」的默认文档；不可写成 sys.argv[1]（见上方陷阱说明）
+DEFAULT_DOC = r'C:/Users/Tsing/DeskBox/文档/岁己直播总结_2026年8月.docx'
 
 
 def heading_text(el):
@@ -43,10 +50,12 @@ def parse_key(txt):
 def reorder(doc_path=None):
     """把文档里的章节按直播日期升序重排。
 
-    doc_path：要重排的 docx；不传则用模块级 DOC（命令行 argv[1] 或默认）。
+    doc_path：要重排的 docx；不传则用默认文档（DEFAULT_DOC）。
     调用方（daily_pipeline）务必传入本场实际写入的月度文档，否则会误排默认文档。
+    保存路径必须与读取路径一致（曾因写死模块级 DOC 而把文档存到别处）。
     """
-    doc = Document(doc_path or DOC)
+    target = doc_path or DEFAULT_DOC
+    doc = Document(target)
     body = doc.element.body
     children = list(body)
 
@@ -92,11 +101,12 @@ def reorder(doc_path=None):
     if sectPr is not None:
         body.append(sectPr)
 
-    doc.save(DOC)
-    print('重排完成，最终章节顺序：')
+    doc.save(target)   # 必须存回读的那个文件，不能写死默认路径
+    print('重排完成（已保存到 %s），最终章节顺序：' % target)
     for key, elems in sections:
         print('   ', key, heading_text(elems[0])[:54])
 
 
 if __name__ == '__main__':
-    reorder()
+    # 只在命令行直接运行时才解析 argv —— import 时 argv 属于调用方
+    reorder(sys.argv[1] if len(sys.argv) > 1 else None)
