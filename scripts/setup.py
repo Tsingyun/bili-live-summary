@@ -64,7 +64,7 @@ def main():
     ap.add_argument('--series-url', default=None)
     ap.add_argument('--api-key', default=None)
     ap.add_argument('--api-provider', default='google')
-    ap.add_argument('--model', default='gemini-3.7-flash')
+    ap.add_argument('--model', default='gemini-3.8-flash')
     ap.add_argument('--streamer', default=None)
     ap.add_argument('--audience', default=None)
     ap.add_argument('--doc-dir', default=None)
@@ -105,7 +105,7 @@ def main():
     api_key = get('api_key', '', 'AI API Key（必填）')
     while not ni and not api_key:
         api_key = ask('AI API Key（必填）', '')
-    model = get('model', 'gemini-3.7-flash', '模型名')
+    model = get('model', 'gemini-3.8-flash', '模型名')
     doc_dir = get('doc_dir', DEFAULTS['doc_dir'], 'Word 文档输出目录')
 
     # 依赖探测

@@ -139,7 +139,7 @@ prompt_original.txt    # 总结用的 system prompt
 |---|---|---|
 | `series` | `mid` / `series_id` | `1954091502` / `2609053`（B站合集，兜底用） |
 | `latest_mode` | `mode` | `latest_by_live_date`；`since_live_date=2026-08-09` 硬下限 |
-| `summarize` | `provider/model` | `google` / `gemini-3.7-flash`（首选，带轮换兜底） |
+| `summarize` | `provider/model` | `google` / `gemini-3.8-flash`（首选，带轮换兜底） |
 | `summarize` | `streamer` / `audience` | `岁己` / `饼干岁`（总结人称，prompt 占位符用） |
 | `summarize` | `chunk_minutes` | `30`（**必须**按 30 分钟切块逐块发 AI） |
 | `summarize` | `prompt_path` | 可选；指向含 `{streamer}`/`{audience}` 占位符的 prompt 文件 |

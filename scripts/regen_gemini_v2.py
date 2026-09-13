@@ -117,21 +117,34 @@ def touch_heartbeat(cfg):
     except Exception:
         pass
 
-# 模型轮换顺序（按能力，用户指定 + 依能力类推的补充 lite/pro 兜底）
-# 2026-08-14：Gemini 3.7 Flash 于 AI Studio 上线 GA，提升为首选（能力最强、单价更低）
+# 模型轮换顺序（用户规则 2026-09-14：**最新版 Flash 固定首位**，其余按综合能力降序，
+# 权重依次为 ① 文本总结/摘要能力 ② 推理质量 ③ 长上下文 ④ 响应速度）
+#
+# 本表于 2026-09-14 用真实 API 逐个核对（GET /v1beta/models 取清单 + 每个模型发一次
+# 最小 generateContent 实测），结论如下，请勿凭版本号推测改动：
+#   · gemini-3.8-flash      2026-09-02 发布，当前最新/最强 Flash，1M 上下文，实测 200
+#   · 免费层 Flash 系列约 20 RPD、Flash-Lite 系列约 500 RPD（各模型独立计数）
+#   · 实测 200：3.8/3.7/3.5-flash、3-flash-preview、2.5-flash、3.5/3.1-flash-lite
+#   · 实测 429：3.6-flash（当日 20 次配额已耗尽，非不可用）、3.1-pro-preview、pro-latest
+#   · 已下架（404，官方要求改用新 ID）：gemini-2.5-flash-lite → gemini-3.5-flash-lite；
+#     gemini-2.5-pro → gemini-3.1-pro-preview。**2.5 系两款已移出本表**
+#   · 不存在的 ID（调用必 404，已移除）：gemini-3-flash / gemini-3.6-flash-lite /
+#     gemini-3-flash-lite / gemini-3-pro / gemini-3.5-pro
+#   · 未收录 gemini-flash-latest 等别名：其指向随 Google 更新漂移，且配额可能与
+#     gemini-3.8-flash 共享，确定性不如固定版本号。
+#
+# 轮换语义：429（每日配额耗尽）/404（模型不可用）自动切下一档；每模型成功 20 次也主动切换。
 MODELS = [
-    'gemini-3.7-flash',
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
-    'gemini-3-flash',
-    'gemini-2.5-flash',
-    'gemini-3.5-flash-lite',
-    'gemini-3.6-flash-lite',
-    'gemini-3-flash-lite',
-    'gemini-2.5-flash-lite',
-    'gemini-2.5-pro',
-    'gemini-3-pro',
-    'gemini-3.5-pro',
+    'gemini-3.8-flash',        # ① 最新最强 Flash，总结质量与推理最佳，1M 上下文
+    'gemini-3.7-flash',        # ② 上代旗舰 Flash，总结稳定，1M 上下文（响应略慢）
+    'gemini-3.6-flash',        # ③ 长期主力，总结质量经实战验证，1M 上下文
+    'gemini-3.5-flash',        # ④ 3.x 中端，质量与速度均衡，1M 上下文
+    'gemini-3-flash-preview',  # ⑤ Gemini 3 首发 Flash，速度快，质量略逊 3.5
+    'gemini-2.5-flash',        # ⑥ 稳定老将，长文本久经考验，免费额度宽松
+    'gemini-3.5-flash-lite',   # ⑦ Lite 档，500 RPD 量大，质量弱于标准 Flash
+    'gemini-3.1-flash-lite',   # ⑧ Lite 档，响应最快，适合兜底救急
+    'gemini-3.1-pro-preview',  # ⑨ Pro 级推理上限最高，但免费额度存疑（实测 429）
+    'gemini-flash-lite-latest' # ⑩ 别名兜底，永不失效，质量最低但几乎总能调通
 ]
 
 # 只处理 2026-08-09 起的 4 场（8/1 那期不在范围内）

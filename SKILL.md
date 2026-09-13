@@ -69,7 +69,7 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 - **bilibili**：B站兜底录播的处置（用户规则 2026-08-29）。`keep_mp4`（默认 `true`）= 跑完流程后**保留 B站录播的 MP4**，原样归档到「录播根目录/YYYY-MM-DD/」；`compress`（默认 `false`）= **不压缩**这类 MP4
 - **latest_mode.mode**：「最新录播」判定（见下）
 - **summarize**：`provider` / `model` / `api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
-  **首选 `provider:"google"`、`model:"gemini-3.7-flash"`**（见下「大模型调用约定」），勿默认用 `zhipu/glm`。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
+  **首选 `provider:"google"`、`model:"gemini-3.8-flash"`**（见下「大模型调用约定」），勿默认用 `zhipu/glm`。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
 - **output**：`doc_dir`、`doc_name_pattern`（支持 `{streamer}`/`{year}`/`{month}`）、`font`
 - **paths**：`project_root` / `python` / `ffmpeg` / `ffprobe` / `aria2c` / `cookies`
 - **transcribe / cleanup**：推理参数与产物清理
@@ -90,7 +90,7 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 ```json
 "summarize": {
   "provider": "google",
-  "model": "gemini-3.7-flash",
+  "model": "gemini-3.8-flash",
   "api_key": "<Google AI Studio / Gemini API Key>",
   "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
   "proxy": "http://127.0.0.1:7897",
@@ -104,20 +104,30 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 
 ### 模型轮换顺序（GeminiRotator）
 旁路重建 / 重跑脚本（`regen_gemini_v2.py`、`run_812.py`）使用 `GeminiRotator` 按下列顺序轮换，
-**首选 `gemini-3.7-flash`**，遇 429（每日配额耗尽）/404（模型不可用）自动顺切下一档；每模型成功调用达 20 次也主动切下一档：
+**首选 `gemini-3.8-flash`**（用户规则 2026-09-14：最新版 Flash 固定首位，其余按综合能力降序，
+权重 ① 文本总结 ② 推理 ③ 长上下文 ④ 响应速度），
+遇 429（每日配额耗尽）/404（模型不可用）自动顺切下一档；每模型成功调用达 20 次也主动切下一档：
 
 ```
-gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash → gemini-3-flash → gemini-2.5-flash
-→ gemini-3.5-flash-lite → gemini-3.6-flash-lite → gemini-3-flash-lite → gemini-2.5-flash-lite
-→ gemini-2.5-pro → gemini-3-pro → gemini-3.5-pro
+gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
+→ gemini-3-flash-preview → gemini-2.5-flash
+→ gemini-3.5-flash-lite → gemini-3.1-flash-lite
+→ gemini-3.1-pro-preview → gemini-flash-lite-latest
 ```
+
+> **已下架/不存在，务必不要再加回**（2026-09-14 实测核对）：
+> `gemini-2.5-flash-lite`、`gemini-2.5-pro` 对免费用户返回 404（官方提示分别改用
+> `gemini-3.5-flash-lite`、`gemini-3.1-pro-preview`）；
+> `gemini-3-flash`、`gemini-3.6-flash-lite`、`gemini-3-flash-lite`、`gemini-3-pro`、`gemini-3.5-pro`
+> 在 `/v1beta/models` 清单中不存在，调用必 404。
 
 `MODELS` 常量定义在 `regen_gemini_v2.py`，`run_812.py` 直接复用 `R.MODELS`，两处同步生效。
-`config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-3.7-flash`。
+`config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-3.8-flash`。
 
-> 注意：`daily_pipeline.py`（每日自动化实际跑的路径）走 **单模型、无自动轮换兜底**，直接用 config 里的
-> `model`（首选 3.7-flash）。3.7 撞免费层每日配额（每模型 20 次/天）会当日跳过、次日续跑；
-> 需要轮换兜底时用 `regen_gemini_v2.py` / `run_812.py` 的转子。两套路径首选模型一致，互不冲突。
+> 补充（2026-09-14 核对）：`daily_pipeline.py` 同样走 `R.GeminiRotator(R.MODELS, rpm=5,
+> max_per_model=20)`，**有自动轮换兜底**（此前本段称其"单模型、无兜底"，与代码不符已更正）。
+> `summarize.model` 仅在非轮换路径/新建配置时作为默认首选；轮换链一律以 `MODELS[0]` 起。
+> 免费层每模型约 20 次/天，撞配额会自动顺切下一档。
 
 ## 5 步每日流程（统一入口 `daily_pipeline.py`）
 
