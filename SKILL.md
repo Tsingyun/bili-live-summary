@@ -112,14 +112,16 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
 → gemini-3-flash-preview → gemini-2.5-flash
 → gemini-3.5-flash-lite → gemini-3.1-flash-lite
-→ gemini-3.1-pro-preview → gemini-flash-lite-latest
+→ gemini-flash-latest → gemini-flash-lite-latest
 ```
 
-> **已下架/不存在，务必不要再加回**（2026-09-14 实测核对）：
+> **已下架/不存在/无免费额度，务必不要再加回**（2026-09-14 实测核对）：
 > `gemini-2.5-flash-lite`、`gemini-2.5-pro` 对免费用户返回 404（官方提示分别改用
 > `gemini-3.5-flash-lite`、`gemini-3.1-pro-preview`）；
 > `gemini-3-flash`、`gemini-3.6-flash-lite`、`gemini-3-flash-lite`、`gemini-3-pro`、`gemini-3.5-pro`
-> 在 `/v1beta/models` 清单中不存在，调用必 404。
+> 在 `/v1beta/models` 清单中不存在，调用必 404；
+> **Pro 系（`gemini-3.1-pro-preview` / `gemini-pro-latest`）在免费层无额度**——配额重置后复测仍 429，
+> 已排除"当日用完"，故不收录。末尾两个 `*-latest` 为滚动别名，作永不失效兜底。
 
 `MODELS` 常量定义在 `regen_gemini_v2.py`，`run_812.py` 直接复用 `R.MODELS`，两处同步生效。
 `config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-3.8-flash`。

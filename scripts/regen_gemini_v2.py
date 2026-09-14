@@ -125,13 +125,16 @@ def touch_heartbeat(cfg):
 #   · gemini-3.8-flash      2026-09-02 发布，当前最新/最强 Flash，1M 上下文，实测 200
 #   · 免费层 Flash 系列约 20 RPD、Flash-Lite 系列约 500 RPD（各模型独立计数）
 #   · 实测 200：3.8/3.7/3.5-flash、3-flash-preview、2.5-flash、3.5/3.1-flash-lite
-#   · 实测 429：3.6-flash（当日 20 次配额已耗尽，非不可用）、3.1-pro-preview、pro-latest
+#   · 实测 429：3.6-flash（当日 20 次配额已耗尽，非不可用）
+#   · **Pro 系在免费层无额度**：`gemini-3.1-pro-preview`、`gemini-pro-latest` 在北京 15:00
+#     配额重置后仍 429（排除"当日用完"），故**不收录**（避免每轮白撞一次）。若日后开通
+#     付费或放开额度，可把 `gemini-pro-latest` 加回列表末尾。
 #   · 已下架（404，官方要求改用新 ID）：gemini-2.5-flash-lite → gemini-3.5-flash-lite；
 #     gemini-2.5-pro → gemini-3.1-pro-preview。**2.5 系两款已移出本表**
 #   · 不存在的 ID（调用必 404，已移除）：gemini-3-flash / gemini-3.6-flash-lite /
 #     gemini-3-flash-lite / gemini-3-pro / gemini-3.5-pro
-#   · 未收录 gemini-flash-latest 等别名：其指向随 Google 更新漂移，且配额可能与
-#     gemini-3.8-flash 共享，确定性不如固定版本号。
+#   · 末尾两个 `*-latest` 为 Google 滚动别名，永远指向当时可用模型，作最后保险
+#     （注意其配额可能与同底层模型共享，撞 429 只会被自动跳过，无实质损失）。
 #
 # 轮换语义：429（每日配额耗尽）/404（模型不可用）自动切下一档；每模型成功 20 次也主动切换。
 MODELS = [
@@ -143,8 +146,8 @@ MODELS = [
     'gemini-2.5-flash',        # ⑥ 稳定老将，长文本久经考验，免费额度宽松
     'gemini-3.5-flash-lite',   # ⑦ Lite 档，500 RPD 量大，质量弱于标准 Flash
     'gemini-3.1-flash-lite',   # ⑧ Lite 档，响应最快，适合兜底救急
-    'gemini-3.1-pro-preview',  # ⑨ Pro 级推理上限最高，但免费额度存疑（实测 429）
-    'gemini-flash-lite-latest' # ⑩ 别名兜底，永不失效，质量最低但几乎总能调通
+    'gemini-flash-latest',     # ⑨ 滚动别名，永远指向当前可用标准 Flash
+    'gemini-flash-lite-latest' # ⑩ 滚动别名兜底，质量最低但几乎总能调通（最后一道保险）
 ]
 
 # 只处理 2026-08-09 起的 4 场（8/1 那期不在范围内）
