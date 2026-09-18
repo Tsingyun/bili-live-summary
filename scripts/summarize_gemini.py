@@ -141,7 +141,10 @@ def _resolve_proxies(sc):
 
 def _post_with_fallback(url, headers, payload, timeout, proxies, log):
     """发起请求；若配置了代理但代理连接失败（如 Clash 已关），
-    自动回退为直连再试一次——沙箱直连可达 Gemini 时可直接生效。"""
+    自动回退为直连再试一次——沙箱直连可达 Gemini 时可直接生效。
+
+    timeout 支持 (连接, 读取) 二元组：连接阶段快速失败，避免代理宕机时白等。
+    """
     try:
         return requests.post(url, headers=headers, json=payload, timeout=timeout, proxies=proxies)
     except requests.exceptions.ConnectionError as e:
@@ -200,7 +203,7 @@ def call_gemini(cfg, system_prompt, user_content, log):
     r = None
     for attempt in range(1, retries + 1):
         try:
-            r = _post_with_fallback(url, headers, payload, 300, proxies, log)
+            r = _post_with_fallback(url, headers, payload, (20, 300), proxies, log)
             if r.status_code == 200:
                 d = r.json()
                 cand = (d.get('candidates') or [{}])[0]
@@ -266,7 +269,7 @@ def call_zhipu(cfg, system_prompt, user_content, log):
     r = None
     for attempt in range(1, retries + 1):
         try:
-            r = _post_with_fallback(url, headers, payload, 300, proxies, log)
+            r = _post_with_fallback(url, headers, payload, (20, 300), proxies, log)
             if r.status_code == 200:
                 d = r.json()
                 msg = ((d.get('choices') or [{}])[0].get('message') or {})
@@ -319,9 +322,56 @@ def doc_path_for(cfg, d: datetime.date):
     return os.path.join(out['doc_dir'], name)
 
 
+def save_doc_atomic(doc, path, log=None):
+    """原子保存 docx：写 <path>.part → 校验 → os.replace。
+
+    ★ 2026-09-18 加固：docx 是本管线最贵重的产物（累积整月章节，且逐月追加）。
+    python-docx 的 doc.save() 是**直接覆盖**目标文件：若此刻进程被环境回收
+    （SIGKILL / 进程树拆除）或目标正被 Word / 腾讯文档占用，就会留下一个
+    **损坏的 docx**（zip 结构不完整），整月内容都可能读不出来。
+    改为：先写临时文件 → 用 zipfile 校验完整性 → 原子替换；替换失败时原文件不动。
+    """
+    import zipfile
+    tmp = path + '.part'
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    doc.save(tmp)
+    # docx 本质是 zip 包：能被打开、无损坏项、含 word/document.xml 即视为完整
+    with zipfile.ZipFile(tmp) as z:
+        bad = z.testzip()
+        if bad is not None or 'word/document.xml' not in z.namelist():
+            try:
+                force_unlink(tmp)
+            except Exception:
+                pass
+            raise RuntimeError('docx 校验失败（损坏项=%s）' % bad)
+    last = None
+    for i in range(10):
+        try:
+            os.replace(tmp, path)
+            return path
+        except OSError as e:
+            last = e
+            time.sleep(0.5 * (i + 1))
+    raise RuntimeError('docx 原子替换失败 %s：%s' % (path, last))
+
+
 def open_or_create(path, font):
     if os.path.exists(path):
-        return Document(path), False
+        try:
+            return Document(path), False
+        except Exception as e:
+            # 主文档损坏（历史上被强杀/占用写坏过）→ 回退 .bak，再不行才新建，
+            # 绝不静默地把新章节写进一个读不出来的文件。
+            bak = path + '.bak'
+            if os.path.exists(bak):
+                try:
+                    d = Document(bak)
+                    import shutil as _sh
+                    _sh.copy2(bak, path)
+                    return d, False
+                except Exception:
+                    pass
+            raise RuntimeError('打开 Word 失败（文件可能已损坏，已尝试 .bak）：%s' % e)
     doc = Document()
     st = doc.styles['Normal']
     st.font.size = Pt(11)
@@ -676,8 +726,14 @@ def summarize_one(cfg, txt_path, log, date_str=None, title=None, bvid=None, url=
         first = created and len([p for p in doc.paragraphs if p.text.strip()]) == 0
         append_section(doc, heading, meta, segs, font, first, overview,
                        topic_sep=sep_cfg.get('enabled', True))
-        os.makedirs(os.path.dirname(docx_path), exist_ok=True)
-        doc.save(docx_path)
+        # 保存前留一份 .bak（原子替换之外的第二道保险，读取端损坏时可回退）
+        try:
+            if os.path.exists(docx_path):
+                import shutil as _sh
+                _sh.copy2(docx_path, docx_path + '.bak')
+        except Exception:
+            pass
+        save_doc_atomic(doc, docx_path, log)
         log(f'  已{"创建" if created else "追加至"}文档：{docx_path}')
         log(f'  token 用量：输入 {tok_in} / 输出 {tok_out}')
         return docx_path

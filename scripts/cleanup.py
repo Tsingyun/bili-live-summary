@@ -36,6 +36,7 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
     python cleanup.py --sweep --aggressive # 无视保留天数，清空全部临时类
 """
 import os
+import re
 import sys
 import time
 import shutil
@@ -292,6 +293,33 @@ def after_session(cfg, log, stem=None, src_kind='local', success=True, dry_run=F
 # ---------------------------------------------------------------------------
 # 全量清扫
 # ---------------------------------------------------------------------------
+def lock_file_is_live(root, name, path):
+    """判断 workdir 下某个 .lock/.heartbeat 的持有者是否**还活着**。
+
+    ★ 2026-09-18 修复（并发安全）：旧实现 `int(整个文件内容)` + 只靠 `os.kill(pid,0)`，
+      有两个洞：
+      ① 新锁格式写作「pid ISO时间」，`int()` 必抛异常 → pid=0 → **跳过存活检查直接删锁**；
+         于是一轮跑满 `orphan_lock_hours`(默认 2h) 的长任务，`.lock` 会在运行中途被清掉，
+         **单实例保护失效**，第二个实例（计划任务/手动）可与它并发写同一份 Word。
+      ② 本机 PID 复用很快，已死进程的 pid 常被无关进程顶替 → 判成「还活着」，
+         孤儿锁永远清不掉（反向故障，下次启动反而被挡住）。
+
+      现在判活统一走 `common`：`.daily_pipeline.*` 用「PID 存在 **且** 心跳新鲜(<20min)」，
+      其它 `.lock` 退化为纯 PID 探测。与 daily_pipeline / run_scheduled 共用一套，不漂移。
+    """
+    if name in ('.daily_pipeline.lock', '.daily_pipeline.heartbeat'):
+        return C.lock_owner_alive(root)
+    pid = 0
+    try:
+        with open(path, encoding='utf-8') as f:
+            m = re.match(r'\s*(\d+)', f.read() or '')
+        if m:
+            pid = int(m.group(1))
+    except Exception:
+        pid = 0
+    return C.pid_alive(pid) if pid else False
+
+
 def sweep(cfg, log, dry_run=False, aggressive=False):
     """按保留天数清扫 workdir 下的临时目录。返回 (释放字节数, 删除清单)。"""
     cu = cfg_cleanup(cfg)
@@ -388,17 +416,8 @@ def sweep(cfg, log, dry_run=False, aggressive=False):
                 continue
             if age_h < lock_hours:
                 continue
-            # 心跳/锁里可能写了 pid，活着就不动
-            try:
-                pid = int((open(p, encoding='utf-8').read().strip() or '0'))
-            except Exception:
-                pid = 0
-            if pid:
-                try:
-                    os.kill(pid, 0)
-                    continue  # 进程还活着
-                except Exception:
-                    pass
+            if lock_file_is_live(root, name, p):
+                continue
             size = dir_size(p)
             freed += size
             deleted.append((p, size))

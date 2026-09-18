@@ -237,13 +237,23 @@ def asr_segments(model, audio_path, cfg, offset_sec=0.0, log=None):
 
 
 def split_audio(ffmpeg, src, work_dir, chunk_sec, log):
+    """按 chunk_sec 切分音频（带超时）。返回切块列表。
+
+    ★ 2026-09-18：加超时——切分挂死会阻塞整轮且无法被清理；
+    同时校验切块非空，避免"切了 0 块"被当成转写成功（产出空 TXT）。
+    """
     os.makedirs(work_dir, exist_ok=True)
     pattern = os.path.join(work_dir, 'chunk_%04d.wav')
-    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-i', src,
-                    '-f', 'segment', '-segment_time', str(int(chunk_sec)),
-                    '-ac', '1', '-ar', '16000', pattern],
-                   capture_output=True, text=True, encoding='utf-8',
-                   errors='replace', timeout=7200)
+    to = int(max(1800, min(6 * 3600, chunk_sec * 60)))
+    try:
+        subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-i', src,
+                        '-f', 'segment', '-segment_time', str(int(chunk_sec)),
+                        '-ac', '1', '-ar', '16000', pattern],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       timeout=to)
+    except subprocess.TimeoutExpired:
+        log.error(f'  音频切分超时（{to}s）已终止')
+        return []
     chunks = sorted(glob.glob(os.path.join(work_dir, 'chunk_*.wav')))
     log(f'  切分为 {len(chunks)} 块，每块 {chunk_sec // 60} 分钟')
     return chunks
@@ -264,13 +274,25 @@ def dedup_merge(segs):
 
 
 def write_txt(path, segs, meta):
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write('# 转写日志\n')
-        for k, v in meta.items():
-            f.write(f'# {k}: {v}\n')
-        f.write('#' + '=' * 55 + '\n\n')
-        for st, _en, txt in segs:
-            f.write(f'[{hms(st)}] {txt}\n')
+    """写转写稿（原子写：.part → os.replace）。
+
+    ★ 2026-09-18：TXT 是总结的输入，下游判据是「存在且 >200 字节」。若进程在写
+    TXT 中途被杀，会留下一个**已经超过 200 字节的截断稿**，下次运行会当作"已转写"
+    直接跳过 → 总结缺掉后半场。原子写保证 TXT 要么不存在、要么完整。
+    """
+    lines = ['# 转写日志\n']
+    for k, v in meta.items():
+        lines.append(f'# {k}: {v}\n')
+    lines.append('#' + '=' * 55 + '\n\n')
+    for st, _en, txt in segs:
+        lines.append(f'[{hms(st)}] {txt}\n')
+    try:
+        from common import atomic_write_text
+        atomic_write_text(path, ''.join(lines))
+    except Exception:
+        # 兜底：原子写失败（极罕见）时退回直接写，至少不丢产物
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(''.join(lines))
 
 
 def srt_time(sec):
@@ -280,11 +302,18 @@ def srt_time(sec):
 
 
 def write_srt(path, segs):
-    with open(path, 'w', encoding='utf-8') as f:
-        for i, (st, en, txt) in enumerate(segs, 1):
-            nxt = segs[i][0] if i < len(segs) else en
-            end = min(max(en, st + 0.8), nxt if nxt > st else en, st + 30)
-            f.write(f'{i}\n{srt_time(st)} --> {srt_time(end)}\n{txt}\n\n')
+    """写 SRT（原子写，理由同 write_txt）。"""
+    buf = []
+    for i, (st, en, txt) in enumerate(segs, 1):
+        nxt = segs[i][0] if i < len(segs) else en
+        end = min(max(en, st + 0.8), nxt if nxt > st else en, st + 30)
+        buf.append(f'{i}\n{srt_time(st)} --> {srt_time(end)}\n{txt}\n\n')
+    try:
+        from common import atomic_write_text
+        atomic_write_text(path, ''.join(buf))
+    except Exception:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(''.join(buf))
 
 
 def transcribe_one(cfg, mp3_path, model, log):
@@ -307,18 +336,34 @@ def transcribe_one(cfg, mp3_path, model, log):
         work = os.path.join(cfg['_dirs']['tmp'], 'asr_' + stem[:40])
         log(f'  时长超过 {threshold // 3600}h，启用分块转写')
         chunks = split_audio(P['ffmpeg'], mp3_path, work, chunk_sec, log)
+        if not chunks:
+            log.error(f'  音频切分为 0 块，转写失败：{stem}')
+            return None
         segs = []
         offset = 0.0
+        failed = []
         for i, c in enumerate(chunks):
             # 用实际块时长累加偏移，而不是假设每块都恰好 chunk_sec
             c_dur = probe_duration(P['ffprobe'], c) or chunk_sec
             log(f'  [{i + 1}/{len(chunks)}] 偏移 {hms(offset)} ...')
-            segs.extend(asr_segments(model, c, cfg, offset_sec=offset, log=log))
+            got = asr_segments(model, c, cfg, offset_sec=offset, log=log)
+            # ★ 2026-09-18：某一块整块转写失败（返回空）以前会被静默跳过，最终 TXT
+            #   仍然"非空"→ 下游判定转写成功 → 总结直接缺掉这 30 分钟。改为显式失败，
+            #   整场不落盘、下次重跑，宁可多花一次算力也不产出残缺稿。
+            if not got:
+                failed.append(i + 1)
+                log.error(f'  第 {i + 1}/{len(chunks)} 块转写为空（该块约 '
+                          f'{int(c_dur // 60)} 分钟内容会丢失）')
+            segs.extend(got)
             offset += c_dur
             # 必须用 force_unlink：D 盘的 os.remove 会被安全 hook 拦截（抛
             # AttributeError），静默失败会让每场留下 ~0.6GB 切块 wav。
             force_unlink(c, log)
         force_rmtree(work, log)
+        if failed:
+            log.error(f'  分块转写有 {len(failed)}/{len(chunks)} 块失败'
+                      f'（块号 {failed}），判定整场失败，不写 TXT/SRT，下次重跑')
+            return None
     else:
         segs = asr_segments(model, mp3_path, cfg, log=log)
 

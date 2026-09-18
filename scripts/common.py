@@ -65,20 +65,156 @@ def load_config(path=None):
     return cfg
 
 
+# ---------- 原子写 ----------
+# 背景（2026-09-18）：流水线随时可能被环境回收（SIGKILL/进程树拆除），若此刻正在
+# 写 state.json / docx / 归档 MP3，磁盘上就会留下**半截文件**；而下游的幂等判据往往
+# 只看「文件存在 + 体积大于某个小阈值」，于是半成品被当成已完成，产出残缺交付物
+# 且再也不会重跑。故所有「写完才算数」的落盘一律走这里：先写 <目标>.part，
+# flush+fsync 落盘，最后 os.replace 原子替换——替换成功即为完成，中途被杀只留 .part。
+def atomic_write_bytes(path, data, log=None):
+    """原子写二进制：<path>.part → fsync → os.replace(path)。
+
+    Windows 上 os.replace 可能因目标被其它程序打开（如 Word/腾讯文档预览 docx）
+    而抛 PermissionError，故带重试；仍失败则抛异常，由调用方决定是否降级。
+    """
+    tmp = path + '.part'
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    with open(tmp, 'wb') as f:
+        f.write(data)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    last = None
+    for i in range(10):
+        try:
+            os.replace(tmp, path)
+            return path
+        except PermissionError as e:          # 目标被占用：稍等再换
+            last = e
+            time.sleep(0.3 * (i + 1))
+        except OSError as e:
+            last = e
+            time.sleep(0.3 * (i + 1))
+    # 实在换不了：清掉 .part，把错误抛给调用方（绝不留下疑似完整的半截文件）
+    try:
+        os.remove(tmp)
+    except Exception:
+        pass
+    raise RuntimeError('原子替换失败 %s：%s' % (path, last))
+
+
+def atomic_write_text(path, text, encoding='utf-8', log=None):
+    return atomic_write_bytes(path, (text or '').encode(encoding, 'replace'), log)
+
+
+def atomic_write_json(path, obj, log=None):
+    return atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2), log=log)
+
+
+# ---------- 单实例锁 / 心跳 ----------
+# 背景（2026-09-18）：流水线可能被环境"回收"（回合结束 → 宿主运行时 dispose →
+# 整棵进程树被拆除）。被回收时不会有机会清理锁文件，于是留下"孤儿锁"。
+# 而 Windows 的 PID 复用很快，仅凭 os.kill(pid, 0) 判活会把无关进程当成持有者，
+# 导致新一轮永远启动不了（表现为"已有实例运行，退出"，当天零产物）。
+# 统一用「PID 存在 **且** 心跳新鲜」双条件判活，并把心跳（heartbeat）作为
+# 长任务的存活证明：只要进程还活着就周期刷新（daily_pipeline 每 60s），被杀则心跳自然变旧。
+#
+# 阈值取 1200s（20 分钟）的权衡：
+#   · 太大 → 上一轮被杀后要等很久才能被接管（自动化 04:00 被杀、04:20 的安全网会跳过，
+#     要等到 05:20 才接管）；
+#   · 太小 → 万一某个步骤长时间占住 GIL、心跳线程 20 分钟没轮上，会误判活实例为孤儿，
+#     造成两个实例并发（重复烧 Gemini 配额）。
+# 心跳线程在独立线程里每 60s 写一次、且长耗时步骤都是 subprocess（会释放 GIL），
+# 1200s 有 20 倍余量；同时把「被杀 → 可接管」的延迟控制在 20 分钟内，当天一定能补完。
+HEARTBEAT_STALE_SEC = 1200
+
+
+def lock_paths(workdir):
+    return (os.path.join(workdir, '.daily_pipeline.lock'),
+            os.path.join(workdir, '.daily_pipeline.heartbeat'))
+
+
+def read_lock_pid(lock_path):
+    """锁文件里的 PID；读不到返回 0。"""
+    try:
+        with open(lock_path, encoding='utf-8') as f:
+            return int((f.read().strip() or '0').split()[0])
+    except Exception:
+        return 0
+
+
+def pid_alive(pid):
+    """PID 是否对应存在的进程。
+
+    实测（Python 3.13 / Windows 11）：os.kill(pid, 0) 是纯探活，**不会**终止进程，
+    可以安全用于判活。
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def heartbeat_age(hb_path):
+    """心跳年龄（秒）；读不到返回 None。"""
+    try:
+        with open(hb_path, encoding='utf-8') as f:
+            parts = f.read().strip().split()
+        ts = int(parts[1]) if len(parts) > 1 else int(parts[0] or 0)
+        return max(0.0, time.time() - ts)
+    except Exception:
+        return None
+
+
+def lock_owner_alive(workdir, stale_sec=HEARTBEAT_STALE_SEC):
+    """锁是否被一个**确实还活着**的实例持有（防 PID 复用误判）。
+
+    判定：PID 存在 **且** 心跳新鲜；心跳缺失或过期 → 视为孤儿锁（可安全抢占）。
+    锁文件没写全（无 PID）时退回 mtime 判断。
+    """
+    lp, hb = lock_paths(workdir)
+    if not os.path.exists(lp):
+        return False
+    pid = read_lock_pid(lp)
+    if not pid:
+        try:
+            return (time.time() - os.path.getmtime(lp)) < stale_sec
+        except OSError:
+            return False
+    if not pid_alive(pid):
+        return False
+    age = heartbeat_age(hb)
+    if age is None:
+        return False
+    return age < stale_sec
+
+
 # ---------- 状态 ----------
 def state_path(cfg):
     return os.path.join(cfg['_dirs']['root'], 'state.json')
 
 
 def load_state(cfg):
+    """读 state.json。主文件损坏时自动回退 state.json.bak（原子写保护之外的最后兜底）。"""
     p = state_path(cfg)
-    if os.path.exists(p):
+    st = None
+    for cand in (p, p + '.bak'):
+        if not os.path.exists(cand):
+            continue
         try:
-            with open(p, 'r', encoding='utf-8') as f:
+            with open(cand, 'r', encoding='utf-8') as f:
                 st = json.load(f)
+            if isinstance(st, dict):
+                break
+            st = None
         except Exception:
-            st = {}
-    else:
+            st = None
+    if not isinstance(st, dict):
         st = {}
     st.setdefault('processed', {})       # bvid -> {title, pubdate, date, stages, doc}
     st.setdefault('last_pubdate', 0)     # 已处理过的最大 pubdate
@@ -87,11 +223,19 @@ def load_state(cfg):
 
 
 def save_state(cfg, st):
+    """原子保存 state.json，并留一份 .bak。
+
+    · 先写 .part（fsync）再 replace，进程被杀只会留下 .part，主文件始终完整；
+    · replace 之前把当前主文件复制为 .bak，读取端损坏时可回退（load_state）。
+    """
     st['updated_at'] = datetime.datetime.now().isoformat(timespec='seconds')
-    tmp = state_path(cfg) + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(st, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, state_path(cfg))
+    p = state_path(cfg)
+    if os.path.exists(p):
+        try:
+            shutil.copy2(p, p + '.bak')
+        except Exception:
+            pass
+    atomic_write_text(p, json.dumps(st, ensure_ascii=False, indent=2))
 
 
 def mark_stage(cfg, st, bvid, stage, info=None):
@@ -227,15 +371,39 @@ def load_cookies(path):
 
 
 def bili_get(url, params=None, cookies=None, retries=3, timeout=20):
-    """带指数退避的 B站 API GET。"""
+    """带指数退避的 B站 API GET。
+
+    ★ 2026-09-18 收紧重试策略：只对**可重试**的故障退避重试——
+      · 网络层异常（连接失败/超时/重置）；
+      · HTTP 429（限流）与 5xx（服务端临时故障）。
+    对 4xx（403/404/412 风控等）**立即失败**：这类错误重试没有意义，
+    原来的实现会对每个 4xx 白等 5s+10s，B站风控时一轮要浪费半分多钟。
+    """
     import requests
     last = None
     for i in range(retries):
         try:
             r = requests.get(url, params=params, headers=BILI_HEADERS,
                              cookies=cookies or {}, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
+            code = r.status_code
+            if code == 200:
+                try:
+                    return r.json()
+                except Exception as e:
+                    last = e
+                    if i < retries - 1:
+                        time.sleep(2 * (i + 1))
+                    continue
+            if code == 429 or 500 <= code < 600:
+                last = RuntimeError('HTTP %s' % code)
+                if i < retries - 1:
+                    time.sleep(5 * (2 ** i))
+                continue
+            # 其它 4xx / 3xx：不可重试，直接失败（附响应片段便于定位风控）
+            raise RuntimeError('B站接口 HTTP %s（不可重试）%s: %s'
+                               % (code, url, (r.text or '')[:200]))
+        except RuntimeError:
+            raise
         except Exception as e:
             last = e
             if i < retries - 1:
@@ -336,6 +504,37 @@ def probe_duration(ffprobe, path):
         return float(r.stdout.strip())
     except Exception:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 外部命令（ffmpeg/ffprobe/aria2c）统一执行口
+#
+# 背景（2026-09-18）：原先多处 `subprocess.run(..., check=True)` **没有 timeout**，
+# 一旦 ffmpeg 卡在损坏输入/网络挂载盘上就会永久阻塞——上一轮被环境回收时就可能
+# 停在这样一个不可中断的调用里。这里统一加超时，并按输入体量自适应，避免大文件
+# 被误杀：timeout = base + 时长(秒) × k，上限 cap。
+# ---------------------------------------------------------------------------
+def timeout_for_source(ffprobe, path, base=900, k=2.0, cap=6 * 3600):
+    """按源文件时长估算合理的转码/合并超时；取不到时长则退回 base。"""
+    try:
+        dur = probe_duration(ffprobe, path) or 0
+    except Exception:
+        dur = 0
+    return int(min(cap, max(base, base + dur * k)))
+
+
+def run_tool(cmd, timeout=None, check=False, log=None, what=''):
+    """统一执行外部命令，返回 CompletedProcess。
+
+    · 超时：交给调用方处理（抛 subprocess.TimeoutExpired），绝不无限等待；
+    · check=True 时命令非 0 退出抛 CalledProcessError；
+    · stderr 用 bytes 读取后自行解码，避免 Windows 下按 gbk 解码中文报错。
+    """
+    import subprocess
+    if log and what:
+        log('[tool] %s（timeout=%s）' % (what, timeout if timeout else '不限'))
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          timeout=timeout, check=check)
 
 
 # ---------------------------------------------------------------------------

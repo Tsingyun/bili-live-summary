@@ -333,33 +333,48 @@ def stage(cfg, st, log, progress, cookies=None, only_date=None, frm=None, to=Non
         date_iso = r['date']
         if date_iso in done:
             continue
-        import darkpy_rec as D
-        work_dir = (cfg.get('darkpy') or {}).get('work_dir') or \
-            os.path.join(cfg['_workdir'], '_darkpy')
-        for sidx in range(r['darkpy_sess']):
-            if date_iso in done:
-                break
-            log('=' * 66)
-            log('[backfill] rec站补档 %s 第 %d/%d 场' % (date_iso, sidx + 1,
-                                                        r['darkpy_sess']))
-            log('=' * 66)
-            try:
-                res = D.fetch_and_prepare(cfg, log, date_iso, work_dir,
-                                          session_index=sidx)
-            except Exception as e:
-                log.error('[backfill] rec站取 %s 场次 %d 异常：%s'
-                          % (date_iso, sidx + 1, e))
-                continue
-            if not res:
-                log.error('[backfill] rec站 %s 场次 %d 下载/合并失败'
-                          % (date_iso, sidx + 1))
-                continue
-            if _process_darkpy_session(cfg, st, DP, date_iso, res, sidx,
-                                       log, progress):
-                DP.mark_darkpy_done(st, cfg, date_iso, res, sidx)
-            else:
-                log.error('[backfill] %s 场次 %d 处理未完成（保留中间产物，可重跑）'
-                          % (date_iso, sidx + 1))
+        try:
+            import darkpy_rec as D
+            work_dir = (cfg.get('darkpy') or {}).get('work_dir') or \
+                os.path.join(cfg['_workdir'], '_darkpy')
+            for sidx in range(r['darkpy_sess']):
+                if date_iso in done:
+                    break
+                log('=' * 66)
+                log('[backfill] rec站补档 %s 第 %d/%d 场' % (date_iso, sidx + 1,
+                                                            r['darkpy_sess']))
+                log('=' * 66)
+                try:
+                    res = D.fetch_and_prepare(cfg, log, date_iso, work_dir,
+                                              session_index=sidx)
+                except Exception as e:
+                    log.error('[backfill] rec站取 %s 场次 %d 异常：%s'
+                              % (date_iso, sidx + 1, e))
+                    continue
+                if not res:
+                    log.error('[backfill] rec站 %s 场次 %d 下载/合并失败'
+                              % (date_iso, sidx + 1))
+                    continue
+                # ★ 2026-09-18：单场处理（转写→总结→Word→MP3→压缩）必须与其它日期隔离。
+                #   旧实现里 _process_darkpy_session 抛异常（如 KeyError/写入失败）会直接
+                #   穿透 stage 冒泡到 main，导致**后面所有缺失日期都不再补档**。
+                try:
+                    if _process_darkpy_session(cfg, st, DP, date_iso, res, sidx,
+                                               log, progress):
+                        DP.mark_darkpy_done(st, cfg, date_iso, res, sidx)
+                    else:
+                        log.error('[backfill] %s 场次 %d 处理未完成（保留中间产物，可重跑）'
+                                  % (date_iso, sidx + 1))
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    log.error('[backfill] %s 场次 %d 处理异常（跳过，保留中间产物可重跑）：%s'
+                              % (date_iso, sidx + 1, e))
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log.error('[backfill] %s 补档流程异常（跳过该日期，继续后续）：%s' % (date_iso, e))
+            continue
 
     # ---- 仍未覆盖、rec站确实没有的 → B站兜底（限定目标日期） ----
     done = set(st.get('done_dates', []))
@@ -374,7 +389,11 @@ def stage(cfg, st, log, progress, cookies=None, only_date=None, frm=None, to=Non
             log.error('[backfill] B站兜底异常：%s' % e)
 
     # ---- 最终结论行 ----
-    rows2, _ = analyze(cfg, st, log, start, end)
+    try:
+        rows2, _ = analyze(cfg, st, log, start, end)
+    except Exception as e:
+        log.error('[backfill] 复核缺失状态失败（不影响已完成的补档）：%s' % e)
+        rows2 = rows
     done = set(st.get('done_dates', []))
     lines = _final_lines(rows2, done, {r['date'] for r in targets})
     log('=' * 66)
@@ -386,6 +405,10 @@ def stage(cfg, st, log, progress, cookies=None, only_date=None, frm=None, to=Non
 
 def _process_darkpy_session(cfg, st, DP, date_iso, res, sidx, log, progress):
     """把 rec站合好的 MP4 送入统一总结流水线（转写→热词→总结→Word→MP3→压缩）。"""
+    src = res.get('src_video')
+    if not src or not os.path.exists(src):
+        log.error('[backfill] rec站合并没有可用的视频文件（src_video=%s），跳过该场' % src)
+        return False
     live_date = datetime.date.fromisoformat(date_iso)
     title = res.get('title') or ''
     # 轻量清洗文件名非法字符（res.title 来自 FLV 标题，可能含 / : 等）
@@ -396,7 +419,7 @@ def _process_darkpy_session(cfg, st, DP, date_iso, res, sidx, log, progress):
         hour = int(hms[:2])
     fname = DP.session_fname(live_date, clean_title, hour, sidx)
     log('[backfill] 送入总结流水线：%s' % fname)
-    return DP.process_video_source(cfg, st, res['src_video'], date_iso, fname,
+    return DP.process_video_source(cfg, st, src, date_iso, fname,
                                    'darkpy', log, progress)
 
 

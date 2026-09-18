@@ -42,16 +42,19 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common
 from common import (load_config, load_state, save_state, load_cookies, Logger,
                     probe_duration, stem_for, fetch_series,
-                    force_unlink, force_rmtree)
+                    force_unlink, force_rmtree, timeout_for_source,
+                    run_tool, atomic_write_text)
 import fetch_latest
 import download_merge
 import hotwords
@@ -508,6 +511,18 @@ def already_done_local(cfg, st, session):
         return False, ''
 
 
+def _sum_dur(cfg, paths):
+    """各分段时长之和（用于合并产物的完整性判据）。取不到时按 0 计。"""
+    ffprobe = (cfg.get('paths') or {}).get('ffprobe')
+    total = 0.0
+    for p in paths:
+        try:
+            total += probe_duration(ffprobe, p) or 0
+        except Exception:
+            pass
+    return total
+
+
 def prepare_session(cfg, log, session):
     """为 session 准备好单一视频源（merged_src）。单文件直接用；多段连续则合并。"""
     if not session['is_merged']:
@@ -517,10 +532,21 @@ def prepare_session(cfg, log, session):
     os.makedirs(merged_dir, exist_ok=True)
     first_base = re.sub(r'\.\w+$', '', os.path.basename(session['member_files'][0]))
     out_path = os.path.join(merged_dir, first_base + '_merged.mp4')
+
+    # 复用已有合并产物必须校验「时长接近各分段之和」，不能只看体积 >1MB。
+    # 旧实现只看体积：上次被杀留下的半截合并文件会被当成已完成直接送去转写，
+    # 结果就是「一场直播只总结了一半」。这里不达标就重新合并（合并函数自身幂等）。
+    exp = _sum_dur(cfg, session['member_files'])
     if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 1024:
-        log('[merge] 合并视频已存在，跳过：%s' % os.path.basename(out_path))
-        session['merged_src'] = out_path
-        return out_path
+        got = probe_duration(cfg['paths']['ffprobe'], out_path) or 0
+        if got > 0 and (exp <= 0 or got >= exp * 0.95):
+            log('[merge] 合并视频已存在且完整（%s），跳过'
+                % _hms_short(got))
+            session['merged_src'] = out_path
+            return out_path
+        log('[merge] 已有合并产物不完整（%.0fs/期望 %.0fs），重新合并：%s'
+            % (got, exp, os.path.basename(out_path)), 'WARN')
+
     log('[merge] 合并 %d 段连续录播为单一时间线：%s'
         % (len(session['member_files']),
            ', '.join(os.path.basename(p) for p in session['member_files'])))
@@ -538,16 +564,24 @@ def prepare_session(cfg, log, session):
     return res
 
 
-def _merged_ok(out_path, ffprobe):
-    """校验合并产物是否可用：有 ffprobe 则校验时长 > 0，否则只能校验非空。"""
+def _hms_short(sec):
+    sec = int(sec or 0)
+    return '%02d:%02d:%02d' % (sec // 3600, (sec % 3600) // 60, sec % 60)
+
+
+def _merged_ok(out_path, ffprobe, min_dur=0.0):
+    """校验合并产物是否可用：非空、时长 > 0，且（给了 min_dur 时）>= min_dur。"""
     if not os.path.exists(out_path) or os.path.getsize(out_path) <= 0:
         return False
     if not ffprobe:
         return True
     try:
-        return (probe_duration(ffprobe, out_path) or 0) > 0
+        got = probe_duration(ffprobe, out_path) or 0
     except Exception:
         return False
+    if got <= 0:
+        return False
+    return min_dur <= 0 or got >= min_dur
 
 
 def merge_videos(cfg, log, session, out_path):
@@ -556,9 +590,13 @@ def merge_videos(cfg, log, session, out_path):
     **外部依赖（显式声明）**：本函数强依赖 `config.paths.ffmpeg` 与
     `config.paths.ffprobe` 两个外部命令。
       · ffmpeg  —— 真正执行合并（concat demuxer / filter_complex 两条路径）；
-      · ffprobe —— 合并后校验产物时长，防止产出 0 字节/损坏文件被当成成功。
+      · ffprobe —— 合并后校验产物时长，防止产出 0 字节/损坏/半截文件被当成成功。
     任一缺失或执行失败都会记录明确错误并返回 None，**由调用方决定跳过整场**，
     绝不会退化成「逐段分别总结」。
+
+    ★ 2026-09-18 加固：先写 `<out>.part.mp4`，校验时长（>= 各分段之和 95%）通过后
+    再原子改名到正式路径；ffmpeg 调用统一带超时。这样进程被杀只会留下 .part，
+    正式文件要么不存在、要么完整——杜绝"半截合并视频被复用"。
     """
     ffmpeg = cfg['paths']['ffmpeg']
     ffprobe = cfg['paths']['ffprobe']
@@ -570,16 +608,38 @@ def merge_videos(cfg, log, session, out_path):
     if not _tool_ready(ffprobe, log, 'ffprobe'):
         log('[merge] 缺少 ffprobe，合并后无法校验产物时长，将改用「文件非空」作为成功判据', 'WARN')
         ffprobe = None
+
+    members = list(session['member_files'])
+    for p in members:
+        if not os.path.exists(p) or os.path.getsize(p) <= 0:
+            _log_err(log, '[merge] 成员文件缺失或为空，放弃合并：%s' % os.path.basename(p))
+            return None
+
+    exp = _sum_dur(cfg, members)
+    min_dur = exp * 0.95 if exp > 0 else 0.0
+    tmp_out = out_path + '.part.mp4'
+    try:
+        force_unlink(tmp_out)
+    except Exception:
+        pass
+    to = int(max(1200, min(6 * 3600, 1200 + exp * 2)))
+
     list_path = out_path + '.list.txt'
     try:
         with open(list_path, 'w', encoding='utf-8') as f:
-            for p in session['member_files']:
+            for p in members:
                 f.write("file '%s'\n" % p.replace("'", "'\\''"))
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                         '-f', 'concat', '-safe', '0', '-i', list_path,
-                        '-c', 'copy', out_path], check=True)
-        if _merged_ok(out_path, ffprobe):
+                        '-c', 'copy', tmp_out], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=to)
+        if _merged_ok(tmp_out, ffprobe, min_dur):
+            os.replace(tmp_out, out_path)
             return out_path
+        log('[merge] 无损合并产物不完整（%s），尝试重编码合并'
+            % _hms_short(probe_duration(ffprobe, tmp_out) if ffprobe else 0), 'WARN')
+    except subprocess.TimeoutExpired:
+        _log_err(log, '[merge] 无损合并超时（%ds）已终止，尝试重编码合并' % to)
     except Exception as e:
         log('[merge] concat demuxer 失败（%s），尝试重编码合并' % e, 'WARN')
     finally:
@@ -587,22 +647,38 @@ def merge_videos(cfg, log, session, out_path):
             force_unlink(list_path)
         except Exception:
             pass
+        try:
+            force_unlink(tmp_out)
+        except Exception:
+            pass
+
     try:
-        n = len(session['member_files'])
+        n = len(members)
         ins = []
-        for p in session['member_files']:
+        for p in members:
             ins += ['-i', p]
         vmap = ''.join('[%d:v]' % i for i in range(n))
         amap = ''.join('[%d:a]' % i for i in range(n))
         fc = "%s%sconcat=n=%d:v=1:a=1[v][a]" % (vmap, amap, n)
+        to2 = int(max(2400, min(12 * 3600, 2400 + exp * 4)))
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + ins +
                        ['-filter_complex', fc, '-map', '[v]', '-map', '[a]',
                         '-c:v', 'libx264', '-preset', 'veryfast',
-                        '-c:a', 'aac', '-b:a', '192k', out_path], check=True)
-        if _merged_ok(out_path, ffprobe):
+                        '-c:a', 'aac', '-b:a', '192k', tmp_out],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       timeout=to2)
+        if _merged_ok(tmp_out, ffprobe, min_dur):
+            os.replace(tmp_out, out_path)
             return out_path
+        log.error('[merge] 重编码合并产物仍不完整，放弃本场')
+    except subprocess.TimeoutExpired:
+        _log_err(log, '[merge] 重编码合并超时，放弃本场')
     except Exception as e2:
-        log.error('[merge] 重编码合并也失败：%s' % e2)
+        _log_err(log, '[merge] 重编码合并也失败：%s' % e2)
+    try:
+        force_unlink(tmp_out)
+    except Exception:
+        pass
     return None
 
 
@@ -631,14 +707,39 @@ def _archive_bilibili_mp4(cfg, log, src_video, date_iso):
         dst = os.path.join(out_dir, os.path.basename(src_video))
         if os.path.abspath(dst) == os.path.abspath(src_video):
             return src_video
+        ffprobe = (cfg.get('paths') or {}).get('ffprobe')
+        src_dur = probe_duration(ffprobe, src_video) or 0
         if os.path.exists(dst) and os.path.getsize(dst) >= os.path.getsize(src_video):
-            log('[bilibili] 归档 MP4 已存在：%s' % dst)
-            try:
-                force_unlink(src_video)
-            except Exception:
-                pass
-            return dst
-        shutil.move(src_video, dst)
+            # 体积够大还要时长对得上，否则可能是上次被杀留下的截断副本
+            dst_dur = probe_duration(ffprobe, dst) or 0
+            if src_dur <= 0 or dst_dur >= src_dur * 0.98:
+                log('[bilibili] 归档 MP4 已存在：%s' % dst)
+                try:
+                    force_unlink(src_video)
+                except Exception:
+                    pass
+                return dst
+            log('[bilibili] 归档副本时长不足（%.0fs/源 %.0fs），重新归档'
+                % (dst_dur, src_dur), 'WARN')
+            force_unlink(dst)
+        # 跨盘时 shutil.move 是 copy+unlink：被杀会留下截断副本。
+        # 先复制到 .part 再原子改名，成功后才删源。
+        tmp = dst + '.part'
+        try:
+            force_unlink(tmp)
+        except Exception:
+            pass
+        if os.path.dirname(os.path.abspath(dst)) == os.path.dirname(os.path.abspath(src_video)):
+            shutil.move(src_video, dst)          # 同盘：rename，原子
+        else:
+            shutil.copy2(src_video, tmp)
+            got = probe_duration(ffprobe, tmp) or 0
+            if src_dur > 0 and (got <= 0 or got < src_dur * 0.98):
+                _log_err(log, '[bilibili] 归档副本校验失败（时长不符），保留原文件不删')
+                force_unlink(tmp)
+                return src_video
+            os.replace(tmp, dst)
+            force_unlink(src_video)
         log('[bilibili] 已保留 B站录播 MP4 → %s' % dst)
         return dst
     except Exception as e:
@@ -650,13 +751,40 @@ def _archive_bilibili_mp4(cfg, log, src_video, date_iso):
 # 核心：对「一个视频源」跑完 转写→总结→MP3→压缩
 # ---------------------------------------------------------------------------
 def extract_16k_audio(cfg, log, src, dst):
+    """抽取 16k 单声道音频（转写用）。已存在且非空则跳过。
+
+    原子写：先落到 <dst>.part，成功后 os.replace；被杀只会留下 .part，
+    不会让一个半截音频被下次运行当成「已抽好」。
+    """
     if os.path.exists(dst) and os.path.getsize(dst) > 1000:
         return
     ffmpeg = cfg['paths']['ffmpeg']
     log('抽取 16k 转写用音频：%s' % os.path.basename(src))
     t0 = time.time()
-    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
-                   '-i', src, '-vn', '-ac', '1', '-ar', '16000', dst], check=True)
+    tmp = dst + '.part'
+    to = timeout_for_source(cfg['paths']['ffprobe'], src, base=1800)
+    try:
+        subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-i', src, '-vn', '-ac', '1', '-ar', '16000', tmp],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       timeout=to)
+        if not (os.path.exists(tmp) and os.path.getsize(tmp) > 1000):
+            raise RuntimeError('音频抽取产物异常（空文件）')
+        os.replace(tmp, dst)
+    except subprocess.TimeoutExpired:
+        _log_err(log, '[audio] 抽取 16k 音频超时（%ds）已终止：%s'
+                 % (to, os.path.basename(src)))
+        try:
+            force_unlink(tmp)
+        except Exception:
+            pass
+        raise
+    except Exception:
+        try:
+            force_unlink(tmp)
+        except Exception:
+            pass
+        raise
     log('  音频抽取完成（%.0fs）' % (time.time() - t0))
 
 
@@ -707,7 +835,12 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         return False
 
     # 4) 总结后导出中质量 MP3（192k/44.1k，供文字识别/其他用途）
-    mp3_export.export_for_local(cfg, log, src_video)
+    #    4)~5) 的产物（归档 MP3 / 压缩 MP4）失败**不影响总结成品**：TXT/SRT/Word 已落盘，
+    #    state 占位照写；下次重跑时转写与总结都会跳过，只补做 MP3/压缩（幂等）。
+    try:
+        mp3_export.export_for_local(cfg, log, src_video)
+    except Exception as e:
+        _log_err(log, '[mp3_export] 归档 MP3 异常（不影响总结）：%s' % e)
 
     # 5) 压缩归档：
     #    · local  —— 压成 ~5GB HEVC MP4（out_dir_mode=date_subfolder → 根/YYYY-MM-DD/，
@@ -718,24 +851,30 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     local_root = (cfg.get('local') or {}).get('root') or ''
     cc = cfg.get('compress') or {}
     bz = cfg.get('bilibili') or {}
-    if src_kind in ('local', 'darkpy') and cc.get('enabled', True):
-        replace = cc.get('replace_original', False) and src_kind == 'local'
-        if src_kind == 'darkpy':
-            # rec站源在临时目录，压缩成功后源文件按本地规则删除（省盘）；
-            # 压缩失败则保留，下次重跑时 merge 幂等跳过、直接续压。
-            replace = cc.get('replace_original', False)
-        compress_video.compress_video(cfg, log, src_video, replace_original=replace,
-                                      archive_root=local_root or None)
-    elif src_kind in ('darkpy', 'bilibili'):
-        log('[compress] %s 源：compress.enabled=false，按 B站规则保留原始 MP4 不压缩' % src_kind)
-        if bz.get('keep_mp4', True):
-            _archive_bilibili_mp4(cfg, log, src_video, date_iso)
-        elif src_kind == 'darkpy':
-            # 用户没关 keep_mp4，但此处被压缩关闭分支触达——保守保留，不删
-            log('[compress] darkpy 源 keep_mp4=false 但压缩关闭，保留原始文件避免丢档', 'WARN')
+    try:
+        if src_kind in ('local', 'darkpy') and cc.get('enabled', True):
+            replace = cc.get('replace_original', False) and src_kind == 'local'
+            if src_kind == 'darkpy':
+                # rec站源在临时目录，压缩成功后源文件按本地规则删除（省盘）；
+                # 压缩失败则保留，下次重跑时 merge 幂等跳过、直接续压。
+                replace = cc.get('replace_original', False)
+            compress_video.compress_video(cfg, log, src_video, replace_original=replace,
+                                          archive_root=local_root or None)
+        elif src_kind in ('darkpy', 'bilibili'):
+            log('[compress] %s 源：compress.enabled=false，按 B站规则保留原始 MP4 不压缩' % src_kind)
+            if bz.get('keep_mp4', True):
+                _archive_bilibili_mp4(cfg, log, src_video, date_iso)
+            elif src_kind == 'darkpy':
+                # 用户没关 keep_mp4，但此处被压缩关闭分支触达——保守保留，不删
+                log('[compress] darkpy 源 keep_mp4=false 但压缩关闭，保留原始文件避免丢档', 'WARN')
+    except Exception as e:
+        _log_err(log, '[compress] 压缩归档异常（不影响总结成品，源文件保留）：%s' % e)
 
     # 收尾兜底：16k 音频 / ASR 切块 / B站已归档副本（正常在转写后已删，这里再确认一次）
-    cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
+    try:
+        cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
+    except Exception as e:
+        log('收尾清理异常（不影响交付物）：%s' % e, 'WARN')
 
     # B站源：按配置保留/删除下载视频（默认保留，归档到 录播根目录/YYYY-MM-DD/）
     if src_kind == 'bilibili':
@@ -773,7 +912,14 @@ def bilibili_fallback(cfg, st, log, cookies, progress, only_dates=None):
     """
     s = cfg['series']
     horizon = fetch_latest.scan_horizon(cfg, st)
-    archives = fetch_series(s['mid'], s['series_id'], cookies, stop_before_pubdate=horizon)
+    # ★ 2026-09-18：B站合集接口会风控（HTTP 412 / code=-352），或代理抖动导致请求失败。
+    #   这里必须自己兜住：B站只是第三备份，拿不到集合列表时应该"本轮跳过并告警"，
+    #   而不是把异常抛到 main 让整轮（含收尾清扫与状态落盘）中断。
+    try:
+        archives = fetch_series(s['mid'], s['series_id'], cookies, stop_before_pubdate=horizon)
+    except Exception as e:
+        log.error('B站兜底：拉取合集失败（风控/网络），本轮跳过 B站源：%s' % e)
+        return []
     log('B站兜底：扫描到 %d 期，最新：%s' % (len(archives),
         (archives[0]['title'][:50] if archives else '无')))
     done_dates = set(st.get('done_dates', []))
@@ -809,18 +955,25 @@ def bilibili_fallback(cfg, st, log, cookies, progress, only_dates=None):
         log('=' * 68)
         log('B站兜底处理 %s  %s  %s' % (bvid, a['date'], a['title'][:46]))
         log('=' * 68)
-        src = download_merge.download_video_one(cfg, a, log)
-        if not src:
-            log.error('%s 视频下载/合并失败，跳过' % bvid)
-            continue
-        stem = stem_for(a.get('pubdate', 0), a['title'])
-        fname = stem + '.txt'
-        ok = process_video_source(cfg, st, src, a['date'], fname, 'bilibili', log, progress)
-        if ok:
-            mark_bilibili_done(st, cfg, a, fname)
-            ok_dates.append(a['date'])
-        else:
-            log.error('%s 处理失败（保留临时视频，下次重试）：%s' % (bvid, src))
+        # ★ 2026-09-18：单期失败必须与其它期隔离——否则一期取流失败/风控会中断
+        #   后面所有期（旧实现里 download_video_one 抛异常就会跳掉整个循环）。
+        try:
+            src = download_merge.download_video_one(cfg, a, log)
+            if not src:
+                log.error('%s 视频下载/合并失败，跳过（已下载分片保留，下次续传）' % bvid)
+                continue
+            stem = stem_for(a.get('pubdate', 0), a['title'])
+            fname = stem + '.txt'
+            ok = process_video_source(cfg, st, src, a['date'], fname, 'bilibili', log, progress)
+            if ok:
+                mark_bilibili_done(st, cfg, a, fname)
+                ok_dates.append(a['date'])
+            else:
+                log.error('%s 处理失败（保留临时视频，下次重试）：%s' % (bvid, src))
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log.error('B站兜底 %s 处理异常（跳过该期，继续后续）：%s' % (bvid, e))
     return ok_dates
 
 
@@ -924,48 +1077,113 @@ def main():
     args = ap.parse_args()
 
     cfg_path = resolve_config_arg(args)
-    # 单实例锁（避免并发抢 Gemini 配额）
-    LOCK = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), '.daily_pipeline.lock')
-    HB = os.path.join(os.path.dirname(os.path.abspath(cfg_path)), '.daily_pipeline.heartbeat')
+    wd = os.path.dirname(os.path.abspath(cfg_path))
+    # 单实例锁（避免并发抢 Gemini 配额）；心跳文件用于判断持有者是否**真的还活着**
+    LOCK = os.path.join(wd, '.daily_pipeline.lock')
+    HB = os.path.join(wd, '.daily_pipeline.heartbeat')
+    STAGE = os.path.join(wd, '.daily_pipeline.stage')
 
-    def pid_alive(pid):
-        if not pid:
-            return False
+    # 判活逻辑统一在 common 里（与 run_scheduled.py 共用，避免两处实现漂移）：
+    # ★ 2026-09-18：旧实现只用 os.kill(pid,0) 判活。本机 PID 复用很快，
+    #   上一轮被环境回收后其 PID 常被无关进程顶替 → 误判「仍存活」→
+    #   新的一轮直接 `已有实例运行，退出`（exit 0），当天**什么都不会产出**，
+    #   且日志上看不出任何异常。这是"可重复运行"最隐蔽的破坏点。
+    #   现在要求「PID 存在 且 心跳新鲜」双条件，心跳过期即判孤儿并抢占。
+    pid_alive = common.pid_alive
+    read_lock_pid = common.read_lock_pid
+    lock_owner_alive = lambda: common.lock_owner_alive(wd)     # noqa: E731
+
+    def write_hb(stage=None):
+        """刷新心跳（必要时同时写阶段检查点）。"""
         try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, OSError):
-            return False
+            with open(HB, 'w', encoding='utf-8') as f:
+                f.write('%d %d %s' % (os.getpid(), int(time.time()), stage or ''))
+        except Exception:
+            pass
+        if stage:
+            try:
+                with open(STAGE, 'w', encoding='utf-8') as f:
+                    f.write('%s\tpid=%d\t%s\n'
+                            % (datetime.datetime.now().isoformat(timespec='seconds'),
+                               os.getpid(), stage))
+            except Exception:
+                pass
+
+    def _write_lock():
+        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, ('%d %s' % (os.getpid(),
+                                 datetime.datetime.now().isoformat(timespec='seconds'))).encode())
+        os.close(fd)
 
     def grab():
         try:
-            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            _write_lock()
+            write_hb('启动')
+            return True
         except OSError:
+            if lock_owner_alive():
+                return False
+            # 持有者已死 / 心跳过期 → 孤儿锁，抢占
+            print('[daily_pipeline] 检测到孤儿锁（持有者已不在或心跳过期），接管')
             try:
-                pid = int(open(LOCK, encoding='utf-8').read().strip() or '0')
+                force_unlink(LOCK)
             except Exception:
-                pid = 0
-            if pid_alive(pid):
-                return False
+                pass
+            for _ in range(10):
+                try:
+                    _write_lock()
+                    write_hb('启动（接管孤儿锁）')
+                    return True
+                except OSError:
+                    time.sleep(0.3)
+            return False
+
+    def release_lock():
+        """只在锁**确实是本进程持有**时释放，避免误删别人的锁。"""
+        if read_lock_pid(LOCK) != os.getpid():
+            return
+        for p in (LOCK, HB, STAGE):
             try:
-                fd = os.open(LOCK, os.O_WRONLY | os.O_TRUNC)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-                return True
-            except OSError:
-                return False
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        return True
+                force_unlink(p)
+            except Exception:
+                pass
 
     if not grab():
-        print('[daily_pipeline] 已有实例运行，退出')
+        print('[daily_pipeline] 已有实例运行（心跳有效），退出')
         sys.exit(0)
 
-    def touch():
+    # ---- 心跳线程：无论卡在哪一步（长 ffmpeg/ASR/Gemini），都持续证明自己活着 ----
+    hb_stop = {'v': False}
+
+    def _hb_loop():
+        while not hb_stop['v']:
+            for _ in range(60):
+                if hb_stop['v']:
+                    return
+                time.sleep(1)
+            try:
+                with open(HB, 'w', encoding='utf-8') as f:
+                    f.write('%d %d' % (os.getpid(), int(time.time())))
+            except Exception:
+                pass
+
+    _hb_thread = threading.Thread(target=_hb_loop, daemon=True)
+    _hb_thread.start()
+
+    def touch(stage=None):
+        write_hb(stage)
+
+    # ---- 信号：把 SIGTERM/SIGBREAK 转成优雅退出，让 finally 能释放锁 ----
+    def _on_term(signum, _frame):
         try:
-            with open(HB, 'w', encoding='utf-8') as f:
-                f.write(str(int(time.time())))
+            write_hb('收到信号 %s，准备退出' % signum)
+        except Exception:
+            pass
+        raise KeyboardInterrupt('signal %s' % signum)
+
+    for _sig in ('SIGTERM', 'SIGBREAK'):
+        try:
+            signal.signal(getattr(signal, _sig), _on_term)
         except Exception:
             pass
 
@@ -987,6 +1205,7 @@ def main():
         cookies = load_cookies(cfg['paths'].get('cookies'))
 
         # ---- 步骤 1：监测本地根目录 ----
+        touch('步骤1 监测本地录播')
         sessions = scan_root_sessions(cfg, log)
         if args.date:
             sessions = [s for s in sessions if s['live_date'].isoformat() == args.date]
@@ -1026,9 +1245,12 @@ def main():
         if args.dry_run:
             if not args.no_backfill:
                 log('---- 步骤 3（dry-run）：缺失检查报告 ----')
-                backfill.stage(cfg, st, log, {}, cookies=cookies,
-                               only_date=args.date, frm=args.frm, to=args.to,
-                               dry_run=True, do_bilibili=False)
+                try:
+                    backfill.stage(cfg, st, log, {}, cookies=cookies,
+                                   only_date=args.date, frm=args.frm, to=args.to,
+                                   dry_run=True, do_bilibili=False)
+                except Exception as e:
+                    log.error('缺失检查（dry-run）异常：%s' % e)
             log('dry-run，未实际处理。')
             return
 
@@ -1037,7 +1259,7 @@ def main():
         if to_process:
             log('---- 步骤 2：本地录播优先总结 ----')
             for s in to_process:
-                touch()
+                touch('步骤2 本地总结 %s' % s['live_date'].isoformat())
                 src = prepare_session(cfg, log, s)
                 if not src:
                     log.error('准备源文件失败，跳过：%s' % s['live_date'].isoformat())
@@ -1051,23 +1273,34 @@ def main():
                                              fname, 'local', log, progress)
                     if ok:
                         mark_local_done(st, cfg, s, fname)
+                except KeyboardInterrupt:
+                    raise                      # 优雅退出信号：交给外层 finally 收尾
                 except Exception as ex:
                     log.error('处理 %s 失败：%s' % (s['live_date'].isoformat(), ex))
                 time.sleep(int(cfg.get('summarize', {}).get('inter_video_delay_sec', 15)))
             log('本地优先扫描完成')
-            touch()
 
         # ---- 步骤 3：缺失检查 + 补档（本地 → rec.darkpy.cn → B站）----
         # 用户规则（2026-09-05）：每天对照「实际直播日历」找缺失，rec.darkpy.cn 优先于 B站。
+        # ★ 2026-09-18：整段包 try/except。此前这里一旦抛异常（如 B站合集接口风控、
+        #   单个日期数据异常），会直接穿透 main 跳过收尾清扫，且日志停在半截、
+        #   看不出是"失败"还是"没跑完"。现在失败也会继续走收尾并明确记录。
         if not args.no_backfill:
             log('---- 步骤 3：缺失检查/补档（backfill） ----')
-            backfill.stage(cfg, st, log, progress, cookies=cookies,
-                           only_date=args.date, frm=args.frm, to=args.to,
-                           dry_run=False, do_bilibili=True)
+            touch('步骤3 缺失检查/补档')
+            try:
+                backfill.stage(cfg, st, log, progress, cookies=cookies,
+                               only_date=args.date, frm=args.frm, to=args.to,
+                               dry_run=False, do_bilibili=True)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                log.error('缺失检查/补档异常（已完成的部分已写入 state，可重跑续做）：%s' % e)
         else:
             log('---- 步骤 3：已跳过（--no-backfill） ----')
 
         # ---- 收尾清扫：无论成败，把本轮产生的中间文件清干净 ----
+        touch('收尾清扫')
         try:
             if cleanup.cfg_cleanup(cfg).get('sweep_on_finish', True):
                 cleanup.sweep(cfg, log, dry_run=args.dry_run)
@@ -1075,13 +1308,12 @@ def main():
             log('收尾清扫失败（不影响交付物）：%s' % e, 'WARN')
 
         log('daily_pipeline 本次完成')
+    except KeyboardInterrupt:
+        print('[daily_pipeline] 收到中断信号，已释放锁并退出（产物均为原子写，可从断点续跑）')
     finally:
+        hb_stop['v'] = True
         try:
-            force_unlink(LOCK)
-        except Exception:
-            pass
-        try:
-            force_unlink(HB)
+            release_lock()
         except Exception:
             pass
 

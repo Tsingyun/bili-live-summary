@@ -229,6 +229,34 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 4. **长任务前台跑完再回报**：一期 5 小时录播约 15~25 分钟，别中途打断。
 5. **宣称完成前必须核验文件存在且大小合理**（Word 章节、MP3、压缩 MP4 三者齐全），不轻信日志里的 "OK"。
 
+### 7.1 进程被回收 / 睡死 / 断电后怎么续（2026-09-18 事故后加固）
+
+**事故背景**：9/17、9/18 连续两天「后台进程被环境回收」，整轮零产物。根因是长任务挂在 **agent 进程树下** ——
+agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树被拆掉，跑在里面的脚本一起被 SIGTERM 杀掉。
+脚本本身没坏，是**宿主回收**杀的。所以对策分两层：
+
+**A. 被杀也不出坏产物（原子写 + 完整性门禁）**
+- 所有 `os.remove` 都是陷阱 —— 本机安全 hook 会拦截（表现为静默失败或进程被终止），统一用 `common.force_unlink`。
+- 合并 / 压缩 / 归档 MP3 一律**先写 `<目标>.part`**，`ffprobe` 校验时长达标后才 `os.replace` 成正式文件。
+  中途被杀只会留下 `.part`，正式文件要么不存在、要么完整，**永远不会留半截**。
+- **产物复用门禁**：判「已完成」不再只看「存在且体积 >1MB」，而是**时长 ≥ 源 / 分段之和 95%（MP3 98%）**。
+  半截产物会被删掉重做，避免被当成完成品、甚至在 `delete` 模式下误删完好的源视频。
+- 状态文件 `state.json` 也用原子写并留 `.bak`；主文件损坏时自动回退 `.bak`，不会因一次写坏就丢全部去重记录。
+
+**B. 长任务搬出 agent 进程树（耐久安全网）**
+- `scripts/run_scheduled.py` 是**耐久入口**：查锁 → 子进程跑 daily_pipeline → 失败重试 2 次 → 结果写 `logs/scheduled_last_run.json`。
+- 用 Windows 计划任务（**Task Scheduler 服务**拉起，不是 agent 的子进程）挂它，就绕开了回收：
+  `python scripts/install_scheduled_task.py install --workdir "D:/岁己直播自动总结"`
+  （注册 `BiliLiveSummary_Daily`：每天 04:20 起每 60 分钟一次、共 3 小时，交互式免提权；**正在跑时不强杀**。）
+  查看 `install_scheduled_task.py show`、手动触发 `... run`、卸载 `... remove`。
+- **锁改心跳驱动**：判活要求「PID 存在 **且** 心跳新鲜（<1200s=20min）」。运行中的进程后台线程每 60s 刷锁，
+  被杀后 20 分钟内即可被下一轮接管。**注意**：Windows 下 `os.kill(pid,0)` 是**纯探活、不会杀进程**（已实测），
+  但 PID 复用很快，所以不能只看 PID —— 这也是必须叠心跳的原因。
+- **排查顺序**：先看 `logs/scheduled_last_run.json`（计划任务那条跑得怎样）→ 再看 `WORKDIR/.daily_pipeline.stage`
+  （卡在哪一阶段）→ 最后才翻 `logs/` 明细日志。看到 `.part` 文件是正常现象，说明上次被中断，下轮会重做该步。
+
+> 结论：**任何「自动化没产物」先怀疑宿主回收，而不是脚本 bug**。重跑一次 `daily_pipeline.py` 就能从断点续上。
+
 ---
 
 ## 8. 代码地图（想改流程先看这里）
@@ -249,8 +277,11 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 | `scripts/backfill.py` | **缺失检查 + 补档编排**：`analyze`(日历−已覆盖) / `stage`(本地→rec→B站) / CLI 检查与补档 |
 | `scripts/download_merge.py` | B站音频下载(`download_one`) + **视频下载合并**(`download_video_one`，兜底用) |
 | `scripts/fetch_latest.py` | B站合集选片逻辑（`latest_by_live_date` 等） |
-| `scripts/common.py` | 配置/状态/日志/B站接口/标点清洗/数字归一 + **`force_unlink`/`force_rmtree`（强制删除，必用）** |
+| `scripts/common.py` | 配置/状态/日志/B站接口/标点清洗/数字归一 + **`force_unlink`/`force_rmtree`（强制删除，必用）** + **原子写 `atomic_write_bytes/text/json`（`.part`+fsync+`os.replace`）** + **锁基础设施 `lock_owner_alive`（PID 存在且心跳 <20min 双条件）** + `timeout_for_source`/`run_tool` |
 | `scripts/cleanup.py` | **垃圾清理器**：按保留天数清扫中间产物、清孤儿下载/ASR切块、磁盘水位检查（`sweep`/`after_session`/`check_disk_guard`/`report`） |
+| `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
+| `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 起每 60 分钟、持续 3 小时，交互式免提权，正在跑时不强杀） |
+| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，28 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |
 
 ---

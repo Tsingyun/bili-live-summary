@@ -58,21 +58,79 @@ def export_mp3(cfg, log, src_video, default_stem=None):
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, name + '.mp3')
 
-    # 幂等：已存在且体积正常则跳过
+    # 幂等：已存在且**时长与源接近**才跳过。
+    # ★ 2026-09-18：旧判据只看体积 >10KB，转码中途被杀留下的残缺 MP3（可能已几十 MB）
+    #   会被当成已完成，归档里就永久留着一个听不完的文件。改为时长达标（≥源 98%）。
+    src_dur = 0.0
+    try:
+        from common import probe_duration
+        src_dur = probe_duration(cfg['paths'].get('ffprobe'), src_video) or 0.0
+    except Exception:
+        pass
     if os.path.exists(out) and os.path.getsize(out) > 10240:
-        log('[mp3_export] 归档 MP3 已存在，跳过：%s' % os.path.basename(out))
-        return out
+        ok = True
+        if src_dur > 0:
+            try:
+                from common import probe_duration
+                got = probe_duration(cfg['paths'].get('ffprobe'), out) or 0
+                ok = got > 0 and got >= src_dur * 0.98
+            except Exception:
+                ok = True
+        if ok:
+            log('[mp3_export] 归档 MP3 已存在且完整，跳过：%s' % os.path.basename(out))
+            return out
+        log('[mp3_export] 已有 MP3 时长不足，重新转码：%s' % os.path.basename(out), 'WARN')
+        try:
+            from common import force_unlink
+            force_unlink(out)
+        except Exception:
+            pass
 
     bitrate = str(mcfg.get('bitrate', '192k'))
     ar = int(mcfg.get('ar', 44100))
     log('[mp3_export] 转中质量 MP3：%s -> %s' % (os.path.basename(src_video), os.path.basename(out)))
+    # 原子写：先落 <out>.part，校验通过再改名——被杀不会留下"看似完整"的半截 MP3
+    tmp = out + '.part'
+    try:
+        from common import force_unlink as _fu
+        _fu(tmp)
+    except Exception:
+        pass
+    to = int(max(600, min(4 * 3600, 600 + (src_dur or 0) * 2)))
     try:
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                         '-i', src_video, '-vn',
                         '-acodec', 'libmp3lame', '-ar', str(ar), '-b:a', bitrate,
-                        out], check=True)
+                        tmp], check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=to)
+    except subprocess.TimeoutExpired:
+        log.error('[mp3_export] 转换超时（%ds）已终止：%s' % (to, os.path.basename(src_video)))
+        _safe_unlink(tmp)
+        return None
     except Exception as e:
         log.error('[mp3_export] 转换失败：%s' % e)
+        _safe_unlink(tmp)
+        return None
+
+    if not (os.path.exists(tmp) and os.path.getsize(tmp) > 10240):
+        log.error('[mp3_export] 转换后文件异常（可能秒退未真正转写）')
+        _safe_unlink(tmp)
+        return None
+    # 时长达标才提升为正式归档文件
+    if src_dur > 0:
+        try:
+            from common import probe_duration
+            got = probe_duration(cfg['paths'].get('ffprobe'), tmp) or 0
+            if got <= 0 or got < src_dur * 0.98:
+                log.error('[mp3_export] 产物时长不足（%.0fs/源 %.0fs），判为失败' % (got, src_dur))
+                _safe_unlink(tmp)
+                return None
+        except Exception:
+            pass
+    try:
+        os.replace(tmp, out)
+    except Exception as e:
+        log.error('[mp3_export] 归档改名失败：%s' % e)
         return None
 
     if os.path.exists(out) and os.path.getsize(out) > 10240:
@@ -81,6 +139,17 @@ def export_mp3(cfg, log, src_video, default_stem=None):
         return out
     log.error('[mp3_export] 转换后文件异常（可能秒退未真正转写）')
     return None
+
+
+def _safe_unlink(path):
+    try:
+        from common import force_unlink
+        force_unlink(path)
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def export_for_local(cfg, log, src_video):

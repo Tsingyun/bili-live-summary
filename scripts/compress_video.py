@@ -151,17 +151,33 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
 
     replace = replace_original or cc.get('replace_original', False)
 
-    # 幂等：已存在且体积正常则跳过
+    # 幂等：已存在且**时长与源接近**才跳过。
+    # ★ 2026-09-18：旧判据只看"体积 >1MB"。压缩是全流程里最耗时的单步（几十分钟），
+    #   上一轮被杀极可能停在编码中途——留下一个体积已经几 GB、但时长只有几分钟的
+    #   残缺 `_compressed.mp4`。旧逻辑下次直接当"已完成"跳过，且 replace 模式下还会
+    #   把**完好的源视频删掉**，等于永久丢档。现在必须时长达标（≥源时长 98%）才算完成。
     if os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
-        sz = os.path.getsize(out) // 1024 // 1024
-        log('[compress] 已存在，跳过：%s（%d MB）' % (os.path.basename(out), sz))
-        if replace:
-            _replace_by_mode(cfg, log, src_video, out)
-        return out
+        out_dur = probe_duration(ffprobe, out) or 0
+        if out_dur <= 0 or out_dur < dur * 0.98:
+            log('[compress] 已有产物不完整（%.0fs/源 %.0fs），删除后重新压缩：%s'
+                % (out_dur, dur, os.path.basename(out)), 'WARN')
+            force_unlink(out, log)
+        else:
+            sz = os.path.getsize(out) // 1024 // 1024
+            log('[compress] 已存在且完整，跳过：%s（%d MB）' % (os.path.basename(out), sz))
+            if replace:
+                _replace_by_mode(cfg, log, src_video, out)
+            return out
 
     a_params = ['-c:a', 'copy']
     if audio_mode == 'aac':
         a_params = ['-c:a', 'aac', '-b:a', '%dk' % int(audio_kbps)]
+
+    # 编码写入临时名（保留 .mp4 后缀，ffmpeg 需要据此选封装格式），
+    # 校验通过后再 os.replace 到正式名——被杀只会留下 .part.mp4。
+    tmp_out = out + '.part.mp4'
+    if os.path.exists(tmp_out):
+        force_unlink(tmp_out, log)          # 上次被杀留下的半成品
 
     log('[compress] 开始：%s（%s，目标≈%dMB，视频目标码率 %dk）'
         % (os.path.basename(src_video), hms(dur), int(target_gb * 1024), video_kbps))
@@ -177,18 +193,43 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
         '-bufsize', '%dk' % int(video_kbps * 2),
         '-spatial-aq', '1', '-temporal-aq', '1',
         '-tag:v', 'hvc1',
-    ] + a_params + [out]
+    ] + a_params + [tmp_out]
+    # 超时按源时长自适应（NVENC 一般 3~8x 实时），上限 6 小时；避免卡死拖住整轮
+    to = int(max(1800, min(6 * 3600, 1800 + dur * 3)))
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=to)
+    except subprocess.TimeoutExpired:
+        log.error('[compress] 编码超时（%ds）已终止，源文件保留：%s'
+                  % (to, os.path.basename(src_video)))
+        force_unlink(tmp_out, log)
+        return None
     except Exception as e:
         log.error('[compress] 编码失败：%s' % e)
+        force_unlink(tmp_out, log)
         return None
 
+    # 产出校验：体积 + **时长必须与源一致**，通过后才原子改名到正式路径
+    if not (os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 1024 * 1024):
+        log.error('[compress] 转换后文件异常（空/过小）')
+        force_unlink(tmp_out, log)
+        return None
+    out_dur = probe_duration(ffprobe, tmp_out) or 0
+    if out_dur <= 0 or out_dur < dur * 0.98:
+        log.error('[compress] 产物时长不足（%.0fs/源 %.0fs），判为失败并保留源文件'
+                  % (out_dur, dur))
+        force_unlink(tmp_out, log)
+        return None
+    try:
+        os.replace(tmp_out, out)
+    except Exception as e:
+        log.error('[compress] 产物改名失败：%s' % e)
+        return None
     if os.path.exists(out) and os.path.getsize(out) > 1024 * 1024:
         sz = os.path.getsize(out) // 1024 // 1024
         saved = (1 - os.path.getsize(out) / os.path.getsize(src_video)) * 100
-        log('[compress] 完成（%d MB，节省 %.0f%%）：%s'
-            % (sz, saved, os.path.basename(out)))
+        log('[compress] 完成（%d MB，节省 %.0f%%，%.0fs）：%s'
+            % (sz, saved, __import__('time').time() - t0, os.path.basename(out)))
     else:
         log.error('[compress] 转换后文件异常')
         return None
@@ -225,13 +266,14 @@ def _send_to_recycle_bin(log, path):
               '[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
               '"' + path.replace('\\', '\\\\') + '",'
               '"OnlyErrorDialogs","SendToRecycleBin")')
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps], check=True)
+        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                       check=True, timeout=300)
     elif sys.platform == 'darwin':
         subprocess.run(['osascript', '-e',
                         'tell application "Finder" to delete POSIX file "%s"' % path],
-                       check=True)
+                       check=True, timeout=300)
     else:
-        subprocess.run(['gio', 'trash', path], check=True)
+        subprocess.run(['gio', 'trash', path], check=True, timeout=300)
     return True
 
 
@@ -279,6 +321,11 @@ def _replace_backup_then_delete(cfg, log, src_video, compressed):
     任意环节失败都保留原文件并返回 False（绝不裸 rm）。
     """
     cc = cfg.get('compress') or {}
+    ok, why = _compressed_ok(cfg, src_video, compressed)
+    if not ok:
+        log.error('[compress] 压缩产物校验未通过（%s），保留原文件：%s'
+                  % (why, os.path.basename(src_video)))
+        return False
     backup_dir = cc.get('backup_dir') or _default_backup_dir(src_video)
     os.makedirs(backup_dir, exist_ok=True)
     backup = os.path.join(backup_dir, os.path.basename(src_video))
@@ -318,13 +365,31 @@ def _replace_by_mode(cfg, log, src_video, compressed):
     return _replace_backup_then_delete(cfg, log, src_video, compressed)
 
 
+def _compressed_ok(cfg, src_video, compressed):
+    """删源前的最后一道门禁：压缩产物必须「存在 + 体积合理 + 时长≈源」。
+    删源不可逆，这里一律从严；取不到源时长时不阻断（只校验体积）。"""
+    if not (os.path.exists(compressed) and os.path.getsize(compressed) > 1024 * 1024):
+        return False, '产物不存在或过小'
+    try:
+        ffprobe = cfg['paths']['ffprobe']
+    except Exception:
+        return True, ''
+    src_dur = probe_duration(ffprobe, src_video) or 0
+    out_dur = probe_duration(ffprobe, compressed) or 0
+    if src_dur > 0 and (out_dur <= 0 or out_dur < src_dur * 0.98):
+        return False, '产物时长 %.0fs < 源时长 %.0fs 的 98%%' % (out_dur, src_dur)
+    return True, ''
+
+
 def _replace_direct_delete(cfg, log, src_video, compressed):
     """压缩成功且校验通过后：直接永久删除原视频（用户规则 2026-08-28：省空间，不进回收站/不备份）。
 
     仅在 compressed 校验通过后才删除；任何异常都保留原文件并返回 False（绝不误删）。
     """
-    if not (os.path.exists(compressed) and os.path.getsize(compressed) > 1024 * 1024):
-        log.error('[compress] 压缩产物不可用，保留原文件：%s' % os.path.basename(src_video))
+    ok, why = _compressed_ok(cfg, src_video, compressed)
+    if not ok:
+        log.error('[compress] 压缩产物校验未通过（%s），保留原文件：%s'
+                  % (why, os.path.basename(src_video)))
         return False
     # 必须检查返回值：force_unlink 失败时不抛异常（内部已兜底），若不判返回值就会
     # 误报「已删除」，20GB 的源视频悄悄留在磁盘上——这正是以前磁盘爆掉的原因之一。

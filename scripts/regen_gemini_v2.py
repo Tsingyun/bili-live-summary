@@ -172,6 +172,7 @@ class GeminiRotator:
         self.max_per_model = max_per_model
         self._ts = []
         self._used = {}
+        self._empty = {}          # 每模型连续空响应计数（防空响应死循环）
         self.log = log
 
     def _rpm_wait(self):
@@ -193,62 +194,102 @@ class GeminiRotator:
             'generationConfig': {'temperature': 0.3, 'maxOutputTokens': 8192},
         }
         headers = {'Content-Type': 'application/json'}
+        # timeout=(连接, 读取)：连接阶段 20s 快速失败，避免代理不通时白等 5 分钟；
+        # 读取阶段留 300s 给长总结输出。
+        to = (20, 300)
         try:
-            return requests.post(url, headers=headers, json=payload, timeout=300, proxies=self.proxies)
+            return requests.post(url, headers=headers, json=payload, timeout=to, proxies=self.proxies)
         except requests.exceptions.ConnectionError:
             if self.proxies:
                 self.log('  [Gemini] 代理连接失败，回退直连重试')
-                return requests.post(url, headers=headers, json=payload, timeout=300, proxies=None)
+                return requests.post(url, headers=headers, json=payload, timeout=to, proxies=None)
             raise
 
     def _advance(self):
         self.idx = (self.idx + 1) % len(self.models)
 
-    def call(self, system_prompt, user_content, tag=''):
+    def call(self, system_prompt, user_content, tag='', max_attempts=None):
+        """请求一次总结；失败自动换模型。返回文本，全部失败返回 ''。
+
+        ★ 2026-09-18 加固（两个会让整场卡住/中断的缺陷）：
+          ① `_post` 的网络异常（超时/连接重置）以前会**直接抛出**，穿透到
+             process_session → main，导致这一场（甚至这一文件）直接中止，
+             即使其它模型本来可用。现在在网络层捕获、同模型退避重试。
+          ② 「200 但空响应」分支以前 `continue` 不计入 tried，若某模型持续返回
+             空响应（finishReason=MAX_TOKENS/RECITATION 等）会**无限循环**。
+             现在用总尝试预算 budget + 每模型空响应计数来兜底，必然收敛。
+        """
         self._rpm_wait()
-        tried = 0
-        last_err = ''
-        while tried < len(self.models):
+        n_models = max(1, len(self.models))
+        budget = max_attempts or max(6, n_models * 2)
+        attempts, last_err = 0, ''
+        while attempts < budget:
             model = self.models[self.idx]
-            self.log(f'  [Gemini] {tag} 模型={model}（已用 {self._used.get(model, 0)}/{self.max_per_model}）')
-            r = self._post(model, system_prompt, user_content)
+            attempts += 1
+            self.log(f'  [Gemini] {tag} 模型={model}'
+                     f'（已用 {self._used.get(model, 0)}/{self.max_per_model}，'
+                     f'尝试 {attempts}/{budget}）')
+            try:
+                r = self._post(model, system_prompt, user_content)
+            except Exception as e:
+                # 网络层异常：不换模型（多半是链路问题），退避后重试同一模型
+                last_err = f'{model} 请求异常 {type(e).__name__}: {e}'
+                self.log(f'  [Gemini] {last_err}，退避重试')
+                time.sleep(min(5 * attempts, 30))
+                continue
+
             now = time.time()
             self._ts.append(now)
             if len(self._ts) > self.rpm:
                 self._ts = self._ts[-self.rpm:]
+
             if r.status_code == 200:
-                d = r.json()
+                try:
+                    d = r.json()
+                except Exception as e:
+                    last_err = f'{model} 响应非 JSON：{e}'
+                    self.log(f'  [Gemini] {last_err}，切换下一模型')
+                    self._advance(); continue
                 cand = (d.get('candidates') or [{}])[0]
                 parts = (cand.get('content') or {}).get('parts') or []
                 text = ''.join(p.get('text', '') for p in parts).strip()
                 if text:
+                    self._empty[model] = 0
                     self._used[model] = self._used.get(model, 0) + 1
                     if self._used[model] >= self.max_per_model:
                         self.log(f'  [Gemini] {model} 已达 {self.max_per_model} 次，切换下一模型')
                         self._advance()
                     return text
-                last_err = f'{model} 空响应 finishReason={cand.get("finishReason")}'
-                self.log(f'  [Gemini] {last_err}，重试该模型')
-                time.sleep(3)
+                # 空响应：同一模型最多容忍 3 次，之后换模型（防死循环）
+                self._empty[model] = self._empty.get(model, 0) + 1
+                last_err = (f'{model} 空响应 finishReason={cand.get("finishReason")}'
+                            f'（第 {self._empty[model]} 次）')
+                self.log(f'  [Gemini] {last_err}')
+                if self._empty[model] >= 3:
+                    self.log(f'  [Gemini] {model} 连续空响应，切换下一模型')
+                    self._advance()
+                    time.sleep(1)
+                else:
+                    time.sleep(3)
                 continue
             elif r.status_code == 429:
                 last_err = f'{model} HTTP 429 配额耗尽'
                 self.log(f'  [Gemini] {last_err}，切换下一模型')
-                self._advance(); tried += 1; continue
+                self._advance(); continue
             elif r.status_code == 404:
                 last_err = f'{model} HTTP 404 不可用'
                 self.log(f'  [Gemini] {last_err}，切换下一模型')
-                self._advance(); tried += 1; continue
+                self._advance(); continue
             elif r.status_code in (500, 503, 504):
                 last_err = f'{model} HTTP {r.status_code}'
-                self.log(f'  [Gemini] {last_err}，切换下一模型')
-                time.sleep(min(8 * (tried + 1), 60))
-                self._advance(); tried += 1; continue
+                self.log(f'  [Gemini] {last_err}，退避后切换下一模型')
+                time.sleep(min(8 * attempts, 60))
+                self._advance(); continue
             else:
                 last_err = f'{model} HTTP {r.status_code}: {r.text[:200]}'
                 self.log(f'  [Gemini] {last_err}')
-                self._advance(); tried += 1; continue
-        self.log(f'  [Gemini] 所有模型均不可用：{last_err}')
+                self._advance(); continue
+        self.log(f'  [Gemini] 尝试 {attempts} 次后仍不可用：{last_err}')
         return ''
 
 
@@ -379,7 +420,15 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         S.append_section(doc, heading, meta, segs, font, first, overview,
                          topic_sep=sep_cfg.get('enabled', True))
         os.makedirs(os.path.dirname(docx_path), exist_ok=True)
-        doc.save(docx_path)
+        # 原子保存（写 .part → zip 校验 → replace），并被 .bak 兜底：
+        # 进程被杀不会把整月 docx 写坏。
+        try:
+            if os.path.exists(docx_path):
+                import shutil as _sh
+                _sh.copy2(docx_path, docx_path + '.bak')
+        except Exception:
+            pass
+        S.save_doc_atomic(doc, docx_path, log)
         log(f'  ✅ 已保存：{docx_path}（{len(all_blocks)} 块）')
         # 整场完成，清理该场进度缓存
         progress.pop(date_str, None)

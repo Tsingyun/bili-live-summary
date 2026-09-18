@@ -239,10 +239,11 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - **跨午夜但连续** → 归属**开播那一场**（`crosses_midnight=True`），合并后**只出一份总结**；
   **同一天但间隔很久**（如下午场 + 晚上场）→ 正确切成两场。
 - 取不到时长时**回退用文件 mtime 估算**结束时刻（打 WARN）；两者都失败 → 该片段保守独立成场，绝不猜测性合并。
-- 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；失败回退 `concat filter` 重编码兜底。
-- **合并失败 = 整场跳过且不写完成标记（下次自动重试），绝不退化成逐段分别总结**——那会给一场直播产出多份残缺总结。
 - 合并：优先 ffmpeg `concat demuxer`（`-c copy`，极快不重编码）；编码不一致导致失败时回退 `concat filter` 重编码兜底。
-- 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
+- **合并失败 = 整场跳过且不写完成标记（下次自动重试），绝不退化成逐段分别总结**——那会给一场直播产出多份残缺总结。
+- **合并产物先写 `.part.mp4`，校验时长达标（≥各分段之和 95%）后原子改名**；复用已有产物时同样校验时长——
+  只看"文件存在 + 体积 >1MB"会把上次被杀留下的半截合并视频当成已完成，直接送去转写，结果一场直播只总结一半。
+- 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在且完整则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
 - 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限，默认 600) / `allow_overlap_sec`(允许的负间隙，默认 60，容忍录制器重连时几秒回退/重叠) / `keep_merged`(是否保留合并视频) / `exclude_dates`(日期列表，**显式强制不合并**，优先级高于 `max_gap_sec`，用于确认是「多场独立直播」而非断流重连的日期)。
 - **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
 - ⚠️ **临界风险**：若某日期多文件真实间隙只比 `max_gap_sec` 略大（如 609s vs 600s），ffprobe 时长精度波动可能让间隙跌破阈值而被误合并。对确认是独立多场的日期务必加入 `exclude_dates`（如 `"exclude_dates": ["2026-08-22"]`），不依赖阈值侥幸。
@@ -252,6 +253,93 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - ⚠️ **占位 key 冲突（2026-09-14 修）**：同一 `live_date` 可能残留旧占位（典型是跨午夜尾巴留下的 `merged_into` 占位）。
   判定「已处理」时会比对**成员文件是否相交**，无交集则视为同一天的另一场；写入时 key 自动顺延（`LOCAL-20260913-2`），**绝不覆盖**旧记录。
   曾发生 9/13 晚场被 9/12 尾巴占位 `LOCAL-20260913` 整场挡住、一直没总结的事故。
+
+## 健壮性加固（2026-09-18，务必保持）
+
+背景：9/17、9/18 连续两天自动化**零产物**。复盘结论是「进程生命周期」问题——agent 回合
+04:04 正常结束 → 宿主运行时被 `lifecycle:dispose` 回收 → 整棵进程树被拆除，管线当时刚
+下到 0.8GB/13GB。围绕"被杀也不出事、重跑必能续上"做了如下加固。
+
+### 1. 一切"写完才算数"的落盘都走原子写
+
+`common.atomic_write_bytes/text/json`：写 `<目标>.part` → `flush + fsync` → `os.replace`
+（目标被 Word/腾讯文档占用时自动重试）。**禁止**直接 `open(path,'w')` 写正式产物。
+
+| 产物 | 原子化方式 | 复用时的完整性判据（关键） |
+|---|---|---|
+| `state.json` | `.part` + replace，并留 `.bak` | 主文件损坏时 `load_state` 自动回退 `.bak` |
+| 月度 docx（最贵重） | `.part` → `zipfile` 校验 → replace，另留 `.bak` | 打不开时 `open_or_create` 回退 `.bak`，绝不静默新建 |
+| 合并 MP4 / 压缩 MP4 | `.part.mp4` → ffprobe 校验时长 → replace | **时长 ≥ 源/分段之和 95%**，否则删掉重做 |
+| 归档 MP3 | `.part` → ffprobe 校验时长 → replace | 时长 ≥ 源 98% |
+| 转写 TXT/SRT | `.part` → replace | 切块转写有任一块为空 → **整场判失败**，不落盘 |
+
+> ⚠️ 为什么强调"复用判据"：旧代码只看「文件存在 + 体积 >1MB」。而压缩/合并是全程最耗时的
+> 步骤，被杀大概率停在**中途**，留下体积已经很大、时长却只有几分钟的残片。旧逻辑下次
+> 直接当"已完成"跳过；`replace_mode=delete` 时还会把**完好的源视频删掉**——等于永久丢档。
+
+### 2. 下载绝不静默产出损坏文件（`darkpy_rec.download_one`）
+
+- **服务器忽略 Range 返回 200 时绝不追加写**：旧实现 resume>0 就用 `'ab'` 续写，会把整份
+  文件接在已有分片后面，产出约 2 倍大小的损坏文件（旧校验只看下界，反而放行）。现在检测到
+  200 或 `Content-Range` 起点不符 → 丢弃分片、从头重下。
+- **字节数必须与 `Content-Length` 吻合**：少一个字节都算失败，保留 `.part` 供下次续传。
+  旧实现在 `expect_bytes==0`（站点大小解析失败）时**完全没有长度校验**，截断 FLV 会被
+  `os.replace` 成正式文件。
+- **自动重试**：按 `darkpy.retries` 退避重试（默认 3），每次从 `.part` 当前长度续传。
+
+### 3. 单实例锁改为「心跳驱动」（`common.lock_owner_alive`）
+
+被回收的进程没机会清理锁 → 留孤儿锁。旧实现只用 `os.kill(pid,0)` 判活，而 Windows PID
+复用很快，无关进程顶替后会被误判「仍存活」→ 新一轮打印 `已有实例运行，退出`（exit 0）
+**当天零产物且日志看不出异常**。现在要求 **PID 存在 且 心跳新鲜（<1200s）** 双条件；
+`daily_pipeline` 启动后台线程每 60s 刷心跳，另写 `.daily_pipeline.stage` 阶段检查点。
+释放锁前校验锁内 PID 是否为本进程，避免误删别人的锁。
+
+还修了一个**反向的锁漏洞**（`cleanup.lock_file_is_live`）：清理器清扫"孤儿锁"时，
+旧实现用 `int(整个文件内容)` 解析 pid，而新锁格式是「pid + ISO 时间」→ `int()` 必抛异常
+→ pid=0 → **跳过存活检查直接删锁**。结果跑满 2 小时（`orphan_lock_hours`）的长任务，
+锁会在运行中途被清掉，**单实例保护失效**——第二个实例（计划任务/手动）就能与它并发写同一份
+Word。现在清理器判活也走 `common`（`.daily_pipeline.*` 用「PID 存在 且 心跳新鲜」，
+其它 `.lock` 退化为 PID 探测），与 pipeline 共用一套逻辑。
+
+### 4. 异常隔离、超时与资源释放
+
+- 单点失败不拖垮整轮：`backfill.stage` 逐日期/逐场次 try/except；`bilibili_fallback` 包住
+  `fetch_series`（B站风控 412/-352）与每期处理；`daily_pipeline` 步骤 3 整段兜底，
+  失败也照常走收尾清扫并落盘 state。
+- `GeminiRotator.call`：网络异常不再直接抛出（旧行为会让整场中止），改为同模型退避重试；
+  用**总尝试预算 + 每模型空响应计数**兜底，杜绝"200 但空响应"导致的死循环。
+- 所有 ffmpeg/ffprobe 调用带 `timeout`（按源时长自适应，见 `common.timeout_for_source`），
+  绝不无限等待；临时 list/part 文件一律用 `force_unlink` 清理（本机 `os.remove` 被安全 hook 拦截）。
+
+### 5. 耐久执行：把长任务搬出 agent 会话的进程树（根治"被回收"）
+
+代码加固只能保证"被杀也不出坏产物、重跑能续上"；**真正让当天必出产物**的做法是别把
+长任务挂在 agent 会话下面。
+
+```bash
+# 注册 Windows 计划任务（默认 04:20 起，每 60 分钟一次共 3 次：04:20/05:20/06:20）
+python scripts/install_scheduled_task.py --install --workdir "<工作目录>"
+python scripts/install_scheduled_task.py --query     # 看状态
+python scripts/install_scheduled_task.py --run       # 立刻触发一次
+python scripts/install_scheduled_task.py --remove    # 删除
+```
+
+- `run_scheduled.py` 由 **Task Scheduler 服务**拉起，不在 agent 进程树里 → agent 回合
+  结束/重开都不影响它跑完；内部先查锁（有存活实例直接退出，不重复跑），失败自动重试
+  （管线幂等，重跑即续做），结果写 `logs/scheduled_last_run.json` + `logs/run_scheduled_*.log`。
+- 定位是**安全网**：自动化那一次跑成了，计划任务到点会看到存活锁而空转退出；被杀了则由它补完。
+- ⚠️ 任务为「只使用交互方式」（需用户已登录），与自动化同处一个登录会话，符合预期。
+
+### 6. 回归自测（改完必跑）
+
+```bash
+# ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
+"C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
+# 24 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退、压缩门禁
+```
+离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
+预期输出结尾为 `通过 24 项，失败 0 项`；若不是 24/24，先确认解释器是否用错，再查代码。
 
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |
@@ -279,7 +367,10 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
+- `selftest_robustness.py` 健壮性回归自测（离线，28 项），详见「健壮性加固」第 6 节
+- `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果
 - 日志在 `WORKDIR/logs/`，错误在 `errors.log`；状态 / 基线在 `WORKDIR/state.json`
+- 中断排查：`WORKDIR/.daily_pipeline.stage` 记录最后一个阶段检查点；`logs/run_scheduled_*.log` 与 `logs/scheduled_last_run.json` 记录计划任务视角的结果
 - rec站下载的 FLV / 合并中间 MP4 在 `darkpy.work_dir`（默认 `WORKDIR/_darkpy/`）：FLV 合并成功后即删（`keep_flv_after_merge=false`），中间 MP4 压缩成功后被删；补档失败时保留供断点重跑
 
 ## 依赖与环境
