@@ -268,7 +268,7 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 | 产物 | 原子化方式 | 复用时的完整性判据（关键） |
 |---|---|---|
 | `state.json` | `.part` + replace，并留 `.bak` | 主文件损坏时 `load_state` 自动回退 `.bak` |
-| 月度 docx（最贵重） | `.part` → `zipfile` 校验 → replace，另留 `.bak` | 打不开时 `open_or_create` 回退 `.bak`，绝不静默新建 |
+| 月度 docx（最贵重） | `.part` → `zipfile` 校验 → replace；被占用(WinError 5/32)时**退化原地覆写**，另留 `.bak` | 打不开时 `open_or_create` 回退 `.bak`，绝不静默新建 |
 | 合并 MP4 / 压缩 MP4 | `.part.mp4` → ffprobe 校验时长 → replace | **时长 ≥ 源/分段之和 95%**，否则删掉重做 |
 | 归档 MP3 | `.part` → ffprobe 校验时长 → replace | 时长 ≥ 源 98% |
 | 转写 TXT/SRT | `.part` → replace | 切块转写有任一块为空 → **整场判失败**，不落盘 |
@@ -283,6 +283,14 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 > 必须加 `-f mp3`（MP4 那几处用的是 `.part.mp4`，扩展名还在末尾，所以没这个问题）。
 > `extract_16k_audio` 与 `mp3_export` 都踩过——删掉 `-f mp3` 会让 9/18 这类场次在
 > **第一步就整场失败**。回归自测 [I] 组专门盯这个。
+
+> ⚠️ **docx 被 Word / 腾讯文档预览打开时，`os.replace` 会被持续拒绝**
+> （`WinError 5 拒绝访问`）。这种占用是「允许读写、不允许删除共享」，**干等重试无效**。
+> 处理方式：`save_doc_atomic` 先按原子路径试，遇到 WinError 5/32 立即**退化到原地覆写**
+> （`.bak` 已是最新完整版，`open_or_create` 遇到损坏会自动回退，所以内容不会静默丢）。
+> 注意：Windows 下 `os.open` 默认**文本模式**，原地覆写必须带 `os.O_BINARY`，否则
+> `\n`→`\r\n` 会把 zip 写坏（回归自测 [F] 组 F4–F6 覆盖）。
+> 只剩一条人工注意项：**在编辑器里手动保存可能覆盖管线刚写的章节**，看完记得关掉预览。
 
 ### 2. 下载绝不静默产出损坏文件（`darkpy_rec.download_one`）
 
@@ -343,10 +351,10 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ```bash
 # ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
-# 34 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退、压缩门禁、清理器锁保护、ffmpeg .part 输出
+# 37 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、ffmpeg .part 输出
 ```
 离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
-预期输出结尾为 `通过 34 项，失败 0 项`；若不是 34/34，先确认解释器是否用错，再查代码。
+预期输出结尾为 `通过 37 项，失败 0 项`；若不是 37/37，先确认解释器是否用错，再查代码。
 
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |
@@ -374,7 +382,7 @@ python scripts/install_scheduled_task.py --remove    # 删除
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
-- `selftest_robustness.py` 健壮性回归自测（离线，34 项），详见「健壮性加固」第 6 节
+- `selftest_robustness.py` 健壮性回归自测（离线，37 项），详见「健壮性加固」第 6 节
 - `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果
 - 日志在 `WORKDIR/logs/`，错误在 `errors.log`；状态 / 基线在 `WORKDIR/state.json`
 - 中断排查：`WORKDIR/.daily_pipeline.stage` 记录最后一个阶段检查点；`logs/run_scheduled_*.log` 与 `logs/scheduled_last_run.json` 记录计划任务视角的结果

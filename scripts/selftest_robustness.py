@@ -287,6 +287,39 @@ def test_docx(tmp, v):
     check('F3 主文档损坏时回退 .bak', (not created) and '来自备份的内容' in txts,
           'created=%s txts=%r' % (created, txts))
 
+    # F4-F6 目标被占用（Word / 腾讯文档预览打开着 docx）：
+    #   os.replace 会一直抛 WinError 5/32，干等无效。必须退化到「原地覆写」，
+    #   否则整个月的章节都写不进去——2026-09-19 的 9/18 场次就是这样整场失败的。
+    p2 = os.path.join(tmp, 'busy.docx')
+    d3 = Document()
+    d3.add_paragraph('原有章节')
+    S.save_doc_atomic(d3, p2)
+    real_replace = os.replace
+
+    def _deny(src, dst, *a, **k):
+        if str(dst).endswith('.docx'):
+            raise OSError(13, 'Access is denied', str(dst), 5)   # winerror=5
+        return real_replace(src, dst, *a, **k)
+
+    os.replace = _deny
+    try:
+        d4 = Document(p2)
+        d4.add_paragraph('占用时追加的章节')
+        err = ''
+        S.save_doc_atomic(d4, p2)
+    except Exception as e:
+        err = str(e)
+    finally:
+        os.replace = real_replace
+    check('F4 目标被占用时退化到原地覆写（不整场失败）', not err, err)
+    try:
+        got = [x.text for x in Document(p2).paragraphs]
+    except Exception as e:
+        got = ['<打不开: %s>' % e]
+    check('F5 原地覆写后内容正确（旧+新都在）',
+          '原有章节' in got and '占用时追加的章节' in got, 'got=%r' % got)
+    check('F6 原地覆写不留 .part', not os.path.exists(p2 + '.part'))
+
 
 # ---------------------------------------------------------------------------
 # G：压缩完整性门禁

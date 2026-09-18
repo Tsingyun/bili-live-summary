@@ -351,8 +351,54 @@ def save_doc_atomic(doc, path, log=None):
             return path
         except OSError as e:
             last = e
+            # ★ 2026-09-19：WinError 5(拒绝访问) / 32(共享冲突) 表示目标被别的进程
+            #   **持有且不允许删除共享**——典型就是 Word / 腾讯文档预览打开着这个 docx。
+            #   这种占用是持续性的，干等 28s 也没用，早点跳到原地覆写分支。
+            if getattr(e, 'winerror', None) in (5, 32):
+                break
             time.sleep(0.5 * (i + 1))
-    raise RuntimeError('docx 原子替换失败 %s：%s' % (path, last))
+
+    # ---- 退化路径：原地覆写 ----
+    # 背景：本机预览面板会长期打开当月 docx，导致 os.replace 永远被拒；
+    # 此时如果直接判失败，整个月的章节都写不进去（9/18 场次就是这样整场失败的）。
+    # 代价：这一步失去「原子」保证——写入过程中被杀会损坏 docx。但：
+    #   · 进这一步之前 .bak 已是上一版完整文档（保存流程会刷新它）；
+    #   · open_or_create 读到损坏的主文档时会自动回退 .bak，不会静默丢内容；
+    #   · 先写正文再 ftruncate，避免"先截断成 0 字节"这种最坏时序。
+    try:
+        with open(tmp, 'rb') as f:
+            data = f.read()
+        # ★ Windows 上 os.open 默认是**文本模式**，会把 \n 翻成 \r\n，写 docx(zip) 必损坏；
+        #   必须显式 O_BINARY。另外 os.write 可能只写一部分，要循环写满。
+        flags = os.O_WRONLY | os.O_CREAT
+        if hasattr(os, 'O_BINARY'):
+            flags |= os.O_BINARY
+        fd = os.open(path, flags)
+        try:
+            mv = memoryview(data)
+            off = 0
+            while off < len(data):
+                off += os.write(fd, mv[off:])
+            os.ftruncate(fd, len(data))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception as e:
+        raise RuntimeError('docx 保存失败 %s：原子替换被拒(%s)，原地覆写也失败(%s)'
+                           % (path, last, e))
+    try:
+        force_unlink(tmp)
+    except Exception:
+        pass
+    if log is not None:
+        try:
+            log('[docx] 目标被占用（%s），已改为原地覆写：%s'
+                % (last, os.path.basename(path)), 'WARN')
+            log('[docx] ⚠️ 若该文档正开着编辑器，请关闭后重新打开以看到最新内容；'
+                '在编辑器里手动保存可能覆盖本次写入', 'WARN')
+        except Exception:
+            pass
+    return path
 
 
 def open_or_create(path, font):
