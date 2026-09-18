@@ -98,10 +98,13 @@ def export_mp3(cfg, log, src_video, default_stem=None):
         pass
     to = int(max(600, min(4 * 3600, 600 + (src_dur or 0) * 2)))
     try:
+        # ★ 必须显式 -f mp3：临时名是 `<out>.part`，ffmpeg 从扩展名猜不出容器格式，
+        #   会直接以 EINVAL(-22) 退出（Windows 上表现为 exit status 4294967274）。
+        #   加了 -f 就与文件名无关，别再删掉它。
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
                         '-i', src_video, '-vn',
                         '-acodec', 'libmp3lame', '-ar', str(ar), '-b:a', bitrate,
-                        tmp], check=True, stdout=subprocess.DEVNULL,
+                        '-f', 'mp3', tmp], check=True, stdout=subprocess.DEVNULL,
                        stderr=subprocess.PIPE, timeout=to)
     except subprocess.TimeoutExpired:
         log.error('[mp3_export] 转换超时（%ds）已终止：%s' % (to, os.path.basename(src_video)))

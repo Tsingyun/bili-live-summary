@@ -764,8 +764,12 @@ def extract_16k_audio(cfg, log, src, dst):
     tmp = dst + '.part'
     to = timeout_for_source(cfg['paths']['ffprobe'], src, base=1800)
     try:
+        # ★ 必须显式 -f mp3：临时名是 `<dst>.part`，ffmpeg 从扩展名猜不出容器格式，
+        #   会直接以 EINVAL(-22) 退出（Windows 上表现为 exit status 4294967274）。
+        #   加了 -f 就与文件名无关，别再删掉它。
         subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
-                        '-i', src, '-vn', '-ac', '1', '-ar', '16000', tmp],
+                        '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+                        '-f', 'mp3', tmp],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                        timeout=to)
         if not (os.path.exists(tmp) and os.path.getsize(tmp) > 1000):

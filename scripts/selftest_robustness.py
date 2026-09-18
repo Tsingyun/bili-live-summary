@@ -394,6 +394,80 @@ def test_cleanup_lock(tmp, v):
           CU.lock_file_is_live(wd, '.regen.lock', other) is True)
 
 
+class _SilentLog:
+    """替身日志：吞掉输出，只在断言失败时才需要看细节。"""
+
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, msg, level=None):
+        self.lines.append('%s %s' % (level or 'INFO', msg))
+
+    def error(self, msg):
+        self.lines.append('ERROR %s' % msg)
+
+
+def test_ffmpeg_part_output(tmp, v):
+    """I：ffmpeg 原子写的临时名不能破坏容器格式推断（回归 4294967274）。
+
+    2026-09-19 事故：`extract_16k_audio` / `mp3_export` 把临时输出写成
+    `<x>.mp3.part`，ffmpeg 从扩展名猜不出容器 → 以 AVERROR(EINVAL) 退出
+    （Windows 上 `exit status 4294967274`），9/18 场次在第一步就失败。
+    修法是给 ffmpeg 显式加 `-f mp3`。这个用例直接调用**真实函数**跑一遍，
+    谁把 `-f mp3` 删掉就会红。
+    """
+    ffmpeg = shutil.which('ffmpeg') or r'D:\ffmpeg\bin\ffmpeg.exe'
+    ffprobe = shutil.which('ffprobe') or r'D:\ffmpeg\bin\ffprobe.exe'
+    if not (os.path.exists(ffmpeg) and os.path.exists(ffprobe)):
+        print('\n[I] 跳过：本机没有 ffmpeg/ffprobe')
+        return
+    print('\n[I] ffmpeg .part 临时名（容器格式推断 + 原子改名）')
+    try:
+        import common
+        import daily_pipeline as DP
+        import mp3_export as ME
+    except Exception as e:
+        check('I0 导入 daily_pipeline / mp3_export', False, str(e))
+        return
+
+    # 造一段有**音轨**的源（G 组那套 testsrc2 没有音频，走不到本路径）
+    src = os.path.join(tmp, 'i_src.wav')
+    r = subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+                        '-ar', '44100', '-ac', '2', src],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if not (os.path.exists(src) and os.path.getsize(src) > 1000):
+        print('  ⏭  跳过：测试音频生成失败 %s' % ((r.stderr or b'')[-200:]))
+        return
+    log = _SilentLog()
+    cfg = {'paths': {'ffmpeg': ffmpeg, 'ffprobe': ffprobe},
+           '_dirs': {'root': tmp},
+           'mp3_export': {'enabled': True, 'out_dir': os.path.join(tmp, 'mp3out'),
+                          'bitrate': '192k', 'ar': 44100}}
+
+    # I1 抽 16k 转写音频（就是 9/18 失败的那一步）
+    dst = os.path.join(tmp, 'i_16k.mp3')
+    try:
+        DP.extract_16k_audio(cfg, log, src, dst)
+        err = ''
+    except Exception as e:
+        err = str(e)
+    check('I1 extract_16k_audio 成功（.part 临时名 + 显式 -f）',
+          os.path.exists(dst) and os.path.getsize(dst) > 1000, err or '产物缺失')
+    check('I2 不留 .part 残留', not os.path.exists(dst + '.part'))
+    d = common.probe_duration(ffprobe, dst) or 0
+    check('I3 抽出的音频时长与源一致（4s）', 3.0 <= d <= 5.0, 'got=%.2f' % d)
+
+    # I4 归档中质量 MP3（另一处同类写法）
+    out = ME.export_mp3(cfg, log, src)
+    check('I4 export_mp3 成功', bool(out) and os.path.exists(out),
+          'out=%s' % out)
+    if out:
+        check('I5 归档 MP3 不留 .part', not os.path.exists(out + '.part'))
+        d2 = common.probe_duration(ffprobe, out) or 0
+        check('I6 归档 MP3 时长与源一致（4s）', 3.0 <= d2 <= 5.0, 'got=%.2f' % d2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -407,6 +481,7 @@ def main():
         test_docx(tmp, args.verbose)
         test_compress(tmp, args.verbose)
         test_cleanup_lock(tmp, args.verbose)
+        test_ffmpeg_part_output(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
