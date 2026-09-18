@@ -1259,7 +1259,14 @@ def main():
             return
 
         # ---- 步骤 2：本地优先总结 ----
-        progress = {}
+        # ★ 2026-09-19：这里以前写死 `progress = {}`，于是 process_session 内部的
+        #   「[缓存命中]」续跑逻辑**从来没生效过**——中途失败（如某块全模型失败、
+        #   或写 docx 被占用）后重跑，会从第 1 块重新调用大模型，白烧一轮额度。
+        #   现在从磁盘读回进度：process_session 成功写完 docx 时会 pop 掉该日期，
+        #   所以正常跑完不会留脏缓存，只有失败残留才会被复用（正是我们要的语义）。
+        progress = R.load_progress(os.path.join(wd, '.regen_gemini_v2_progress.json'))
+        if progress:
+            log('载入总结续跑进度：%s' % ', '.join(sorted(progress.keys())))
         if to_process:
             log('---- 步骤 2：本地录播优先总结 ----')
             for s in to_process:

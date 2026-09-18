@@ -304,10 +304,22 @@ def load_progress(path):
 
 
 def save_progress(data, path):
+    """保存续跑进度。**尽力而为**：写缓存失败不该拖垮整场总结。"""
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            force_unlink(tmp)
+        except Exception:
+            pass
 
 
 def build_user(chunk_label, idx, total, content):
@@ -362,6 +374,13 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         log(f'== 载入全量原始规则并开始：{heading}（{total} 块）==')
 
         sess = progress.setdefault(date_str, {'chunks': {}, 'overview': ''})
+        # ★ 2026-09-19：缓存按「块序号」索引，若转写稿变了（切块数不同）还复用旧缓存，
+        #   会把 A 段内容贴到 B 段位置上。块数不一致时直接丢弃缓存重算。
+        if sess.get('total') not in (None, total):
+            log(f'  续跑缓存块数({sess.get("total")})与本次({total})不一致，丢弃缓存重算')
+            sess = {'chunks': {}, 'overview': '', 'total': total}
+            progress[date_str] = sess
+        sess['total'] = total
         all_blocks = []
         for i, (start, content) in enumerate(chunks, 1):
             touch_heartbeat(cfg)
