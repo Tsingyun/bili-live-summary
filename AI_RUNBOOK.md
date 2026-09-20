@@ -145,7 +145,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `summarize` | `prompt_path` | 可选；指向含 `{streamer}`/`{audience}` 占位符的 prompt 文件 |
 | `output` | `doc_dir` / `doc_name_pattern` | `C:\Users\Tsing\DeskBox\文档` / `岁己直播总结_{year}年{month}月.docx` |
 | `transcribe` | `chunk_hours_threshold` | `2`（>2h 音频先切块再转写，规避 FunASR VAD 截断） |
-| `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录） |
+| `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录）。**固定流程「转写→热词→总结」的第 2 步，勿跳过**：权威表在 `WORKDIR/hotwords.md`，改完立刻生效；改完跑 `python scripts/hotwords.py --audit` 查空转/冲突/危险级联 |
 | `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
 | `local_merge` | `enabled/max_gap_sec/allow_overlap_sec/exclude_dates` | 多段**先合并再总结**（禁止逐段总结）；场次判定**只看相邻间隙、不看日期变更**，跨 0 点连续段归属开播那一场；`allow_overlap_sec`(默认60) 容忍重连时的轻微负间隙；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
@@ -266,7 +266,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/daily_pipeline.py` | **主编排器**：监测 → 本地/B站 → MP3 → 压缩，含锁/断点/状态写入（通用，零主播硬编码） |
 | `scripts/scan_root_sessions`（在 daily_pipeline 内） | 根目录监测 + **全局按时间排序、间隙阈值切分场次**（跨午夜归前一场）+ 合并 + 录制中跳过；合并依赖外部命令 ffmpeg/ffprobe，缺失时显式报错并降级/跳过 |
 | `scripts/transcribe.py` | FunASR 转写（带时间轴 TXT/SRT），`chunk_hours_threshold` 切块 |
-| `scripts/hotwords.py` | 转写后热词替换（路径相对工作目录解析） |
+| `scripts/hotwords.py` | 转写后热词替换（**固定流程「转写→热词→总结」第 2 步**）：路径相对工作目录解析、保护词占位防误伤、长词优先、原子写回；`--audit` 审计空转/冲突/危险级联 |
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |
 | `scripts/summarize_gemini.py` | Word 排版底层（粗体总结、斜体金句、章节元数据、话题分隔线） |
 | `scripts/mp3_export.py` | 中质量 MP3 导出 |
@@ -281,7 +281,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/cleanup.py` | **垃圾清理器**：按保留天数清扫中间产物、清孤儿下载/ASR切块、磁盘水位检查（`sweep`/`after_session`/`check_disk_guard`/`report`） |
 | `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
 | `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 起每 60 分钟、持续 3 小时，交互式免提权，正在跑时不强杀） |
-| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，37 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
+| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，50 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |
 
 ---

@@ -73,7 +73,7 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 - **output**：`doc_dir`、`doc_name_pattern`（支持 `{streamer}`/`{year}`/`{month}`）、`font`
 - **paths**：`project_root` / `python` / `ffmpeg` / `ffprobe` / `aria2c` / `cookies`
 - **transcribe / cleanup**：推理参数与产物清理
-- **hotwords**：转写后自动纠正。`enabled:true` 时解析 `path`（默认用 skill 自带空模板 `SKILL_DIR/scripts/hotwords.md`）里的替换表，对 TXT/SRT 各做一遍替换再送 AI；`enabled:false` 关闭；`path` 可指向工作目录下的自定义替换表（相对路径以 WORKDIR 为基准）。
+- **hotwords**：转写后自动纠正（**固定流程「转写→热词→总结」的中间一环，勿跳过**）。`enabled:true` 时解析 `path`（默认用 skill 自带空模板 `SKILL_DIR/scripts/hotwords.md`）里的替换表，对 TXT/SRT 各做一遍替换再送 AI；`enabled:false` 关闭；`path` 可指向工作目录下的自定义替换表（相对路径以 WORKDIR 为基准）。改表立刻生效；改完用 `python scripts/hotwords.py --audit` 自检。
 - **标点清洗（冗余双标点）**：FunASR 的 VAD 分段兜底会在转写里叠出 `。，` `？，` `，。` `。？` 这类"句末终结符+句内连接符相邻"的冗余双标点。脚本在**写出 TXT/SRT 前**（`clean_segment_boundaries`）与**写 Word 前**（`clean_punctuation`，覆盖每块总结与概要）两处自动清洗——纯纠错不改语义，无需手动干预。若日后发现新双标点模式，改 `common.py` 的 `_RE_TERMINAL_CONN / _RE_CONN_TERMINAL` 即可。
 - **数字归一（规格数字中文读法→阿拉伯）**：FunASR 常把规格数字读成中文（`三零五零显卡`→`3050显卡`、`七十五赫兹`→`75Hz`、`八G`→`8G`）。脚本在**写出 TXT/SRT 前**（`normalize_numbers`）与**写 Word 前**（每块总结+概要各再做一遍）两处把"紧邻规格单位（显卡/GPU/Hz/赫兹/G/GB/寸/英寸/K/p/ti 等）的中国数字"转回阿拉伯，**仅对紧邻规格单位的读数生效，普通计数不动**，已是阿拉伯的文本幂等不受影响。若日后要增删单位，改 `common.py` 的 `_NUM_TRIGGERS` 即可。
 - **话题分隔符（横向分隔线）**：一场直播总结成一整段不易阅读。脚本在写完 Word 前，把全场总结合并后**调一次模型**识别话题边界（吃饭↔打游戏↔看电影等），在边界插入 `§SEP§` 标记并切分成多个话题块，相邻话题块之间写一条**灰色横线**（`add_horizontal_rule`，段落下边框）。实现：`summarize_gemini.py` 的 `segment_topics_with` + `append_section(topic_sep=True)`。config.json 的 `topic_separator.enabled=false` 可关闭（退回不分段）；模型若异常/改动了原文行则自动退回单块（不丢内容、不加线）。
@@ -351,10 +351,10 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ```bash
 # ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
-# 37 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、ffmpeg .part 输出
+# 50 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、ffmpeg .part 输出、热词替换
 ```
 离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
-预期输出结尾为 `通过 37 项，失败 0 项`；若不是 37/37，先确认解释器是否用错，再查代码。
+预期输出结尾为 `通过 50 项，失败 0 项`；若不是 50/50，先确认解释器是否用错，再查代码。
 
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |
@@ -376,13 +376,39 @@ python scripts/install_scheduled_task.py --remove    # 删除
 - 断点续跑：每场每阶段写入 state.json，中断重跑自动跳过已完成部分。
 - 热词纠正：转写之后、送 AI 之前必须对 TXT/SRT 做一遍热词替换（`hotwords.md`，含主播名/术语/歌名/保护规则），确保送进模型的文本已纠正。
 
+## 标准流程（固定，勿改顺序）
+
+**转写 → 热词纠正 → 总结**。三步的顺序是硬规范，任何一侧都不得调换或省略：
+
+| 步 | 动作 | 代码位置 | 硬性要求 |
+|---|---|---|---|
+| 1 | FunASR 带时间轴转写 | `transcribe.py` | 超过 2h 的音频**先切块再转写**（防 VAD 截断丢内容）；任一分块为空 → 整场失败、不落盘 |
+| 2 | 按热词表逐项纠正 TXT **与** SRT | `hotwords.py`（`apply_to_file`） | 转写产物落盘后**立刻**跑；两张表都要过一遍；保护词先占位防误伤；写回用原子写 |
+| 3 | 按 30 分钟切块逐块总结 → 写 Word | `regen_gemini_v2.py` / `summarize_gemini.py` | 只允许喂**已纠正**的文本；绝不整篇一次性发送 |
+
+配套约定（2026-09-20 固定）：
+
+- **替换表的权威位置是工作目录的 `WORKDIR/hotwords.md`**（由 `config.hotwords.path` 指向，相对路径以工作目录为基准）。
+  改这个文件**立即生效、无需改任何代码**；skill 内 `scripts/hotwords.md` 只是通用空模板兜底。
+- **改完表先自检**：`python scripts/hotwords.py --audit`（默认自动定位当前生效表）。
+  它会报出三类「写了但没真正生效」的词条并在有问题时以退出码 1 结束：
+  · **空转**——原词与替换完全相同，`replace` 什么也没做；
+  · **冲突**——同一原词指向多个不同目标，只有首次生效、其余被静默丢弃；
+  · **危险级联**——某条的替换结果里含有另一条非空转规则的原词，会被二次替换。
+- **保护词机制不可删**：`## 保护规则（不受误伤）` 章节下的短语会先被占位、替换完再还原，
+  专门用于挡住「上见→上舰」「点个→点歌」「破房→破防」「PC→PK」这类短词误伤长词。
+- **已总结的历史场次不重跑**：`state.json` 的 `done_dates` / `processed` 是门禁，干跑会显示
+  `[已覆盖] 已处理`。需要重跑某场必须**显式**指定（`--date YYYY-MM-DD` 或 `--bvid BVxxx`），
+  日常自动化绝不回头重刷历史。
+
 ## 运行与调试
 - `daily_pipeline.py --workdir "<工作目录>" --bvid BVxxx` 手动指定某期
 - `daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览会处理/跳过哪些（含缺失检查报告）
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
-- `selftest_robustness.py` 健壮性回归自测（离线，37 项），详见「健壮性加固」第 6 节
+- `selftest_robustness.py` 健壮性回归自测（离线，50 项），详见「健壮性加固」第 6 节
+- `hotwords.py --audit` 审计当前生效的热词表（空转 / 冲突 / 危险级联）；`hotwords.py --text "..."` 演示单条替换
 - `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果
 - 日志在 `WORKDIR/logs/`，错误在 `errors.log`；状态 / 基线在 `WORKDIR/state.json`
 - 中断排查：`WORKDIR/.daily_pipeline.stage` 记录最后一个阶段检查点；`logs/run_scheduled_*.log` 与 `logs/scheduled_last_run.json` 记录计划任务视角的结果

@@ -501,6 +501,131 @@ def test_ffmpeg_part_output(tmp, v):
         check('I6 归档 MP3 时长与源一致（4s）', 3.0 <= d2 <= 5.0, 'got=%.2f' % d2)
 
 
+def test_hotwords(tmp, v):
+    """J：热词替换（转写后 → 送总结前）必须真的生效，且不误伤、不留半截。
+
+    这是「标准流程」的守门测试：转写产物必须先经热词表纠正，再交给大模型总结。
+    任何人改坏解析顺序、把保护词机制删掉、或换成非原子写，这里都会红。
+    """
+    print('\n[J] 热词替换（解析 / 保护 / 长词优先 / 审计 / 原子写）')
+    try:
+        import hotwords as HW
+    except Exception as e:
+        check('J0 导入 hotwords', False, str(e))
+        return
+
+    def write_md(name, lines):
+        p = os.path.join(tmp, name)
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        return p
+
+    # J1 基础解析：规则与保护词分别归位
+    md = write_md('j_hw.md', [
+        '# 测试热词表', '',
+        '| 原词 | 替换为 |',
+        '| --- | --- |',
+        '| 饼干碎 | 饼干岁 |',
+        '| 剑长 | 舰长 |',
+        '| 连卖 | 连麦 |',
+        '| 点个 | 点歌 |',
+        '| 长词样本ABC | 替换后 |', '',
+        '## 保护规则（不受误伤）', '',
+        '| 保护词 | 原因 |',
+        '| --- | --- |',
+        '| 点个赞 | 理由 |',
+        '| 点个关注 | 理由 |',
+        '| 晚上见 | 理由 |',
+    ])
+    rules, protect = HW.load_rules(md)
+    check('J1 规则/保护词分别解析正确',
+          len(rules) == 5 and protect == ['点个赞', '点个关注', '晚上见'],
+          'rules=%d protect=%r' % (len(rules), protect))
+
+    # J2 保护词生效：点个赞/点个关注/晚上见 不被「点个→点歌」误伤；
+    #    没被保护的「点个」仍应正常替换（保护是精确短语、不是整段屏蔽）
+    out = HW.apply_to_text('点个赞然后晚上见再点个关注再点个菜', rules, protect)
+    check('J2 保护词不被短词误伤',
+          out == '点个赞然后晚上见再点个关注再点歌菜', 'got=%r' % out)
+    check('J3 应替换的仍然替换',
+          HW.apply_to_text('饼干碎和剑长连卖', rules, protect) == '饼干岁和舰长连麦')
+
+    # J4 长词优先：ABC 整体替换，不被更短的 BC 抢先切碎
+    md2 = write_md('j_hw2.md', [
+        '| 原词 | 替换为 |', '| --- | --- |',
+        '| ABC | Z |', '| BC | Y |',
+    ])
+    r2, _ = HW.load_rules(md2)
+    check('J4 长词优先（不被短词抢先替换）',
+          HW.apply_to_text('ABC', r2, []) == 'Z',
+          'got=%r' % HW.apply_to_text('ABC', r2, []))
+
+    # J5 占位符不泄漏：保护词还原后不应残留私用区字符
+    out5 = HW.apply_to_text('点个赞点个赞晚上见', rules, protect)
+    check('J5 保护占位符完整还原、无残留',
+          '\uE000' not in out5 and '\uE001' not in out5 and out5 == '点个赞点个赞晚上见',
+          'got=%r' % out5)
+
+    # J6 审计能发现「冲突重复」（同原词不同目标，后者会被静默丢弃）
+    md6 = write_md('j_hw6.md', [
+        '| 原词 | 替换为 |', '| --- | --- |',
+        '| 甲 | 乙 |', '| 甲 | 丙 |',
+    ])
+    rep6 = HW.audit_md(md6)
+    check('J6 审计发现同原词不同目标的冲突',
+          '甲' in rep6['conflicts'], 'conflicts=%r' % rep6['conflicts'])
+
+    # J7 审计能发现「危险级联」（替换结果还会被另一条非空转规则改动）
+    md7 = write_md('j_hw7.md', [
+        '| 原词 | 替换为 |', '| --- | --- |',
+        '| 坏词 | 好B |', '| 好B | 更好B |',
+    ])
+    rep7 = HW.audit_md(md7)
+    check('J7 审计发现危险级联',
+          any(x[0] == '坏词' and x[2] == '好B' for x in rep7['dangerous']),
+          'dangerous=%r' % rep7['dangerous'])
+
+    # J8 审计能发现「空转」（原词 == 替换为，replace 没有任何作用）
+    md8 = write_md('j_hw8.md', [
+        '| 原词 | 替换为 |', '| --- | --- |',
+        '| 银魂 | 银魂 |',
+    ])
+    rep8 = HW.audit_md(md8)
+    check('J8 审计发现空转词条', len(rep8['noop']) == 1, 'noop=%r' % rep8['noop'])
+
+    # J9 相对路径解析：以 cfg._workdir 为基准找到工作目录里的表
+    sub = os.path.join(tmp, 'j_wd')
+    os.makedirs(sub, exist_ok=True)
+    write_md('j_wd/hotwords.md', ['| 原词 | 替换为 |', '| --- | --- |', '| 碎姐 | 岁己 |'])
+    cfg9 = {'_workdir': sub, 'hotwords': {'enabled': True, 'path': 'hotwords.md'}}
+    check('J9 hotwords.path 相对工作目录解析',
+          HW.resolve_md_path(cfg9) == os.path.join(sub, 'hotwords.md'))
+
+    # J10 apply_to_file：真改文件、且不留 .part（原子写）
+    txt = os.path.join(tmp, 'j_tr.txt')
+    with open(txt, 'w', encoding='utf-8') as f:
+        f.write('饼干碎说剑长')
+    changed = HW.apply_to_file(txt, cfg9, None)      # cfg9 表里只有「碎姐」，不该改
+    check('J10a 无命中时不改动文件', changed is False)
+    cfg10 = {'_workdir': sub, 'hotwords': {'enabled': True, 'path': 'hotwords.md'}}
+    with open(os.path.join(sub, 'hotwords.md'), 'w', encoding='utf-8') as f:
+        f.write('| 原词 | 替换为 |\n| --- | --- |\n| 饼干碎 | 饼干岁 |\n| 剑长 | 舰长 |\n')
+    changed = HW.apply_to_file(txt, cfg10, None)
+    body = open(txt, encoding='utf-8').read()
+    check('J10b 命中时正确改写文件', changed is True and body == '饼干岁说舰长',
+          'changed=%s body=%r' % (changed, body))
+    check('J10c 写回不留 .part 残留', not os.path.exists(txt + '.part'))
+
+    # J11 enabled=false 时完全不动作
+    txt2 = os.path.join(tmp, 'j_tr2.txt')
+    with open(txt2, 'w', encoding='utf-8') as f:
+        f.write('饼干碎')
+    check('J11 enabled=false 时不替换',
+          HW.apply_to_file(txt2, {'_workdir': sub,
+                                  'hotwords': {'enabled': False, 'path': 'hotwords.md'}}) is False
+          and open(txt2, encoding='utf-8').read() == '饼干碎')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -515,6 +640,7 @@ def main():
         test_compress(tmp, args.verbose)
         test_cleanup_lock(tmp, args.verbose)
         test_ffmpeg_part_output(tmp, args.verbose)
+        test_hotwords(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
