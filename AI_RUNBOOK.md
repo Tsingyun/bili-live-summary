@@ -192,6 +192,9 @@ Word 月度文档已有该日章节、或本地存在该日完整视频（> `bac
 | 合并多场被误判成一场 | 加 `local_merge.exclude_dates: ["2026-08-22"]` 显式强制不合并（别依赖阈值侥幸）。 |
 | **磁盘被撑爆 / 垃圾文件堆积** | 跑 `python cleanup.py --report` 看占用、`--sweep` 清扫。每场临时占 25~30GB，靠 `cleanup` 段配置自动回收（详见下方「自动清理」）。 |
 | **清理了但文件还在** | 自动化环境下 D 盘的 `os.remove` 会被安全 hook 拦截（抛 `AttributeError: 'NoneType' object has no attribute 'strip'`）。所有删除必须走 `common.force_unlink`（自动降级 PowerShell），管线脚本里禁止裸 `os.remove`。 |
+| **Word 里金句变成粗体 / 有 `_下划线_` 残留** | 模型（尤其 gemini-2.5-flash）给金句套了 markdown 斜体 `“…”`，旧清理没剥单下划线 → 被判成正文。已修：`strip_md_markers()` 在判金句前统一剥除。历史文档跑 `python scripts/docx_healthcheck.py --workdir <WD> --fix` 就地纠正。 |
+| **Word 里出现提示词 / 「好的，这是对输入文本…」这类话** | 模型回显了 user 消息里的说明句或输出了元话语开场白。已修：`prompt_leak_hits()` + `is_meta_line()` 双重过滤，写入侧拦截、产物侧由 `docx_healthcheck.py` 清除。 |
+| **金句里的错字没被热词表纠正** | 先确认不是流程问题：`hotwords.py --audit` + 看 TXT 是否已替换（401 条规则应残留 0）。**残留 = 表里没这个词条**，属于表缺口；`docx_healthcheck.py` 会列出「原词→建议替换」清单，补进 `WORKDIR/hotwords.md` 即刻生效。注意英文原词按词边界匹配，别被 `NPC` 命中 `PC` 误导。 |
 
 **日志位置**：`工作目录\logs\YYYY-MM-DD.log`（每日一个）+ `logs\errors.log`（错误汇总）。
 
@@ -281,7 +284,8 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/cleanup.py` | **垃圾清理器**：按保留天数清扫中间产物、清孤儿下载/ASR切块、磁盘水位检查（`sweep`/`after_session`/`check_disk_guard`/`report`） |
 | `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
 | `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 起每 60 分钟、持续 3 小时，交互式免提权，正在跑时不强杀） |
-| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，50 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
+| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，72 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**、**金句格式/异常内容过滤/文档体检**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
+| `scripts/docx_healthcheck.py` | **Word 成品体检与修复**（2026-09-24 新增）：① 格式（金句=灰色斜体/正文=粗体）② markdown 残留 ③ 提示词回显与元话语 ④ 热词表原词回扫 ⑤ 结构提示。`--fix` 就地修复（留 `.bak`）。已接入 `daily_pipeline` 收尾步骤 4 自动执行 |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |
 
 ---

@@ -436,8 +436,8 @@ def process_session(rot, sys_prompt, cfg, fname, date_str, font, log, progress, 
         if src_path:
             meta.append(f'来源 {src_path}')
         first = created and len([p for p in doc.paragraphs if p.text.strip()]) == 0
-        S.append_section(doc, heading, meta, segs, font, first, overview,
-                         topic_sep=sep_cfg.get('enabled', True))
+        dropped = S.append_section(doc, heading, meta, segs, font, first, overview,
+                                   topic_sep=sep_cfg.get('enabled', True), log=log)
         os.makedirs(os.path.dirname(docx_path), exist_ok=True)
         # 原子保存（写 .part → zip 校验 → replace），并被 .bak 兜底：
         # 进程被杀不会把整月 docx 写坏。

@@ -526,25 +526,159 @@ def _release_doc_lock(lock_path):
         pass
 
 
+# ---------------- 行级清洗与「异常内容」过滤 ----------------
+# 2026-09-24 修复两类实测问题（9/23 那场暴露）：
+#  ① 金句被误判成粗体：不同模型遵循度不同——gemini-2.5-flash 会给金句套 markdown
+#     斜体 `“…”`，旧清理只剥 ** 与 __，**单下划线漏网** → is_quote_line 看到首字符
+#     是 '_' 判否 → 走正文分支被加粗（本应灰色斜体），下划线还直接显示在 Word 里。
+#  ② 提示词/元话语写进正文：模型把 user 消息里的说明句当「金句」回显
+#     （如「输入文本每一行都以 [HH:MM:SS] 开头…」），或输出「好的，这是对输入文本
+#     进行分段重组与精炼总结后的内容：」这类开场白，被当成正文段落加粗写入。
+
+_MD_LIST_PREFIX = re.compile(r'^[\-\u2022\u30fb\u25cf]+\s*')
+_MD_HEAD_PREFIX = re.compile(r'^#{1,6}\s*')
+_MD_WRAP = (
+    re.compile(r'^\*{1,3}(.+?)\*{1,3}$', re.S),
+    re.compile(r'^_{1,3}(.+?)_{1,3}$', re.S),
+    re.compile(r'^`{1,3}(.+?)`{1,3}$', re.S),
+)
+_TS_PREFIX = re.compile(r'^\[\d{1,2}:\d{2}:\d{2}\]\s*')
+_QUOTE_OPEN = ('\u201c', '"', '\u300c', '\u300e')     # “ " 「 『
+_QUOTE_CLOSE = ('\u201d', '"', '\u300d', '\u300f')    # ” " 」 』
+
+
+def strip_md_markers(line):
+    """剥掉模型自发加的 markdown 标记（列表/标题/强调/行内代码），返回纯文本行。
+
+    单下划线**只剥成对包裹**的形式（`_斜体_`），不做全局删除——中文正文里 `_`
+    几乎不出现，成对才处理可避免误伤英文歌词、账号名等。
+    """
+    s = (line or '').strip()
+    if not s:
+        return ''
+    s = _MD_LIST_PREFIX.sub('', s)
+    s = _MD_HEAD_PREFIX.sub('', s)
+    for _ in range(4):                 # 容忍 *** ** * 或 ___ __ _ 多层嵌套
+        before = s
+        for pat in _MD_WRAP:
+            s = pat.sub(r'\1', s).strip()
+        if s == before:
+            break
+    s = s.replace('**', '').replace('__', '')
+    return s.strip()
+
+
 def is_quote_line(line):
-    s = line.strip()
-    return (len(s) > 4
-            and s[0] in ('“', '"', '「')
-            and s[-1] in ('”', '"', '」'))
+    """是否为「金句」行（引号包裹的原文摘录）。
+
+    先剥 markdown 标记（关键：`_“…”_` 要能被认出来），再容忍 [HH:MM:SS] 前缀。
+    """
+    s = strip_md_markers(line)
+    if len(s) > 4 and s[0] in _QUOTE_OPEN and s[-1] in _QUOTE_CLOSE:
+        return True
+    t = _TS_PREFIX.sub('', s)
+    if t != s and len(t) > 4 and t[0] in _QUOTE_OPEN and t[-1] in _QUOTE_CLOSE:
+        return True
+    return False
+
+
+_FP_CACHE = {}
+
+
+def _prompt_fingerprints(cfg=None):
+    """收集提示词里长度足够的句子片段，作为「模型回显提示词」的指纹。
+
+    长度阈值取 12：既是提示词里的实义片段，又几乎不可能与主播口语原句重合。
+    """
+    if 'fp' in _FP_CACHE:
+        return _FP_CACHE['fp']
+    parts = [globals().get(n) or '' for n in
+             ('USER_TEMPLATE', 'SYSTEM_PROMPT_FALLBACK', 'OVERVIEW_SYSTEM_PROMPT_FALLBACK',
+              'OVERVIEW_USER_TEMPLATE', 'TOPIC_SEG_SYSTEM')]
+    # 实际生效的提示词文件（工作目录优先）
+    paths = []
+    if cfg and cfg.get('_workdir'):
+        paths += [os.path.join(cfg['_workdir'], n) for n in
+                  ('prompt_original.txt', 'prompt.txt', 'prompt_overview.txt')]
+    _sd = os.path.dirname(os.path.abspath(__file__))
+    paths += [os.path.join(_sd, n) for n in ('prompt.txt', 'prompt_overview.txt')]
+    for p in paths:
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                parts.append(f.read())
+        except Exception:
+            pass
+    # regen_gemini_v2 的 build_user 模板（延迟 import，避免循环依赖）
+    try:
+        import regen_gemini_v2 as _R
+        parts.append(_R.build_user('x', 1, 1, ''))
+    except Exception:
+        pass
+    fps = set()
+    for c in parts:
+        if not c:
+            continue
+        c = re.sub(r'\{[a-zA-Z_]+\}', ' ', c)          # 去掉 {chunk_label} 之类占位符
+        for sent in re.split(r'[。；;\n，,：:]', c):
+            s = sent.strip().strip('。，,、:：')
+            if len(s) >= 12:
+                fps.add(s)
+    _FP_CACHE['fp'] = fps
+    return fps
+
+
+def prompt_leak_hits(line):
+    """返回该行命中的提示词指纹；非空表示这是模型回显的提示词/系统指令。"""
+    s = strip_md_markers(line)
+    if not s:
+        return []
+    return [fp for fp in _prompt_fingerprints() if fp in s]
+
+
+# 元话语（模型开场白/收尾语）的特征模板
+_META_PATTERNS = (
+    re.compile(r'对(输入|上述|以下|原文)?(文本|内容).{0,20}(分段重组|重组|精炼|整理|改写|压缩)'),
+    re.compile(r'^(好(的|嘞)?|收到|明白|没问题|当然|可以)[，,。!！]?\s*'
+               r'(这是|以下是|下面是|这里是|我将|我来|我|已|根据)?.{0,40}'
+               r'(内容|总结|结果|输出|如下)[:：]?$'),
+    re.compile(r'^(以下|下面|以上|如上|这是|这里是)是?.{0,30}(内容|总结|结果|输出|如下)[:：]?$'),
+    re.compile(r'^(我)?(已|按照|根据)(您的?|你的)?(要求|指令|提示|系统指令).{0,40}$'),
+    re.compile(r'^(希望|祝)(能|这(份|些)?)?.{0,20}(对你有帮助|帮到你|满意)'),
+    re.compile(r'^(如果|若)(你|您)(还)?(有|需要).{0,30}(请|可以|随时)(告诉|说|提)'),
+    re.compile(r'^(注意|备注|说明)[:：].{0,20}(格式|输出|规则)'),
+)
+_META_TAIL_HINT = re.compile(r'(内容|总结|结果|如下|输出|重组|整理|精炼)[:：]\s*$')
+
+
+def is_meta_line(line):
+    """是否为模型自说自话的元话语行（开场白/收尾语/格式说明），不应进正文。
+
+    严格限制在「短行」上判断，避免误删正常总结与金句。
+    """
+    s = strip_md_markers(line)
+    if not s or len(s) > 80:
+        return False
+    if _TS_PREFIX.match(s):          # 带时间戳的是正文
+        return False
+    for pat in _META_PATTERNS:
+        if pat.search(s):
+            return True
+    if len(s) <= 45 and _META_TAIL_HINT.search(s):
+        return True
+    return False
 
 
 def clean_block(text):
-    """分组提示词产出的清洗：剥掉模型自发加的标号、『金句：』标题行、列表符号，
-    把 “” 归一为「」，保留 [HH:MM:SS] 起始时间行与「」金句行。"""
+    """分组提示词产出的清洗：剥掉模型自发加的标号、『金句：』标题行、列表符号、
+    markdown 强调标记，把 “” 归一为「」，保留 [HH:MM:SS] 起始时间行与「」金句行。"""
     out = []
     for line in text.split('\n'):
-        line = line.strip()
+        line = strip_md_markers(line)
         if not line:
             continue
         if line.startswith('【') or line.startswith('格式') or line.startswith('输出'):
             continue
-        # 剥列表符号与标号（可能带或不带前置时间戳）
-        line = re.sub(r'^[-\u2022\u30fb\u25cf]+\s*', '', line)
+        # 剥标号（可能带或不带前置时间戳）
         line = re.sub(r'^(金句|总结段|一段|段落\d+|段\d+|quote)[:：]\s*', '', line, flags=re.I)
         line = re.sub(r'(\[\d{1,2}:\d{2}:\d{2}\]\s*)(金句|总结段|一段|段落\d+|段\d+)[:：]\s*', r'\1', line, flags=re.I)
         # “原句” -> 「原句」 （仅当整行是引号包裹的引用时归一，避免误伤总结正文）
@@ -611,11 +745,17 @@ def segment_topics_with(combined_text, call_fn, log):
     return segs
 
 
-def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overview='', topic_sep=True):
+def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overview='',
+                   topic_sep=True, log=None):
     """把一场直播的总结追加进文档。segments 为话题块列表（每个元素是含多行的字符串）；
     开启 topic_sep 时，在相邻话题块之间插入一条横向分隔线。
-    金句（引号行）按提示词要求：每段总结可附带 1–2 句，超出该段 2 句上限的后续金句行丢弃。"""
+    金句（引号行）按提示词要求：每段总结可附带 1–2 句，超出该段 2 句上限的后续金句行丢弃。
+
+    行级清理在**唯一的写入点**统一完成（两条总结路径 summarize_one / regen_gemini_v2
+    都走这里），顺序固定：剥 markdown 标记 → 丢弃提示词回显/元话语 → 判金句 → 落格式。
+    返回被丢弃的行列表（供健康检查与测试断言）。"""
     para_quote = 0  # 每段金句计数，遇到新的总结段重置
+    dropped = []
     if not first_in_doc:
         doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
@@ -647,12 +787,16 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
         if si > 0 and topic_sep:
             add_horizontal_rule(doc)
             para_quote = 0  # 新话题块 → 金句计数重置
-        for line in seg.strip().split('\n'):
-            line = line.strip()
+        for raw in seg.strip().split('\n'):
+            # ★ 统一剥 markdown 标记（关键：`_“…”_` 必须还原成 `“…”`，
+            #   否则下面的 is_quote_line 会判否 → 金句被当正文加粗）
+            line = strip_md_markers(raw)
             if not line:
                 continue
-            line = re.sub(r'^[\*#\-\u2022]+\s*', '', line)
-            line = line.replace('**', '').replace('__', '').strip().strip('*').strip()
+            # 异常内容过滤：模型回显的提示词 / 元话语开场白，绝不写进文档
+            if prompt_leak_hits(line) or is_meta_line(line):
+                dropped.append(line)
+                continue
             if is_quote_line(line):
                 if para_quote >= 2:
                     continue  # 该段金句已达 2 句上限，跳过多余金句行
@@ -674,6 +818,11 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
                 set_font(r, font)
                 r.bold = True
                 r.font.size = Pt(11)
+
+    if dropped and log:
+        log.error('  已拦截 %d 行非正文内容（提示词回显/元话语），未写入文档：%s'
+                  % (len(dropped), ' | '.join(d[:40] for d in dropped[:3])))
+    return dropped
 
 
 # ---------------- 主流程 ----------------
@@ -771,7 +920,7 @@ def summarize_one(cfg, txt_path, log, date_str=None, title=None, bvid=None, url=
             segs = blocks
         first = created and len([p for p in doc.paragraphs if p.text.strip()]) == 0
         append_section(doc, heading, meta, segs, font, first, overview,
-                       topic_sep=sep_cfg.get('enabled', True))
+                       topic_sep=sep_cfg.get('enabled', True), log=log)
         # 保存前留一份 .bak（原子替换之外的第二道保险，读取端损坏时可回退）
         try:
             if os.path.exists(docx_path):

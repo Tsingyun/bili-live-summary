@@ -351,10 +351,44 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ```bash
 # ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
-# 50 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、ffmpeg .part 输出、热词替换
+# 72 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、
+#        ffmpeg .part 输出、热词替换、金句格式/异常内容过滤/文档体检
 ```
 离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
-预期输出结尾为 `通过 50 项，失败 0 项`；若不是 50/50，先确认解释器是否用错，再查代码。
+预期输出结尾为 `通过 72 项，失败 0 项`；若不是 72/72，先确认解释器是否用错，再查代码。
+
+### 7. 产物质量门禁：Word 写完自动体检并修复（2026-09-24）
+
+**背景**：9/23 那场总结暴露出三类成品问题（写入侧已修，产物侧再兜一道）：
+
+| 问题 | 根因 | 修法 |
+|---|---|---|
+| 金句本该「灰色斜体」，24 处却变**粗体**、下划线裸露 | 不同模型遵循度不同：`gemini-2.5-flash` 会给金句套 markdown 斜体 `“…”`；旧清理只剥 `**`/`__`，**单下划线漏网** → `is_quote_line` 判否 → 当正文加粗 | `strip_md_markers()` 统一剥包裹标记，且**在判金句之前**执行 |
+| 出现提示词回显（「输入文本每一行都以 [HH:MM:SS] 开头…」）与元话语（「好的，这是对输入文本进行分段重组…」） | 模型把 user 消息里的说明句当「金句」输出 | `prompt_leak_hits()` 指纹匹配 + `is_meta_line()` 元话语识别，命中即丢弃 |
+| 金句里仍有未纠正的错字（掉件/藿相正奇/布包…） | **不是流程坏了**——401 条规则在转写稿里残留 0；是**表里没有这些词条** | `docx_healthcheck.py` 扫成品 vs 热词表原词，列出缺口 |
+
+**双保险设计**：
+1. **源头拦截**（`summarize_gemini.append_section`，两条总结路径共用的唯一写入点）：
+   剥 markdown → 丢弃提示词回显/元话语 → 判金句 → 落格式。被拦的行会打 WARN 日志。
+2. **产物体检**（`docx_healthcheck.py`）：对已生成的 docx 就地修复，不重跑 AI、不耗额度。
+
+```bash
+# 只体检（不改文件）
+python scripts/docx_healthcheck.py --workdir "<工作目录>" --verbose
+# 体检并修复（先留 .bak，再原子保存）
+python scripts/docx_healthcheck.py --workdir "<工作目录>" --fix --json report.json
+# 也可只查单个文档
+python scripts/docx_healthcheck.py --doc "C:/.../岁己直播总结_2026年9月.docx" --fix
+```
+
+- 检查项：① 金句/正文格式（金句=灰色斜体 10pt 非粗体；正文=粗体 11pt 非斜体）
+  ② markdown 标记残留 ③ 提示词回显/元话语 ④ 热词表原词残留 ⑤ 结构提示（元信息行、空金句章节）
+- ★ **热词残留校验必须按词边界匹配英文原词**：`PC → PK` 这条规则会用子串命中 `NPC`
+  （实测误报 21 处），所以 ASCII 原词走 `(?<![A-Za-z0-9])…(?![A-Za-z0-9])`，中文原词才用子串。
+- 备份/历史快照（`.bak`、`_pre*`、`blockfix`、`~$*`）**不参与**体检，避免误改归档。
+- **已接入每日流程**：`daily_pipeline.py` 收尾「步骤 4 产物质量检查」自动以修复模式跑一次；
+  `--dry-run` 时降级为只读体检。任何异常都只告警，绝不影响交付物。
+- 退出码：0 = 无问题或已修复；1 = 仍有严重项未解决（low 级结构提示不阻塞）。
 
 ## 「最新录播」的几种判定（latest_mode.mode）
 | mode | 含义 |
@@ -371,10 +405,11 @@ python scripts/install_scheduled_task.py --remove    # 删除
 
 ## 硬约束（务必保持）
 - 转录文本**必须按 30 分钟切块逐块发送 AI**，绝不允许整篇一次性发送（防超长 / 超时 / 截断）。
-- Word 文档：同月复用同一文档，每场新直播插入**分页符 + Heading2 标题**区分；总结段粗体、金句斜体。
+- Word 文档：同月复用同一文档，每场新直播插入**分页符 + Heading2 标题**区分；总结段=**粗体 11pt**，金句=**灰色(#666666)斜体 10pt**（格式错误由 `docx_healthcheck.py` 自动纠正）。
 - **章节元数据行（必须）**：每个 Heading2 章节标题下方必须紧跟一行元数据：`直播日期 YYYY-MM-DD  |  时长 HH:MM:SS  |  N/N 段  |  总结于 YYYY-MM-DD HH:MM`；本地 / B站场次另起一行 `来源 <本地 mp4/flv 路径 或 https://www.bilibili.com/video/BVxxxx>`。旁路本地路径（`regen_gemini_v2.process_session`）与自动化路径（`summarize_gemini.append_section`）生成的元数据格式**必须完全一致**。
 - 断点续跑：每场每阶段写入 state.json，中断重跑自动跳过已完成部分。
 - 热词纠正：转写之后、送 AI 之前必须对 TXT/SRT 做一遍热词替换（`hotwords.md`，含主播名/术语/歌名/保护规则），确保送进模型的文本已纠正。
+  AI 产出里若又出现热词表的原词（模型改写引入），由 `docx_healthcheck.py` 在收尾自动回扫并告警。
 
 ## 标准流程（固定，勿改顺序）
 
@@ -407,7 +442,8 @@ python scripts/install_scheduled_task.py --remove    # 删除
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
-- `selftest_robustness.py` 健壮性回归自测（离线，50 项），详见「健壮性加固」第 6 节
+- `selftest_robustness.py` 健壮性回归自测（离线，72 项），详见「健壮性加固」第 6 节
+- `docx_healthcheck.py` Word 成品体检与修复（格式/异常内容/热词），详见「健壮性加固」第 7 节；已接入每日流程收尾
 - `hotwords.py --audit` 审计当前生效的热词表（空转 / 冲突 / 危险级联）；`hotwords.py --text "..."` 演示单条替换
 - `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果
 - 日志在 `WORKDIR/logs/`，错误在 `errors.log`；状态 / 基线在 `WORKDIR/state.json`

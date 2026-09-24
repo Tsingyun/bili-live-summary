@@ -1062,6 +1062,76 @@ def _finalize_state(st, cfg, live_date):
 
 
 # ---------------------------------------------------------------------------
+# 产物质量门禁（2026-09-24 新增）
+# ---------------------------------------------------------------------------
+def _healthcheck(cfg, log, dry_run=False):
+    """对输出目录的 Word 总结做三项自检并就地修复：
+
+      ① 格式错误：金句应为「灰色斜体 10pt」，正文应「粗体 11pt」；
+         markdown 标记（`**`、`__`、`_“…”_`）必须已剥净。
+      ② 异常内容：模型回显的提示词（如「输入文本每一行都以 [HH:MM:SS] 开头…」）
+         与元话语开场白（「好的，这是对输入文本进行分段重组…」）必须清除。
+      ③ 热词校验：文档里不得残留热词表的「原词」（英文按词边界匹配，避免 NPC 命中 PC）。
+
+    纯离线，不消耗网络与模型额度；任何异常都只告警，绝不影响交付物。
+    """
+    try:
+        import glob
+        import docx_healthcheck as HC
+    except Exception as e:
+        log('未加载产物质量检查模块，跳过：%s' % e, 'WARN')
+        return
+    out_dir = (cfg.get('output') or {}).get('doc_dir')
+    if not out_dir or not os.path.isdir(out_dir):
+        log('输出目录不存在，跳过产物质量检查', 'WARN')
+        return
+    docs = [d for d in glob.glob(os.path.join(out_dir, '*直播总结_*.docx'))
+            if not HC.is_backup_file(os.path.basename(d))]
+    if not docs:
+        return
+    try:
+        rules, protect = HC.resolve_rules(cfg)
+    except Exception:
+        rules, protect = [], []
+    font = (cfg.get('output') or {}).get('font', '思源宋体CN Light')
+
+    total_fixed, problems = 0, 0
+    for d in docs:
+        try:
+            rep = HC.check_doc(d, rules, protect, fix=not dry_run, font=font, log=log)
+        except Exception as e:
+            log('  [质检] %s 检查失败：%s' % (os.path.basename(d), e), 'WARN')
+            continue
+        c = rep['counts']
+        if rep['total']:
+            log('  [质检] %s：格式 %d / markdown %d / 异常内容 %d / 热词残留 %d / 结构提示 %d%s'
+                % (os.path.basename(d), c.get('quote_format', 0), c.get('md_residue', 0),
+                   c.get('abnormal', 0), c.get('hotword_residue', 0),
+                   c.get('structure', 0),
+                   ('（已修复 %d 处）' % rep['fixed']) if rep['fixed'] else ''))
+            if rep.get('blocking'):
+                problems += 1
+            if c.get('abnormal'):
+                for it in rep['issues']['abnormal'][:3]:
+                    log('    · 异常内容已处理：%s' % it['text'][:60], 'WARN')
+            if c.get('hotword_residue'):
+                agg = {}
+                for it in rep['issues']['hotword_residue']:
+                    k = (it['orig'], it['repl'])
+                    agg[k] = agg.get(k, 0) + 1
+                top = sorted(agg.items(), key=lambda x: -x[1])[:5]
+                log('    · 热词未覆盖（建议补进 hotwords.md）：%s'
+                    % '、'.join('%s→%s x%d' % (a, b, n) for (a, b), n in top), 'WARN')
+            total_fixed += rep['fixed']
+    if total_fixed:
+        log('产物质量检查：共修复 %d 处' % total_fixed)
+    elif problems:
+        log('产物质量检查：发现问题但未修复（dry-run）', 'WARN')
+    else:
+        log('产物质量检查：全部通过')
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 def main():
@@ -1256,6 +1326,11 @@ def main():
                 except Exception as e:
                     log.error('缺失检查（dry-run）异常：%s' % e)
             log('dry-run，未实际处理。')
+            # dry-run 也做一次**只读**体检，便于提前发现文档问题（绝不修改文件）
+            try:
+                _healthcheck(cfg, log, dry_run=True)
+            except Exception as e:
+                log('产物质量检查（dry-run）异常：%s' % e, 'WARN')
             return
 
         # ---- 步骤 2：本地优先总结 ----
@@ -1309,6 +1384,14 @@ def main():
                 log.error('缺失检查/补档异常（已完成的部分已写入 state，可重跑续做）：%s' % e)
         else:
             log('---- 步骤 3：已跳过（--no-backfill） ----')
+
+        # ---- 步骤 4：产物质量门禁（格式检查 / 异常内容清理 / 热词校验）----
+        # 2026-09-24 新增：Word 写完后再自检一遍并就地修复，见 _healthcheck 说明。
+        touch('步骤4 产物质量检查')
+        try:
+            _healthcheck(cfg, log, dry_run=args.dry_run)
+        except Exception as e:
+            log('产物质量检查失败（不影响交付物）：%s' % e, 'WARN')
 
         # ---- 收尾清扫：无论成败，把本轮产生的中间文件清干净 ----
         touch('收尾清扫')

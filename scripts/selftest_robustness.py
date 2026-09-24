@@ -626,6 +626,115 @@ def test_hotwords(tmp, v):
           and open(txt2, encoding='utf-8').read() == '饼干碎')
 
 
+def test_docx_healthcheck(tmp, v):
+    """[K] 2026-09-24 新增：金句格式、异常内容拦截、热词词边界与文档体检修复。"""
+    print('\n[K] 金句格式 / 异常内容过滤 / 热词校验 / 文档体检')
+    try:
+        import summarize_gemini as S
+        import docx_healthcheck as HC
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+    except Exception as e:
+        check('K0 导入相关模块', False, str(e))
+        return
+    quiet = HC._Log(quiet=True)
+
+    # --- K1 markdown 标记剥除 ---
+    cases = [
+        ('_\u201c\u4f60\u597d\u5440\u3002\u201d_', '\u201c\u4f60\u597d\u5440\u3002\u201d'),
+        ('**\u201c\u52a0\u7c97\u5305\u88f9\u3002\u201d**', '\u201c\u52a0\u7c97\u5305\u88f9\u3002\u201d'),
+        ('***\u4e09\u661f***', '\u4e09\u661f'),
+        ('__\u53cc\u4e0b\u5212\u7ebf__', '\u53cc\u4e0b\u5212\u7ebf'),
+        ('- \u5217\u8868\u9879', '\u5217\u8868\u9879'),
+        ('# \u6807\u9898\u9879', '\u6807\u9898\u9879'),
+        ('`\u4ee3\u7801`', '\u4ee3\u7801'),
+    ]
+    bad = [(a, S.strip_md_markers(a)) for a, b in cases if S.strip_md_markers(a) != b]
+    check('K1 markdown 标记统一剥除（含单下划线斜体）', not bad, '%r' % bad[:2])
+
+    # --- K2 金句识别 ---
+    check('K2 markdown 斜体金句被正确识别',
+          S.is_quote_line('_\u201c\u5c0f\u7f16\u4e5f\u4e0d\u77e5\u9053\u3002\u201d_'))
+    check('K2b 带时间戳的金句被识别',
+          S.is_quote_line('[00:12:00] \u201c\u5c31\u662f\u8fd9\u6837\u3002\u201d'))
+    check('K2c 普通正文不被误判为金句',
+          not S.is_quote_line('[00:12:00] \u5c81\u5df1\u611f\u8c22\u997c\u5e72\u5c81\u9001\u51fa\u7684\u793c\u7269\u3002'))
+
+    # --- K3 提示词回显识别 ---
+    leak = '\u201c\u8f93\u5165\u6587\u672c\u6bcf\u4e00\u884c\u90fd\u4ee5 [HH:MM:SS] \u5f00\u5934\uff0c\u8868\u793a\u8be5\u53e5\u5728\u672c\u573a\u76f4\u64ad\u4e2d\u7684\u7edd\u5bf9\u65f6\u95f4\uff1b\u8bf7\u636e\u6b64\u6807\u6ce8\u65f6\u95f4\u3002\u201d'
+    check('K3 模型回显的提示词被抓出', bool(S.prompt_leak_hits(leak)))
+    check('K3b 金句含「你是」等普通词不被误杀',
+          not S.prompt_leak_hits('\u201c\u4f60\u662f\u4e00\u4e2a\u5f88\u597d\u5f88\u597d\u7684\u997c\u3002\u201d'))
+
+    # --- K4 元话语识别 ---
+    check('K4 模型开场白被识别',
+          S.is_meta_line('\u597d\u7684\uff0c\u8fd9\u662f\u5bf9\u8f93\u5165\u6587\u672c\u8fdb\u884c\u5206\u6bb5\u91cd\u7ec4\u4e0e\u7cbe\u7ec3\u603b\u7ed3\u540e\u7684\u5185\u5bb9\uff1a'))
+    check('K4b 「以下是…内容：」被识别',
+          S.is_meta_line('\u4ee5\u4e0b\u662f\u6839\u636e\u60a8\u7684\u8981\u6c42\u5bf9\u8f93\u5165\u6587\u672c\u8fdb\u884c\u5206\u6bb5\u91cd\u7ec4\u4e0e\u7cbe\u70bc\u603b\u7ed3\u7684\u5185\u5bb9\uff1a'))
+    check('K4c 正常短句不被误判为元话语',
+          not S.is_meta_line('\u5c81\u5df1\u611f\u8c22\u997c\u5e72\u5c81\u9001\u51fa\u7684\u793c\u7269\u3002'))
+
+    # --- K5 append_section 端到端：金句落灰色斜体、异常行不落盘 ---
+    d = Document()
+    seg = ('[00:00:10] \u5c81\u5df1\u5f00\u573a\u3002\n'
+           '\u201c\u6b63\u5e38\u91d1\u53e5\u3002\u201d\n'
+           '_\u201cmarkdown \u91d1\u53e5\u3002\u201d_\n'
+           '\u597d\u7684\uff0c\u8fd9\u662f\u5bf9\u8f93\u5165\u6587\u672c\u8fdb\u884c\u5206\u6bb5\u91cd\u7ec4\u4e0e\u7cbe\u7ec3\u603b\u7ed3\u540e\u7684\u5185\u5bb9\uff1a\n'
+           '\u201c\u8f93\u5165\u6587\u672c\u6bcf\u4e00\u884c\u90fd\u4ee5 [HH:MM:SS] \u5f00\u5934\uff0c'
+           '\u8868\u793a\u8be5\u53e5\u5728\u672c\u573a\u76f4\u64ad\u4e2d\u7684\u7edd\u5bf9\u65f6\u95f4\uff1b\u8bf7\u636e\u6b64\u6807\u6ce8\u65f6\u95f4\u3002\u201d')
+    dropped = S.append_section(d, '\u6d4b\u8bd5\u573a\u6b21', [], [seg],
+                               '\u601d\u6e90\u5b8b\u4f53CN Light', True, log=quiet)
+    txts = [p.text for p in d.paragraphs]
+    joined = '\n'.join(txts)
+    check('K5 提示词回显未写入文档',
+          '\u8f93\u5165\u6587\u672c\u6bcf\u4e00\u884c\u90fd\u4ee5' not in joined)
+    check('K5b 元话语未写入文档',
+          '\u597d\u7684\uff0c\u8fd9\u662f\u5bf9\u8f93\u5165\u6587\u672c' not in joined)
+    check('K5c dropped 记录了被拦截的行', len(dropped) >= 2, 'dropped=%d' % len(dropped))
+    quotes = [p for p in d.paragraphs if S.is_quote_line(p.text)]
+    all_ok = bool(quotes) and all(
+        q.runs and q.runs[0].italic and not q.runs[0].bold
+        and str(q.runs[0].font.color.rgb).upper() == '666666' for q in quotes)
+    check('K5d 金句全部落灰色斜体（不再是粗体）', all_ok,
+          '金句数=%d' % len(quotes))
+    md_left = [t for t in txts if '_' in t and S.is_quote_line(t)]
+    check('K5e 金句不再残留 markdown 下划线', not md_left, '%r' % md_left[:2])
+
+    # --- K6 热词词边界（NPC 不得命中 PC） ---
+    check('K6 英文原词按词边界匹配（NPC 不命中 PC）',
+          not HC._has_residue('\u6211\u9047\u89c1\u4e86NPC\u96f7\u5a1c', 'PC'))
+    check('K6b 独立的英文原词仍能命中',
+          HC._has_residue('\u6211\u5728PC\u7aef\u73a9', 'PC'))
+    check('K6c 中文原词用子串匹配',
+          HC._has_residue('\u997c\u5e72\u788e\u4f60\u597d', '\u997c\u5e72\u788e'))
+
+    # --- K7 文档体检：能查出并修复"金句被加粗"与"异常内容" ---
+    path = os.path.join(tmp, 'health.docx')
+    hd = Document()
+    hd.add_paragraph('\u6d4b\u8bd5\u573a\u6b21 2026\u5e7409\u670823\u65e5 20\u70b9\u573a')
+    p = hd.add_paragraph()
+    r = p.add_run('\u201c\u6211\u662f\u91d1\u53e5\u4f46\u88ab\u52a0\u7c97\u4e86\u3002\u201d')
+    r.bold = True
+    r.font.size = Pt(11)
+    hd.add_paragraph('\u597d\u7684\uff0c\u8fd9\u662f\u5bf9\u8f93\u5165\u6587\u672c\u8fdb\u884c\u5206\u6bb5\u91cd\u7ec4\u4e0e\u7cbe\u7ec3\u603b\u7ed3\u540e\u7684\u5185\u5bb9\uff1a')
+    hd.save(path)
+
+    rep = HC.check_doc(path, [], [], fix=False, log=quiet)
+    check('K7 体检能查出金句格式与异常内容',
+          rep['counts']['quote_format'] >= 1 and rep['counts']['abnormal'] >= 1,
+          'counts=%r' % rep['counts'])
+    rep2 = HC.check_doc(path, [], [], fix=True, log=quiet)
+    hd2 = Document(path)
+    q2 = [x for x in hd2.paragraphs if S.is_quote_line(x.text)]
+    fixed_ok = bool(q2) and q2[0].runs[0].italic and not q2[0].runs[0].bold
+    check('K7b 修复后金句变灰色斜体', fixed_ok)
+    left = '\n'.join(x.text for x in hd2.paragraphs)
+    check('K7c 修复后异常内容已删除',
+          '\u597d\u7684\uff0c\u8fd9\u662f\u5bf9\u8f93\u5165\u6587\u672c' not in left)
+    check('K7d 修复过程留了 .bak 备份', os.path.exists(path + '.bak'))
+    check('K7e 修复后不留 .part', not os.path.exists(path + '.part'))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -641,6 +750,7 @@ def main():
         test_cleanup_lock(tmp, args.verbose)
         test_ffmpeg_part_output(tmp, args.verbose)
         test_hotwords(tmp, args.verbose)
+        test_docx_healthcheck(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
