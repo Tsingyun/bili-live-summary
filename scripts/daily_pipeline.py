@@ -66,6 +66,7 @@ import summarize_gemini as S
 import regen_gemini_v2 as R
 import cleanup
 import bili_upload
+import cleanup_originals  # 压完删原始 FLV 的闭环清扫（run_sweep）
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1311,6 +1312,12 @@ def main():
         cu = cleanup.cfg_cleanup(cfg)
         if cu.get('enabled', True) and cu.get('sweep_on_start', True):
             cleanup.sweep(cfg, log, dry_run=args.dry_run)
+        # 开跑前也扫一遍：补删上一轮（被宿主回收/中断）残留的「已压缩原文」
+        # —— 这是"压完却漏删"的根因缺口，见 cleanup_originals.run_sweep
+        try:
+            cleanup_originals.run_sweep(cfg, log, dry_run=args.dry_run)
+        except Exception as e:
+            log.error('开跑前原始FLV清扫异常（不影响后续）：%s' % e)
         if not args.dry_run:
             cleanup.check_disk_guard(cfg, log, dry_run=False)
 
@@ -1396,9 +1403,9 @@ def main():
                 fname = session_fname(s['live_date'], s['clean_title'], s['hour'],
                                       s.get('date_seq', s['chain_index']))
                 try:
-                ok = process_video_source(cfg, st, src, s['live_date'].isoformat(),
-                                         fname, 'local', log, progress,
-                                         member_files=s['member_files'])
+                    ok = process_video_source(cfg, st, src, s['live_date'].isoformat(),
+                                             fname, 'local', log, progress,
+                                             member_files=s['member_files'])
                     if ok:
                         mark_local_done(st, cfg, s, fname)
                 except KeyboardInterrupt:
@@ -1442,6 +1449,12 @@ def main():
                 cleanup.sweep(cfg, log, dry_run=args.dry_run)
         except Exception as e:
             log('收尾清扫失败（不影响交付物）：%s' % e, 'WARN')
+        # 收尾补扫：本回合（含历史遗留）压出 _compressed 的原始 FLV 一律删掉
+        # —— 漏删必删，杜绝"压完却堆着原始FLV 最后靠手动删"的事故
+        try:
+            cleanup_originals.run_sweep(cfg, log, dry_run=args.dry_run)
+        except Exception as e:
+            log('原始FLV清扫失败（不影响交付物）：%s' % e, 'WARN')
 
         log('daily_pipeline 本次完成')
     except KeyboardInterrupt:
