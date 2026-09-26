@@ -65,6 +65,7 @@ import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
 import cleanup
+import bili_upload
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -315,8 +316,16 @@ def scan_root_sessions(cfg, log):
                 continue
             if not fn.lower().endswith(MEDIA_EXT):
                 continue
-            # 压缩产物不是新录播（默认正则的 title 组会吃掉 _compressed 从而误匹配）
-            if re.sub(r'\.\w+$', '', fn).lower().endswith('_compressed'):
+            low = fn.lower()
+            # 排除压缩/合并产物及其半成品（2026-09-26 修复）：
+            #  · 任意含 .part 的残留（压缩/合并被杀留下的 *.part.mp4）绝不能当新录播，
+            #    否则会被 is_file_stable 误判成「录制中」，导致整场被永久跳过、源永不删；
+            #  · 去掉全部尾缀扩展名后仍以 _compressed / _merged 结尾的（如
+            #    xxx_compressed.mp4、xxx_merged_compressed.mp4、xxx_merged.mp4）也排除。
+            if '.part' in low:
+                continue
+            core = re.sub(r'(\.\w+)+$', '', fn)
+            if core.lower().endswith('_compressed') or core.lower().endswith('_merged'):
                 continue
             if fn in seen:
                 continue
@@ -610,10 +619,18 @@ def merge_videos(cfg, log, session, out_path):
         ffprobe = None
 
     members = list(session['member_files'])
-    for p in members:
-        if not os.path.exists(p) or os.path.getsize(p) <= 0:
-            _log_err(log, '[merge] 成员文件缺失或为空，放弃合并：%s' % os.path.basename(p))
-            return None
+    # ★ 2026-09-26 修复：录制中断会留下 0 字节占位片段，concat 对空文件会失败。
+    #   直接丢弃空成员（它们不含任何内容），仅当全部为空才放弃合并。
+    nonempty = [p for p in members if os.path.exists(p) and os.path.getsize(p) > 0]
+    if len(nonempty) < len(members):
+        dropped = [os.path.basename(p) for p in members if p not in nonempty]
+        log('[merge] 丢弃 %d 个空片段(0字节,疑似录制中断残留)：%s'
+            % (len(dropped), ', '.join(dropped)), 'WARN')
+    members = nonempty
+    if not members:
+        _log_err(log, '[merge] 所有成员均为空文件，放弃合并：%s'
+                 % ', '.join(os.path.basename(p) for p in session['member_files']))
+        return None
 
     exp = _sum_dur(cfg, members)
     min_dur = exp * 0.95 if exp > 0 else 0.0
@@ -792,7 +809,7 @@ def extract_16k_audio(cfg, log, src, dst):
     log('  音频抽取完成（%.0fs）' % (time.time() - t0))
 
 
-def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, progress):
+def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, progress, member_files=None):
     """对单个视频源跑完整总结流水线，返回 True/False。
 
     src_kind: 'local' 或 'bilibili'（影响压缩后是否删除原文件、占位写法）。
@@ -855,6 +872,7 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     local_root = (cfg.get('local') or {}).get('root') or ''
     cc = cfg.get('compress') or {}
     bz = cfg.get('bilibili') or {}
+    compressed_path = None  # 压缩产物路径，供「步骤6 上传小号」使用
     try:
         if src_kind in ('local', 'darkpy') and cc.get('enabled', True):
             replace = cc.get('replace_original', False) and src_kind == 'local'
@@ -862,8 +880,9 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
                 # rec站源在临时目录，压缩成功后源文件按本地规则删除（省盘）；
                 # 压缩失败则保留，下次重跑时 merge 幂等跳过、直接续压。
                 replace = cc.get('replace_original', False)
-            compress_video.compress_video(cfg, log, src_video, replace_original=replace,
-                                          archive_root=local_root or None)
+            compressed_path = compress_video.compress_video(cfg, log, src_video, replace_original=replace,
+                                          archive_root=local_root or None,
+                                          orig_members=(member_files if src_kind == 'local' else None))
         elif src_kind in ('darkpy', 'bilibili'):
             log('[compress] %s 源：compress.enabled=false，按 B站规则保留原始 MP4 不压缩' % src_kind)
             if bz.get('keep_mp4', True):
@@ -901,6 +920,28 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         RD.reorder(S.doc_path_for(cfg, live_date))
     except Exception as e:
         log('重排 Word 失败（不影响总结）：%s' % e)
+
+    # 步骤 6（可选）：上传压缩副本到 B站小号
+    #   · 默认直接传现有 HEVC 副本（用户 2026-09-26 确认：先拿真实 HEVC 录播试传，
+    #     H.264 转码仅作兜底，block_hevc=true 才阻断）；
+    #   · 失败不影响总结成品：TXT/SRT/Word/MP3/压缩 MP4 已全部落盘，state 占位照写，
+    #     下次重跑时只补做上传（幂等，已上传标记会跳过）。
+    try:
+        uc = bili_upload.load_upload_cfg(cfg)
+        if uc.get('enabled'):
+            up_src = compressed_path if (compressed_path and os.path.exists(compressed_path)) \
+                else (src_video if src_kind == 'bilibili' else None)
+            if up_src and os.path.exists(up_src):
+                cookies = load_cookies(cfg['paths'].get('cookies'))
+                bili_upload.upload_one(cfg, log, uc, up_src,
+                                       {'date_iso': date_iso, 'fname': fname,
+                                        'src_kind': src_kind}, cookies, st=st)
+            else:
+                log('[upload] 无可上传视频（压缩产物缺失且非 B站源），跳过', 'WARN')
+        else:
+            log('[upload] 未启用（upload.enabled=false）')
+    except Exception as e:
+        _log_err(log, '[upload] 上传小号异常（不影响总结成品）：%s' % e)
     return True
 
 
@@ -1355,8 +1396,9 @@ def main():
                 fname = session_fname(s['live_date'], s['clean_title'], s['hour'],
                                       s.get('date_seq', s['chain_index']))
                 try:
-                    ok = process_video_source(cfg, st, src, s['live_date'].isoformat(),
-                                             fname, 'local', log, progress)
+                ok = process_video_source(cfg, st, src, s['live_date'].isoformat(),
+                                         fname, 'local', log, progress,
+                                         member_files=s['member_files'])
                     if ok:
                         mark_local_done(st, cfg, s, fname)
                 except KeyboardInterrupt:

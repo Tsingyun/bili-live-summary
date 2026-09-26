@@ -62,7 +62,7 @@ def _audio_codec_of(ffprobe, src):
         return ''
 
 
-def compress_video(cfg, log, src_video, replace_original=False, archive_root=None):
+def compress_video(cfg, log, src_video, replace_original=False, archive_root=None, orig_members=None):
     """把 src_video 用 hevc_nvenc 压成更小的归档副本。
 
     返回输出文件路径；未启用 / 源不存在 / 转换失败返回 None。
@@ -237,6 +237,20 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     # replace_original：压缩成功后按需处理原文件（replace_mode 决定方式）
     if replace:
         ok = _replace_by_mode(cfg, log, src_video, out)
+        if ok and orig_members:
+            # ★ 2026-09-26 修复：多段合并场次 src_video 只是合并中间文件，原始 FLV 分段
+            #   从未被碰过 → 每天堆积。压缩成功后一并删除原始分段（压缩产物已校验完整）。
+            for m in orig_members:
+                try:
+                    if os.path.abspath(m) == os.path.abspath(out):
+                        continue
+                    if force_unlink(m, log):
+                        log('[compress] 已删除原始分段（压缩版已就绪）：%s' % os.path.basename(m))
+                    else:
+                        log.error('[compress] 删除原始分段失败（会持续占磁盘）：%s'
+                                  % os.path.basename(m))
+                except Exception as e:
+                    log.error('[compress] 删除原始分段异常：%s' % e)
         if not ok:
             log('[compress] 原文件保留（压缩版已就绪）：%s' % os.path.basename(out))
     return out
