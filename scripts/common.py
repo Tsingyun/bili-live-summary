@@ -272,27 +272,35 @@ def _ps_remove(path, is_dir):
         return False, '%s: %s' % (type(e).__name__, str(e)[:200])
 
 
-def force_unlink(path, log=None):
-    """强制删除单个文件（os.remove → PowerShell 降级）。存在与否都返回是否「已不存在」。"""
+def force_unlink(path, log=None, retries=5, delay=4.0):
+    """强制删除单个文件（os.remove → PowerShell 降级），对「文件被占用」等瞬时锁做重试。
+
+    存在与否都返回是否「已不存在」。环境层会把 os.remove 转成软删（进回收站），
+    若此时文件被直播录制器等进程占用，删除会失败——此处重试若干次，给占用方释放时间；
+    仍失败则保留文件并返回 False（绝不误删），留待后续 run_sweep 兜底清扫。
+    """
     if not path or not os.path.lexists(path):
         return True
-    try:
-        os.remove(path)
-        if not os.path.lexists(path):
+    last_err = ''
+    for attempt in range(retries + 1):
+        removed = False
+        try:
+            os.remove(path)
+            removed = not os.path.lexists(path)
+        except Exception as e1:
+            ok, err = _ps_remove(path, False)
+            last_err = '%s | %s' % (e1, err)
+            removed = ok and not os.path.lexists(path)
+        if removed:
             return True
-    except Exception as e1:
-        ok, err = _ps_remove(path, False)
-        if ok and not os.path.lexists(path):
-            return True
-        if log:
-            log('删除失败 %s：%s | %s' % (path, e1, err), 'WARN')
-        return False
-    # os.remove 没抛错但文件还在（罕见）——同样降级
-    ok, err = _ps_remove(path, False)
-    if not os.path.lexists(path):
-        return True
+        if attempt < retries:
+            if log:
+                log('删除被占用，重试 %d/%d：%s' % (attempt + 1, retries, os.path.basename(path)), 'WARN')
+            time.sleep(delay)
+            continue
+        break
     if log:
-        log('删除失败 %s：%s' % (path, err), 'WARN')
+        log('删除失败 %s：%s' % (path, last_err), 'WARN')
     return False
 
 

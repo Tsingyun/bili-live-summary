@@ -211,7 +211,7 @@ def _norm_dtime(uc, submit_ts):
     h = float(uc.get('dtime_hours') or 0)
     if h <= 0:
         return None
-    import datetime
+    submit_ts = submit_ts or int(time.time())
     dt = submit_ts + max(4.1 * 3600, h * 3600)
     upper = submit_ts + 15 * 24 * 3600
     dt = min(dt, upper)
