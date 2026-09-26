@@ -262,10 +262,8 @@ def _req_json(s, method, url, *, params=None, headers=None, data=None, json_body
     raise RuntimeError('请求失败 %s: %s' % (url, last))
 
 
-def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
-    """完整投稿链路（bilibili-API-collect 文档）：preupload→元数据→分片→结束→发布。"""
-    s = _new_session(uc)
-    s.cookies.update(cookies)
+def _upload_one_file(s, log, uc, video_path, cookies, submit_ts):
+    """投稿链路前 4 步（preupload→元数据→分片→结束），返回 (upos_basename, biz_id)。"""
     if not cookies.get('bili_jct'):
         raise RuntimeError('cookie 缺少 bili_jct（提交发布需要 CSRF）')
     size = os.path.getsize(video_path)
@@ -284,10 +282,17 @@ def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
     auth = pre['auth']
     biz_id = pre['biz_id']
     chunk_size = int(pre.get('chunk_size') or 8 * 1024 * 1024)
-    endpoint = pre['endpoint']              # 形如 //upos-cs-upcdntxa.bilivideo.com
+    endpoint = pre['endpoint']              # 形如 //upos-cs-upcdntxa.bilivideo.com（无结尾斜杠）
     upos_uri = pre['upos_uri']              # 形如 upos://ugcfx2lf/<name>
     upos_path = upos_uri[len('upos://'):] if upos_uri.startswith('upos://') else upos_uri
-    url = 'https:' + endpoint + upos_path
+    # 拼出正确的上传 URL：endpoint 与 upos_path 之间必须有一个 '/'，否则主机名会被拼接成
+    # upos-cs-xxx.bilivideo.comugcfx... 导致代理 502。
+    url = 'https:' + endpoint
+    if not url.endswith('/'):
+        url += '/'
+    if upos_path.startswith('/'):
+        upos_path = upos_path[1:]
+    url += upos_path
     log('[upload] preupload OK：biz_id=%s chunk=%d url=%s' % (biz_id, chunk_size, url))
 
     # 2) 上传元数据（拿 upload_id）
@@ -347,13 +352,15 @@ def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
     if fin.get('OK') != 1:
         raise RuntimeError('结束上传返回异常：%s' % (fin,))
     log('[upload] 结束上传 OK')
-
-    # 5) 提交发布
     filename_nohash = os.path.basename(upos_path).rsplit('.', 1)[0]
+    return filename_nohash, biz_id
+
+
+def _submit(s, log, uc, meta, videos, cookies, submit_ts):
+    """提交发布（单 P / 多 P 共用）。videos=[{filename,title,desc,cid}...]，顺序即分P顺序。"""
     body = {
         'copyright': meta['copyright'],
-        'videos': [{'filename': filename_nohash, 'title': meta['title'],
-                    'desc': meta['desc'], 'cid': biz_id}],
+        'videos': videos,
         'title': meta['title'],
         'tid': meta['tid'],
         'tag': ','.join(meta['tags']),
@@ -384,8 +391,32 @@ def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
         raise RuntimeError('提交发布失败 code=%s message=%s'
                            % (j.get('code'), j.get('message')))
     bvid = (j.get('data') or {}).get('bvid')
-    log('[upload] 发布成功：%s（tid=%s，延时发布=%s）' % (bvid, meta['tid'], dtime))
+    log('[upload] 发布成功：%s（tid=%s，延时发布=%s，分P=%d）'
+        % (bvid, meta['tid'], dtime, len(videos)))
     return bvid
+
+
+def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
+    """单文件投稿（兼容旧调用）。"""
+    s = _new_session(uc)
+    s.cookies.update(cookies)
+    fn, biz = _upload_one_file(s, log, uc, video_path, cookies, submit_ts)
+    return _submit(s, log, uc, meta,
+                   [{'filename': fn, 'title': meta['title'], 'desc': meta['desc'], 'cid': biz}],
+                   cookies, submit_ts)
+
+
+def upload_multi(cfg, log, uc, segments, meta, cookies, submit_ts=None):
+    """多 P 投稿：segments=[{path, part_title}]，列表顺序即分P顺序；流复制无损，画质不变。"""
+    s = _new_session(uc)
+    s.cookies.update(cookies)
+    videos = []
+    for idx, seg in enumerate(segments, 1):
+        log('[upload] === 分P %d/%d：%s ===' % (idx, len(segments), os.path.basename(seg['path'])))
+        fn, biz = _upload_one_file(s, log, uc, seg['path'], cookies, submit_ts)
+        videos.append({'filename': fn, 'title': seg.get('part_title', 'P%d' % idx),
+                       'desc': '', 'cid': biz})
+    return _submit(s, log, uc, meta, videos, cookies, submit_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -466,10 +497,11 @@ def upload_one(cfg, log, uc, video_path, ctx, cookies, st=None, force=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--src', default=None, help='要上传的视频路径')
+    ap.add_argument('--src', nargs='+', default=None, help='要上传的视频路径（多个=多P分P上传）')
     ap.add_argument('--config', default=None)
     ap.add_argument('--date', default='', help='直播日期 ISO（用于 state 幂等键，如 2026-09-23）')
-    ap.add_argument('--title', default=None, help='覆盖标题')
+    ap.add_argument('--title', default=None, help='覆盖总标题')
+    ap.add_argument('--part-title', nargs='+', default=None, help='各分P标题（与 --src 数量对应）')
     ap.add_argument('--dry-run', action='store_true', help='只校验 + 打印元数据，不上传')
     ap.add_argument('--check-cookie', action='store_true', help='只校验 cookie 有效性')
     ap.add_argument('--force', action='store_true', help='忽略已上传标记强制上传')
@@ -484,20 +516,61 @@ def main():
         log('cookie 校验：%s %s' % ('OK' if ok else 'FAIL', info))
         return
     if not args.src:
-        log.error('请指定 --src 或 --check-cookie')
+        log.error('请指定 --src（可多个，多P）或 --check-cookie')
         return
-    ctx = {'date_iso': args.date, 'fname': os.path.basename(args.src)}
     if args.title:
         uc['title_template'] = args.title
+    if len(args.src) == 1:
+        ctx = {'date_iso': args.date, 'fname': os.path.basename(args.src[0])}
+        if args.dry_run:
+            validate_video(cfg, uc, args.src[0], log)
+            ok, info = check_cookie(cfg, uc, log)
+            meta = build_metadata(cfg, uc, ctx)
+            log('[dry-run] 元数据：%s' % json.dumps(meta, ensure_ascii=False))
+            log('[dry-run] cookie=%s；将上传：%s' % ('OK' if ok else info, args.src[0]))
+            return
+        cookies = load_cookies(uc.get('cookies_path'))
+        bvid = upload_one(cfg, log, uc, args.src[0], ctx, cookies, st=None, force=args.force)
+        log('结果：%s' % bvid)
+        return
+    # 多 P 模式
+    segments = []
+    for i, p in enumerate(args.src):
+        if not os.path.exists(p):
+            log.error('[upload] 分P源不存在：%s' % p)
+            return
+        pt = (args.part_title[i] if args.part_title and i < len(args.part_title)
+              else 'P%d' % (i + 1))
+        segments.append({'path': p, 'part_title': pt})
+    ctx = {'date_iso': args.date, 'fname': os.path.basename(args.src[0])}
+    meta = build_metadata(cfg, uc, ctx)
     if args.dry_run:
-        validate_video(cfg, uc, args.src, log)
+        validate_video(cfg, uc, args.src[0], log)
         ok, info = check_cookie(cfg, uc, log)
-        meta = build_metadata(cfg, uc, ctx)
-        log('[dry-run] 元数据：%s' % json.dumps(meta, ensure_ascii=False))
-        log('[dry-run] cookie=%s；将上传：%s' % ('OK' if ok else info, args.src))
+        log('[dry-run] 总标题：%s' % meta['title'])
+        for i, seg in enumerate(segments):
+            log('[dry-run] 分P%d：%s | %s' % (i + 1, seg['part_title'], seg['path']))
+        log('[dry-run] cookie=%s；将上传 %d 个分P' % ('OK' if ok else info, len(segments)))
+        return
+    # 幂等：用工作目录 state.json 防重传（避免断点重跑产生重复投稿）
+    st_path = os.path.join((cfg.get('paths') or {}).get('project_root') or '.', 'state.json')
+    st = {}
+    if os.path.exists(st_path):
+        try:
+            st = json.load(open(st_path, encoding='utf-8'))
+        except Exception:
+            st = {}
+    if not args.force and args.date and is_uploaded(st, args.date):
+        log('[upload] %s 已上传（%s），跳过' % (args.date, is_uploaded(st, args.date).get('bvid')))
         return
     cookies = load_cookies(uc.get('cookies_path'))
-    bvid = upload_one(cfg, log, uc, args.src, ctx, cookies, st=None, force=args.force)
+    bvid = upload_multi(cfg, log, uc, segments, meta, cookies, submit_ts=None)
+    if bvid and args.date:
+        mark_uploaded(st, args.date, bvid, 'api')
+        try:
+            json.dump(st, open(st_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+        except Exception as e:
+            log('[upload] 写入 state 失败（不影响已发布）：%s' % e)
     log('结果：%s' % bvid)
 
 
