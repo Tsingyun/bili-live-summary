@@ -267,6 +267,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | 文件 | 职责 |
 |---|---|
 | `scripts/daily_pipeline.py` | **主编排器**：监测 → 本地/B站 → MP3 → 压缩，含锁/断点/状态写入（通用，零主播硬编码） |
+| `scripts/bili_upload.py` | **B站小号自动投稿**（2026-09-26 新增）：压缩后录播（默认直接传 HEVC 副本）投稿到 B站小号；纯 requests 实现 bilibili-API-collect 全链路，复用项目 Netscape cookie，`state['uploads']` 幂等防重，H.265/体积/时长只告警；已接入 daily_pipeline「步骤 6」 |
 | `scripts/scan_root_sessions`（在 daily_pipeline 内） | 根目录监测 + **全局按时间排序、间隙阈值切分场次**（跨午夜归前一场）+ 合并 + 录制中跳过；合并依赖外部命令 ffmpeg/ffprobe，缺失时显式报错并降级/跳过 |
 | `scripts/transcribe.py` | FunASR 转写（带时间轴 TXT/SRT），`chunk_hours_threshold` 切块 |
 | `scripts/hotwords.py` | 转写后热词替换（**固定流程「转写→热词→总结」第 2 步**）：路径相对工作目录解析、保护词占位防误伤、长词优先、原子写回；`--audit` 审计空转/冲突/危险级联 |
@@ -284,7 +285,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/cleanup.py` | **垃圾清理器**：按保留天数清扫中间产物、清孤儿下载/ASR切块、磁盘水位检查（`sweep`/`after_session`/`check_disk_guard`/`report`） |
 | `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
 | `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 起每 60 分钟、持续 3 小时，交互式免提权，正在跑时不强杀） |
-| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，72 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**、**金句格式/异常内容过滤/文档体检**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
+| `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，85 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**、**金句格式/异常内容过滤/文档体检**、**小号上传模块纯逻辑（[L]，2026-09-26）**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
 | `scripts/docx_healthcheck.py` | **Word 成品体检与修复**（2026-09-24 新增）：① 格式（金句=灰色斜体/正文=粗体）② markdown 残留 ③ 提示词回显与元话语 ④ 热词表原词回扫 ⑤ 结构提示。`--fix` 就地修复（留 `.bak`）。已接入 `daily_pipeline` 收尾步骤 4 自动执行 |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |
 

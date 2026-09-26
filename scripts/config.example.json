@@ -158,5 +158,29 @@
     "danmakus_api": "",
     "uid": 0,
     "lookback_days": 45
+  },
+  "upload": {
+    "_comment": "★ 2026-09-26 新增：把压缩后的录播自动投稿到 B站「小号」。默认直接传现有 HEVC 副本（先试传，H.264 转码仅作兜底）。backend=api 复用项目既有的 Netscape cookie 文件（paths.cookies）；backend=biliup 需另行提供 biliup 生成的 cookie.json。enabled=false 时完全不触发上传。",
+    "enabled": false,
+    "backend": "api",
+    "biliup_bin": "",
+    "biliup_cookie_json": "",
+    "cookies_path": "",
+    "tid": 171,
+    "tags": ["直播回放", "虚拟主播", "岁己"],
+    "copyright": 1,
+    "title_template": "{streamer} {live_date} 直播回放",
+    "desc_template": "",
+    "dynamic": "",
+    "source": "",
+    "no_reprint": 1,
+    "dtime_hours": 6,
+    "line": "AUTO",
+    "proxy": "",
+    "max_retries": 3,
+    "retry_delay": 10,
+    "block_hevc": false,
+    "max_size_gb_warn": 4,
+    "max_duration_hour_warn": 5
   }
 }

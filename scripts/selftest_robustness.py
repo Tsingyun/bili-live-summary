@@ -12,6 +12,8 @@
   F. docx 原子保存 + 主文档损坏时回退 .bak
   G. 压缩产物完整性门禁：时长不足的 "_compressed.mp4" 不得被当成已完成
      （这道门禁同时保护"删源视频"——旧逻辑会把完好源删掉、留下残片）
+  L. 小号上传模块纯逻辑：默认值/元数据渲染与截断/延时发布夹取/幂等/缺 cookie 优雅失败
+     （2026-09-26 新增，8 项）
 
 用法
 ----
@@ -735,6 +737,73 @@ def test_docx_healthcheck(tmp, v):
     check('K7e 修复后不留 .part', not os.path.exists(path + '.part'))
 
 
+def test_bili_upload(tmp, v):
+    """[L] 2026-09-26 新增：小号上传模块纯逻辑（默认值/元数据/延时夹取/幂等/缺 cookie 优雅失败）。"""
+    print('\n[L] 小号上传模块纯逻辑（无需联网/cookie）')
+
+    class _Log:
+        def __call__(self, *a, **k):
+            pass
+
+        def error(self, *a, **k):
+            pass
+
+    try:
+        import bili_upload as BU
+    except Exception as e:
+        check('L0 导入 bili_upload', False, str(e))
+        return
+    cfg = {'summarize': {'streamer': '岁己'}, 'paths': {'cookies': 'C:/nope_bili.txt'}}
+    uc = BU.load_upload_cfg(cfg)
+    check('L1 默认 enabled=false / backend=api', (uc['enabled'] is False and uc['backend'] == 'api'))
+    check('L1b streamer 取自 summarize', uc['streamer'] == '岁己')
+
+    # 元数据：标题模板渲染 + 80 字截断 + 标签 ≤10
+    meta = BU.build_metadata(cfg, uc, {'date_iso': '2026-09-23',
+                                      'fname': '录制-25788785-20260923-220000-1-晚场_compressed.mp4'})
+    check('L2 标题模板渲染', meta['title'] == '岁己 2026-09-23 直播回放', meta['title'])
+    check('L2b copyright 默认自制', meta['copyright'] == 1)
+    uc2 = dict(uc)
+    uc2['title_template'] = '{title}' + 'x' * 100
+    meta2 = BU.build_metadata({'summarize': {'streamer': '岁己'}}, uc2, {'fname': 'abc.mp4'})
+    check('L2c 标题截断到 80 字', len(meta2['title']) <= 80, 'len=%d' % len(meta2['title']))
+    uc3 = dict(uc)
+    uc3['tags'] = ['t%d' % i for i in range(15)]
+    meta3 = BU.build_metadata({'summarize': {'streamer': '岁己'}}, uc3, {'fname': 'abc.mp4'})
+    check('L2d 标签被截到 ≤10', len(meta3['tags']) <= 10, 'n=%d' % len(meta3['tags']))
+
+    # 延时发布夹取到合法区间（>4.1h 且 ≤15d）
+    d1 = BU._norm_dtime(uc, 1_000_000_000)
+    check('L3 dtime 默认 6h 落在合法区间（>4.1h）',
+          1_000_000_000 + 4.1 * 3600 < d1 <= 1_000_000_000 + 15 * 86400, 'd1=%s' % d1)
+    uc_neg = dict(uc)
+    uc_neg['dtime_hours'] = 0
+    check('L3b dtime=0 返回 None（不延时）', BU._norm_dtime(uc_neg, 1_000_000_000) is None)
+
+    # 缺 cookie 优雅失败（不抛异常）
+    ok, info = BU.check_cookie(cfg, uc, _Log())
+    check('L4 缺 cookie 文件 → (False, error)', (ok is False and 'error' in info))
+    uc_b = dict(uc)
+    uc_b['backend'] = 'biliup'
+    uc_b['biliup_cookie_json'] = 'C:/nope.json'
+    ok2, info2 = BU.check_cookie(cfg, uc_b, _Log())
+    check('L4b backend=biliup 缺 json → (False, error)', (ok2 is False and 'error' in info2))
+
+    # 幂等：mark → is_uploaded
+    st = {}
+    BU.mark_uploaded(st, '2026-09-23', 'BVtest', 'api')
+    rec = BU.is_uploaded(st, '2026-09-23')
+    check('L5 mark/is_uploaded 幂等记录', rec and rec.get('bvid') == 'BVtest'
+          and rec.get('backend') == 'api')
+    check('L5b 未上传日期返回 None', BU.is_uploaded(st, '2026-09-24') is None)
+
+    # upload_one：源文件不存在 → 返回 None 不抛异常
+    r = BU.upload_one({'summarize': {'streamer': '岁己'}, 'paths': {'cookies': 'C:/nope.txt'}},
+                      _Log(), uc, 'C:/nope_src.mp4',
+                      {'date_iso': '2026-09-23', 'fname': 'x.mp4'}, {}, st=None, force=False)
+    check('L6 upload_one 源不存在 → 返回 None 不抛异常', r is None)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -751,6 +820,7 @@ def main():
         test_ffmpeg_part_output(tmp, args.verbose)
         test_hotwords(tmp, args.verbose)
         test_docx_healthcheck(tmp, args.verbose)
+        test_bili_upload(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

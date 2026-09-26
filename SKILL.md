@@ -351,11 +351,11 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ```bash
 # ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
-# 72 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、
-#        ffmpeg .part 输出、热词替换、金句格式/异常内容过滤/文档体检
+# 85 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、
+#        ffmpeg .part 输出、热词替换、金句格式/异常内容过滤/文档体检、小号上传模块纯逻辑（[L]）
 ```
 离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
-预期输出结尾为 `通过 72 项，失败 0 项`；若不是 72/72，先确认解释器是否用错，再查代码。
+预期输出结尾为 `通过 85 项，失败 0 项`；若不是 85/85，先确认解释器是否用错，再查代码。
 
 ### 7. 产物质量门禁：Word 写完自动体检并修复（2026-09-24）
 
@@ -442,7 +442,7 @@ python scripts/docx_healthcheck.py --doc "C:/.../岁己直播总结_2026年9月.
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
-- `selftest_robustness.py` 健壮性回归自测（离线，72 项），详见「健壮性加固」第 6 节
+- `selftest_robustness.py` 健壮性回归自测（离线，85 项），详见「健壮性加固」第 6 节
 - `docx_healthcheck.py` Word 成品体检与修复（格式/异常内容/热词），详见「健壮性加固」第 7 节；已接入每日流程收尾
 - `hotwords.py --audit` 审计当前生效的热词表（空转 / 冲突 / 危险级联）；`hotwords.py --text "..."` 演示单条替换
 - `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果
