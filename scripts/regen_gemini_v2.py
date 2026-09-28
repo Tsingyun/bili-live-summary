@@ -187,6 +187,8 @@ class GeminiRotator:
         self.backoff_transient = backoff_transient  # 5xx/网络/空响应/非JSON：短退避，很快回头
         self.backoff_429 = backoff_429              # 限流/配额：中等退避
         self.backoff_dead = backoff_dead            # 404/达上限：本轮停用
+        self.provider_tag = 'Gemini'  # 日志前缀（model_router 混合路由器覆盖为 '模型'）
+        self._last_finish = ''        # 最近一次响应 finishReason（空响应日志用）
 
     def _rpm_wait(self):
         now = time.time()
@@ -214,7 +216,7 @@ class GeminiRotator:
             return requests.post(url, headers=headers, json=payload, timeout=to, proxies=self.proxies)
         except requests.exceptions.ConnectionError:
             if self.proxies:
-                self.log('  [Gemini] 代理连接失败，回退直连重试')
+                self.log(f'  [{self.provider_tag}] 代理连接失败，回退直连重试')
                 return requests.post(url, headers=headers, json=payload, timeout=to, proxies=None)
             raise
 
@@ -229,7 +231,7 @@ class GeminiRotator:
         soonest = min(self.down_until.get(m, 0) for m in self.models)
         wait = soonest - now + 0.5
         if wait > 0:
-            self.log(f'  [Gemini] 全部模型退避中，等待 {wait:.0f}s')
+            self.log(f'  [{self.provider_tag}] 全部模型退避中，等待 {wait:.0f}s')
             time.sleep(wait)
         return min(self.models, key=lambda m: self.down_until.get(m, 0))
 
@@ -240,6 +242,25 @@ class GeminiRotator:
     def _mark_up(self, model):
         """清除某模型的退避（成功或恢复后）。"""
         self.down_until.pop(model, None)
+
+    def cap_for(self, model):
+        """单模型本轮成功调用上限（子类按 provider 差异化，如魔搭 450/日）。"""
+        return self.max_per_model
+
+    def _extract_text(self, model, r):
+        """从 200 响应提取正文。默认解析 Gemini generateContent 格式；
+        model_router.MultiProviderRotator 覆写为 OpenAI 兼容格式。
+        返回 '' = 无正文（非 JSON / 空候选），由 call() 统一按空响应处理。"""
+        self._last_finish = ''
+        try:
+            d = r.json()
+        except Exception as e:
+            self.log(f'  [{self.provider_tag}] {model} 响应非 JSON：{e}')
+            return ''
+        cand = (d.get('candidates') or [{}])[0]
+        self._last_finish = cand.get('finishReason') or ''
+        parts = (cand.get('content') or {}).get('parts') or []
+        return ''.join(p.get('text', '') for p in parts).strip()
 
     def call(self, system_prompt, user_content, tag='', max_attempts=None):
         """请求一次总结；失败降级，但降级是『退避 + 回头』而非永久抛弃：
@@ -264,15 +285,15 @@ class GeminiRotator:
             model = self._pick()
             self.idx = self.models.index(model)
             attempts += 1
-            self.log(f'  [Gemini] {tag} 模型={model}'
-                     f'（已用 {self._used.get(model, 0)}/{self.max_per_model}，'
+            self.log(f'  [{self.provider_tag}] {tag} 模型={model}'
+                     f'（已用 {self._used.get(model, 0)}/{self.cap_for(model)}，'
                      f'尝试 {attempts}/{budget}）')
             try:
                 r = self._post(model, system_prompt, user_content)
             except Exception as e:
                 # 网络层异常：不降级（多半是链路问题），退避后重试同一模型
                 last_err = f'{model} 请求异常 {type(e).__name__}: {e}'
-                self.log(f'  [Gemini] {last_err}，退避重试')
+                self.log(f'  [{self.provider_tag}] {last_err}，退避重试')
                 time.sleep(min(5 * attempts, 30))
                 continue
 
@@ -282,31 +303,22 @@ class GeminiRotator:
                 self._ts = self._ts[-self.rpm:]
 
             if r.status_code == 200:
-                try:
-                    d = r.json()
-                except Exception as e:
-                    last_err = f'{model} 响应非 JSON：{e}'
-                    self.log(f'  [Gemini] {last_err}，退避后转下一可用模型')
-                    self._mark_down(model, self.backoff_transient)
-                    continue
-                cand = (d.get('candidates') or [{}])[0]
-                parts = (cand.get('content') or {}).get('parts') or []
-                text = ''.join(p.get('text', '') for p in parts).strip()
+                text = self._extract_text(model, r)
                 if text:
                     self._empty[model] = 0
                     self._used[model] = self._used.get(model, 0) + 1
                     self._mark_up(model)
-                    if self._used[model] >= self.max_per_model:
-                        self.log(f'  [Gemini] {model} 已达 {self.max_per_model} 次，本轮停用')
+                    if self._used[model] >= self.cap_for(model):
+                        self.log(f'  [{self.provider_tag}] {model} 已达 {self.max_per_model} 次，本轮停用')
                         self._mark_down(model, self.backoff_dead)
                     return text
                 # 空响应：同一模型最多容忍 3 次，之后退避（防死循环，回头重试）
                 self._empty[model] = self._empty.get(model, 0) + 1
-                last_err = (f'{model} 空响应 finishReason={cand.get("finishReason")}'
+                last_err = (f'{model} 空响应 finishReason={self._last_finish or "?"}'
                             f'（第 {self._empty[model]} 次）')
-                self.log(f'  [Gemini] {last_err}')
+                self.log(f'  [{self.provider_tag}] {last_err}')
                 if self._empty[model] >= 3:
-                    self.log(f'  [Gemini] {model} 连续空响应，退避')
+                    self.log(f'  [{self.provider_tag}] {model} 连续空响应，退避')
                     self._mark_down(model, self.backoff_transient)
                     time.sleep(1)
                 else:
@@ -314,26 +326,26 @@ class GeminiRotator:
                 continue
             elif r.status_code == 429:
                 last_err = f'{model} HTTP 429 配额/限流'
-                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
+                self.log(f'  [{self.provider_tag}] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
                 self._mark_down(model, self.backoff_429)
                 continue
             elif r.status_code == 404:
                 last_err = f'{model} HTTP 404 不可用'
-                self.log(f'  [Gemini] {last_err}，本轮停用')
+                self.log(f'  [{self.provider_tag}] {last_err}，本轮停用')
                 self._mark_down(model, self.backoff_dead)
                 continue
             elif r.status_code in (500, 503, 504):
                 last_err = f'{model} HTTP {r.status_code}'
-                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
+                self.log(f'  [{self.provider_tag}] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
                 self._mark_down(model, self.backoff_transient)
                 time.sleep(min(8 * attempts, 60))
                 continue
             else:
                 last_err = f'{model} HTTP {r.status_code}: {r.text[:200]}'
-                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型')
+                self.log(f'  [{self.provider_tag}] {last_err}，退避后转下一可用模型')
                 self._mark_down(model, self.backoff_transient)
                 continue
-        self.log(f'  [Gemini] 尝试 {attempts} 次后仍不可用：{last_err}')
+        self.log(f'  [{self.provider_tag}] 尝试 {attempts} 次后仍不可用：{last_err}')
         return ''
 
 

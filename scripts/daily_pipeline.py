@@ -64,6 +64,7 @@ import backfill
 import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
+import model_router as MR  # Gemini + ModelScope 混合模型路由
 import cleanup
 import bili_upload
 import cleanup_originals  # 压完删原始 FLV 的闭环清扫（run_sweep）
@@ -846,8 +847,7 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     # 3) Gemini 逐 30 分钟块总结 → 写 Word（含章节元数据 + 话题分隔线）
     sys_prompt = R.load_prompt(cfg)
     font = cfg['output'].get('font', '思源宋体CN Light')
-    rot = R.GeminiRotator(R.get_api_key(cfg), cfg['summarize'].get('proxy') or R.PROXY,
-                          R.MODELS, rpm=5, window=60, max_per_model=20, log=log)
+    rot = MR.build_rotator(cfg, log)  # 混合降级链（未配 ModelScope key 时自动退化为纯 Gemini）
     ok = R.process_session(rot, sys_prompt, cfg, fname, date_iso, font, log, progress,
                            src_path=src_video)
     if not ok:
