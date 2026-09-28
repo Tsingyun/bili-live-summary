@@ -181,13 +181,23 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
 
         clean = S.strip_md_markers(t)
 
-        # --- ② markdown 标记残留 ---
+        # --- ② markdown 标记残留 / 字面格式词（粗体/斜体前缀）---
         if clean != t:
             issues['md_residue'].append({
                 'idx': i, 'sev': 'mid', 'text': t[:100], 'clean': clean[:100]})
             if fix:
                 _set_para_text(p, clean)
                 t = clean
+                fixed += 1
+
+        # --- ②b 金句引号配对：以“开头但缺收尾引号（模型截断），补齐 ---
+        if (t.startswith('\u201c') and t.count('\u201c') == t.count('\u201d') + 1):
+            issues['quote_format'].append({
+                'idx': i, 'sev': 'mid', 'text': t[:100], 'detail': '金句缺收尾引号”'})
+            if fix:
+                newt = t + '\u201d'
+                _set_para_text(p, newt)
+                t = newt
                 fixed += 1
 
         r0 = p.runs[0] if p.runs else None

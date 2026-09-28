@@ -650,6 +650,10 @@ def test_docx_healthcheck(tmp, v):
         ('- \u5217\u8868\u9879', '\u5217\u8868\u9879'),
         ('# \u6807\u9898\u9879', '\u6807\u9898\u9879'),
         ('`\u4ee3\u7801`', '\u4ee3\u7801'),
+        # --- K1b 2026-09-29 新增：字面格式词（9/28 场 gemini-3-flash-preview 输出 40 段）---
+        ('\u7c97\u4f53\u5c81\u5df1\u572802:01:00\u65f6\u786e\u8ba4\u3002', '\u5c81\u5df1\u572802:01:00\u65f6\u786e\u8ba4\u3002'),
+        ('\u659c\u4f53\u201c\u6211\u4e0d\u77e5\u9053\u3002\u201d', '\u201c\u6211\u4e0d\u77e5\u9053\u3002\u201d'),
+        ('**\u7c97\u4f53\u5d4c\u5957\u5e74\u4ee3\u3002**', '\u5d4c\u5957\u5e74\u4ee3\u3002'),
     ]
     bad = [(a, S.strip_md_markers(a)) for a, b in cases if S.strip_md_markers(a) != b]
     check('K1 markdown 标记统一剥除（含单下划线斜体）', not bad, '%r' % bad[:2])
@@ -661,6 +665,8 @@ def test_docx_healthcheck(tmp, v):
           S.is_quote_line('[00:12:00] \u201c\u5c31\u662f\u8fd9\u6837\u3002\u201d'))
     check('K2c 普通正文不被误判为金句',
           not S.is_quote_line('[00:12:00] \u5c81\u5df1\u611f\u8c22\u997c\u5e72\u5c81\u9001\u51fa\u7684\u793c\u7269\u3002'))
+    check('K2d 字面「斜体」前缀的金句被正确识别',
+          S.is_quote_line('\u659c\u4f53\u201c\u6211\u4e0d\u77e5\u9053\u3002\u201d'))
 
     # --- K3 提示词回显识别 ---
     leak = '\u201c\u8f93\u5165\u6587\u672c\u6bcf\u4e00\u884c\u90fd\u4ee5 [HH:MM:SS] \u5f00\u5934\uff0c\u8868\u793a\u8be5\u53e5\u5728\u672c\u573a\u76f4\u64ad\u4e2d\u7684\u7edd\u5bf9\u65f6\u95f4\uff1b\u8bf7\u636e\u6b64\u6807\u6ce8\u65f6\u95f4\u3002\u201d'

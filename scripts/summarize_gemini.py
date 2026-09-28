@@ -545,13 +545,20 @@ _MD_WRAP = (
 _TS_PREFIX = re.compile(r'^\[\d{1,2}:\d{2}:\d{2}\]\s*')
 _QUOTE_OPEN = ('\u201c', '"', '\u300c', '\u300e')     # “ " 「 『
 _QUOTE_CLOSE = ('\u201d', '"', '\u300d', '\u300f')    # ” " 」 』
+# ★ 2026-09-29：模型会把排版指令「说」出来（gemini-3-flash-preview 在 9/28 场实测输出
+#   「粗体岁己在02:01:00…」「斜体“…”」共 40 段），导致正文带字面格式词、金句判否被加粗。
+_MD_FMT_WORD = re.compile(r'^(?:粗体|斜体|加粗|黑体)\s*[:：,，、]?\s*')
 
 
 def strip_md_markers(line):
-    """剥掉模型自发加的 markdown 标记（列表/标题/强调/行内代码），返回纯文本行。
+    """剥掉模型自发加的标记（列表/标题/强调/行内代码/**字面格式词**），返回纯文本行。
 
     单下划线**只剥成对包裹**的形式（`_斜体_`），不做全局删除——中文正文里 `_`
     几乎不出现，成对才处理可避免误伤英文歌词、账号名等。
+    ★ 2026-09-29 新增：剥掉行首字面格式词（粗体/斜体/加粗/黑体）。本域内总结段必须
+    以主语开头、金句必须以“开头，行首出现这些词只可能是模型把排版指令说了出来。
+    本函数同时被 append_section（源头拦截）与 docx_healthcheck（产物修复）共用，
+    故必须在 is_quote_line 判定之前完成——否则「斜体“…”」会被误判成正文加粗。
     """
     s = (line or '').strip()
     if not s:
@@ -562,6 +569,7 @@ def strip_md_markers(line):
         before = s
         for pat in _MD_WRAP:
             s = pat.sub(r'\1', s).strip()
+        s = _MD_FMT_WORD.sub('', s).strip()
         if s == before:
             break
     s = s.replace('**', '').replace('__', '')
