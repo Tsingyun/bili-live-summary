@@ -136,7 +136,8 @@ def touch_heartbeat(cfg):
 #   · 末尾两个 `*-latest` 为 Google 滚动别名，永远指向当时可用模型，作最后保险
 #     （注意其配额可能与同底层模型共享，撞 429 只会被自动跳过，无实质损失）。
 #
-# 轮换语义：429（每日配额耗尽）/404（模型不可用）自动切下一档；每模型成功 20 次也主动切换。
+# 轮换语义：失败（429/404/5xx/空响应）模型进入退避窗口并降级，但窗口过期后按优先级
+# 重扫、更高阶模型重新成为首选被回头重试；每模型成功 20 次也主动停用本轮。
 MODELS = [
     'gemini-3.8-flash',        # ① 最新最强 Flash，总结质量与推理最佳，1M 上下文
     'gemini-3.7-flash',        # ② 上代旗舰 Flash，总结稳定，1M 上下文（响应略慢）
@@ -160,9 +161,15 @@ TARGETS = [
 
 
 class GeminiRotator:
-    """按模型列表轮换调用 Gemini；429/404 自动切下一个；RPM≤5/60s。"""
+    """按模型列表优先级调用 Gemini；失败降级但『退避 + 回头』而非永久抛弃。
 
-    def __init__(self, api_key, proxy, models, rpm=5, window=60, max_per_model=20, log=print):
+    ★ 2026-09-29 改为退避式回退：失败模型进入 per-model down_until 退避窗口（按错误类型），
+      _pick() 每次按列表优先级返回『当前可用的最高阶模型』。窗口过期后更高阶模型重新成为
+      首选被重试（如 3.8 一次 503 后 60s 回头再试），避免高阶模型有余额却被永久跳过。
+      RPM≤5/60s。"""
+
+    def __init__(self, api_key, proxy, models, rpm=5, window=60, max_per_model=20, log=print,
+                 backoff_transient=60, backoff_429=300, backoff_dead=3600):
         self.api_key = api_key
         self.proxies = {'http': proxy, 'https': proxy} if proxy else None
         self.models = models
@@ -174,6 +181,12 @@ class GeminiRotator:
         self._used = {}
         self._empty = {}          # 每模型连续空响应计数（防空响应死循环）
         self.log = log
+        # ★ 2026-09-29 退避式回退：失败模型进入 down_until 退避窗口，_pick 按优先级重扫时
+        # 窗口过期的高阶模型重新成为首选 → 实现「往下跳之后回头重试更高阶」。
+        self.down_until = {}      # model -> epoch 秒，在此之前视为不可用
+        self.backoff_transient = backoff_transient  # 5xx/网络/空响应/非JSON：短退避，很快回头
+        self.backoff_429 = backoff_429              # 限流/配额：中等退避
+        self.backoff_dead = backoff_dead            # 404/达上限：本轮停用
 
     def _rpm_wait(self):
         now = time.time()
@@ -205,11 +218,32 @@ class GeminiRotator:
                 return requests.post(url, headers=headers, json=payload, timeout=to, proxies=None)
             raise
 
-    def _advance(self):
-        self.idx = (self.idx + 1) % len(self.models)
+    def _pick(self):
+        """按静态优先级（列表顺序 = 能力高低）返回当前可用的模型。失败过的模型在退避窗口内被跳过；
+        窗口过期后最高阶模型重新成为首选 → 实现「往下跳之后回头重试更高阶」。
+        全部模型都在退避中时，等到最近一个恢复再返回，避免空烧尝试预算。"""
+        now = time.time()
+        for m in self.models:
+            if now >= self.down_until.get(m, 0):
+                return m
+        soonest = min(self.down_until.get(m, 0) for m in self.models)
+        wait = soonest - now + 0.5
+        if wait > 0:
+            self.log(f'  [Gemini] 全部模型退避中，等待 {wait:.0f}s')
+            time.sleep(wait)
+        return min(self.models, key=lambda m: self.down_until.get(m, 0))
+
+    def _mark_down(self, model, secs):
+        """将某模型标记为不可用，持续 secs 秒（退避窗口）。"""
+        self.down_until[model] = time.time() + secs
+
+    def _mark_up(self, model):
+        """清除某模型的退避（成功或恢复后）。"""
+        self.down_until.pop(model, None)
 
     def call(self, system_prompt, user_content, tag='', max_attempts=None):
-        """请求一次总结；失败自动换模型。返回文本，全部失败返回 ''。
+        """请求一次总结；失败降级，但降级是『退避 + 回头』而非永久抛弃：
+        失败模型进入退避窗口（按错误类型），窗口过期后它（含更高阶模型）重新成为首选重试。
 
         ★ 2026-09-18 加固（两个会让整场卡住/中断的缺陷）：
           ① `_post` 的网络异常（超时/连接重置）以前会**直接抛出**，穿透到
@@ -218,13 +252,17 @@ class GeminiRotator:
           ② 「200 但空响应」分支以前 `continue` 不计入 tried，若某模型持续返回
              空响应（finishReason=MAX_TOKENS/RECITATION 等）会**无限循环**。
              现在用总尝试预算 budget + 每模型空响应计数来兜底，必然收敛。
+        ★ 2026-09-29 改为『退避式回退』：调用失败不再单向下沉、永久放弃更高阶模型；
+          改用 per-model down_until 退避窗口 + _pick 优先级重扫，失败的高阶模型
+          窗口过期后重新被优先选用（如 3.8 一次 503 后 60s 回头重试，仍有余额即可利用）。
         """
         self._rpm_wait()
         n_models = max(1, len(self.models))
         budget = max_attempts or max(6, n_models * 2)
         attempts, last_err = 0, ''
         while attempts < budget:
-            model = self.models[self.idx]
+            model = self._pick()
+            self.idx = self.models.index(model)
             attempts += 1
             self.log(f'  [Gemini] {tag} 模型={model}'
                      f'（已用 {self._used.get(model, 0)}/{self.max_per_model}，'
@@ -232,7 +270,7 @@ class GeminiRotator:
             try:
                 r = self._post(model, system_prompt, user_content)
             except Exception as e:
-                # 网络层异常：不换模型（多半是链路问题），退避后重试同一模型
+                # 网络层异常：不降级（多半是链路问题），退避后重试同一模型
                 last_err = f'{model} 请求异常 {type(e).__name__}: {e}'
                 self.log(f'  [Gemini] {last_err}，退避重试')
                 time.sleep(min(5 * attempts, 30))
@@ -248,47 +286,53 @@ class GeminiRotator:
                     d = r.json()
                 except Exception as e:
                     last_err = f'{model} 响应非 JSON：{e}'
-                    self.log(f'  [Gemini] {last_err}，切换下一模型')
-                    self._advance(); continue
+                    self.log(f'  [Gemini] {last_err}，退避后转下一可用模型')
+                    self._mark_down(model, self.backoff_transient)
+                    continue
                 cand = (d.get('candidates') or [{}])[0]
                 parts = (cand.get('content') or {}).get('parts') or []
                 text = ''.join(p.get('text', '') for p in parts).strip()
                 if text:
                     self._empty[model] = 0
                     self._used[model] = self._used.get(model, 0) + 1
+                    self._mark_up(model)
                     if self._used[model] >= self.max_per_model:
-                        self.log(f'  [Gemini] {model} 已达 {self.max_per_model} 次，切换下一模型')
-                        self._advance()
+                        self.log(f'  [Gemini] {model} 已达 {self.max_per_model} 次，本轮停用')
+                        self._mark_down(model, self.backoff_dead)
                     return text
-                # 空响应：同一模型最多容忍 3 次，之后换模型（防死循环）
+                # 空响应：同一模型最多容忍 3 次，之后退避（防死循环，回头重试）
                 self._empty[model] = self._empty.get(model, 0) + 1
                 last_err = (f'{model} 空响应 finishReason={cand.get("finishReason")}'
                             f'（第 {self._empty[model]} 次）')
                 self.log(f'  [Gemini] {last_err}')
                 if self._empty[model] >= 3:
-                    self.log(f'  [Gemini] {model} 连续空响应，切换下一模型')
-                    self._advance()
+                    self.log(f'  [Gemini] {model} 连续空响应，退避')
+                    self._mark_down(model, self.backoff_transient)
                     time.sleep(1)
                 else:
                     time.sleep(3)
                 continue
             elif r.status_code == 429:
-                last_err = f'{model} HTTP 429 配额耗尽'
-                self.log(f'  [Gemini] {last_err}，切换下一模型')
-                self._advance(); continue
+                last_err = f'{model} HTTP 429 配额/限流'
+                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
+                self._mark_down(model, self.backoff_429)
+                continue
             elif r.status_code == 404:
                 last_err = f'{model} HTTP 404 不可用'
-                self.log(f'  [Gemini] {last_err}，切换下一模型')
-                self._advance(); continue
+                self.log(f'  [Gemini] {last_err}，本轮停用')
+                self._mark_down(model, self.backoff_dead)
+                continue
             elif r.status_code in (500, 503, 504):
                 last_err = f'{model} HTTP {r.status_code}'
-                self.log(f'  [Gemini] {last_err}，退避后切换下一模型')
+                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型（窗口过期回头重试）')
+                self._mark_down(model, self.backoff_transient)
                 time.sleep(min(8 * attempts, 60))
-                self._advance(); continue
+                continue
             else:
                 last_err = f'{model} HTTP {r.status_code}: {r.text[:200]}'
-                self.log(f'  [Gemini] {last_err}')
-                self._advance(); continue
+                self.log(f'  [Gemini] {last_err}，退避后转下一可用模型')
+                self._mark_down(model, self.backoff_transient)
+                continue
         self.log(f'  [Gemini] 尝试 {attempts} 次后仍不可用：{last_err}')
         return ''
 
