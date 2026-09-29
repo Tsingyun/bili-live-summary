@@ -282,6 +282,7 @@ class MultiProviderRotator(GeminiRotator):
             err = str(d.get('error') or d)[:200]
             self.log(f'  [{self.provider_tag}] {model} 响应异常：{err}')
             return ''
+        self._note_usage(model, d)
         msg = (choices[0] or {}).get('message') or {}
         self._last_finish = choices[0].get('finish_reason') or ''
         return (msg.get('content') or '').strip()

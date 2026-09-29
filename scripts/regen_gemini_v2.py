@@ -160,6 +160,46 @@ TARGETS = [
 ]
 
 
+# ---- 用量账本（模块级共享：同一进程内所有 rotator 累计 = 本次运行总量）----
+USAGE = {}   # model -> {'calls':成功次数, 'in':输入token, 'out':输出token, 'total':合计}
+
+
+def reset_usage():
+    """清空用量账本（单次进程 = 单次运行，一般无需主动调用；测试用）。"""
+    USAGE.clear()
+
+
+def format_usage_report(usage=None, limit=None):
+    """生成『本次运行模型用量』汇报行（list[str]）。
+
+    口径：calls = 成功返回正文的调用次数（与日志『已用 N/M』一致）；
+    token 取 provider 响应里的 usageMetadata(Gemini) / usage(OpenAI 兼容)。
+    若 provider 未返回 usage 字段 → token 全 0，汇报显式标注『无法统计』。"""
+    u = USAGE if usage is None else usage
+    rows = [(m, v) for m, v in u.items() if (v.get('calls') or v.get('total'))]
+    rows.sort(key=lambda kv: (-kv[1].get('calls', 0), -kv[1].get('total', 0)))
+    if not rows:
+        return ['---- 本次运行模型用量 ----', '  （本次未发生模型调用）']
+    if limit:
+        rows = rows[:limit]
+    out = ['---- 本次运行模型用量 ----']
+    w = max(len(m) for m, _ in rows)
+    for m, v in rows:
+        out.append('  %s %3d 次  输入 %s / 输出 %s / 合计 %s token'
+                   % (m.ljust(w), v.get('calls', 0),
+                      format(v.get('in', 0), ','), format(v.get('out', 0), ','),
+                      format(v.get('total', 0), ',')))
+    tc = sum(v.get('calls', 0) for _, v in rows)
+    ti = sum(v.get('in', 0) for _, v in rows)
+    to = sum(v.get('out', 0) for _, v in rows)
+    tt = sum(v.get('total', 0) for _, v in rows)
+    out.append('  合计：%d 个模型 / %d 次调用，输入 %s + 输出 %s = %s token'
+               % (len(rows), tc, format(ti, ','), format(to, ','), format(tt, ',')))
+    if tt == 0:
+        out.append('  （token 无法统计：provider 响应未返回 usage / usageMetadata 字段）')
+    return out
+
+
 class GeminiRotator:
     """按模型列表优先级调用 Gemini；失败降级但『退避 + 回头』而非永久抛弃。
 
@@ -189,6 +229,7 @@ class GeminiRotator:
         self.backoff_dead = backoff_dead            # 404/达上限：本轮停用
         self.provider_tag = 'Gemini'  # 日志前缀（model_router 混合路由器覆盖为 '模型'）
         self._last_finish = ''        # 最近一次响应 finishReason（空响应日志用）
+        self.usage = USAGE           # 用量账本（本次运行跨 rotator 实例共享累计）
 
     def _rpm_wait(self):
         now = time.time()
@@ -243,6 +284,33 @@ class GeminiRotator:
         """清除某模型的退避（成功或恢复后）。"""
         self.down_until.pop(model, None)
 
+    def _note_usage(self, model, d):
+        """累计 token 消耗：取 Gemini usageMetadata 或 OpenAI 兼容 usage。
+        成功与空响应都记（都真实消耗）；失败请求无 usage 可记。"""
+        try:
+            if not isinstance(d, dict):
+                return
+            u = d.get('usageMetadata') or d.get('usage') or {}
+            if not u:
+                return
+            rec = self.usage.setdefault(model, {'calls': 0, 'in': 0, 'out': 0, 'total': 0})
+            tin = int(u.get('promptTokenCount') or u.get('prompt_tokens') or 0)
+            tout = int(u.get('candidatesTokenCount') or u.get('completion_tokens') or 0)
+            ttot = int(u.get('totalTokenCount') or u.get('total_tokens') or (tin + tout))
+            rec['in'] += tin
+            rec['out'] += tout
+            rec['total'] += ttot
+        except Exception:
+            pass
+
+    def _note_call(self, model):
+        """成功调用计数（与日志『已用 N/M』口径一致）。"""
+        try:
+            self.usage.setdefault(model, {'calls': 0, 'in': 0, 'out': 0, 'total': 0})
+            self.usage[model]['calls'] += 1
+        except Exception:
+            pass
+
     def cap_for(self, model):
         """单模型本轮成功调用上限（子类按 provider 差异化，如魔搭 450/日）。"""
         return self.max_per_model
@@ -257,6 +325,7 @@ class GeminiRotator:
         except Exception as e:
             self.log(f'  [{self.provider_tag}] {model} 响应非 JSON：{e}')
             return ''
+        self._note_usage(model, d)
         cand = (d.get('candidates') or [{}])[0]
         self._last_finish = cand.get('finishReason') or ''
         parts = (cand.get('content') or {}).get('parts') or []
@@ -307,6 +376,7 @@ class GeminiRotator:
                 if text:
                     self._empty[model] = 0
                     self._used[model] = self._used.get(model, 0) + 1
+                    self._note_call(model)
                     self._mark_up(model)
                     if self._used[model] >= self.cap_for(model):
                         self.log(f'  [{self.provider_tag}] {model} 已达 {self.max_per_model} 次，本轮停用')

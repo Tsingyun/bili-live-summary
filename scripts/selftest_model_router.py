@@ -13,6 +13,7 @@ selftest_model_router.py —— model_router 混合模型路由器离线回归�
   [G] 响应解析：双格式分流（Gemini/OpenAI）、忽略 reasoning_content、坏 JSON 返回空
   [H] build_rotator：无 MS key 退化纯 Gemini；有 key 用混合链
   [I] 全链失败：尝试预算耗尽返回空串（不抛异常）
+  [J] 用量账本：成功计数 + token 累计（双 provider）、失败不计、汇报格式与「无法统计」标注
 
 跑法：python selftest_model_router.py（需要 requests + python-docx，用 bili-archive venv）
 """
@@ -25,6 +26,7 @@ import model_router as MR
 from model_router import (MultiProviderRotator, build_rotator, build_system_prompt,
                           is_modelscope, MS_MODELS)
 from regen_gemini_v2 import GeminiRotator
+import regen_gemini_v2 as RG   # 模块级用量账本（USAGE / reset_usage / format_usage_report）
 
 PASS, FAIL = 0, []
 
@@ -251,6 +253,68 @@ def t_i_all_fail():
     check('I2 快速收敛（<60s）', time.time() - t0 < 60, time.time() - t0)
 
 
+def t_j_usage():
+    """[J] 用量账本：成功计数 + token 累计（双 provider 格式）+ 收尾汇报输出。"""
+    print('[J] 用量账本与运行汇报')
+    RG.reset_usage()
+    rot = make_rot(['gemini-3.8-flash', 'Qwen/Qwen3.5-397B-A17B'], backoff_transient=0.5)
+
+    # J1 Gemini：usageMetadata 计入
+    rot._post = lambda m, s, u: FakeResp(200, {
+        'candidates': [{'content': {'parts': [{'text': 'OK-G'}]}, 'finishReason': 'STOP'}],
+        'usageMetadata': {'promptTokenCount': 1000, 'candidatesTokenCount': 200,
+                          'totalTokenCount': 1200}})
+    check('J1 Gemini 调用返回正文', rot.call('sys', 'u', tag='[J1]') == 'OK-G')
+    rec = rot.usage.get('gemini-3.8-flash') or {}
+    check('J1b Gemini 成功计数 1', rec.get('calls') == 1, str(rec))
+    check('J1c Gemini token 累计 in/out/total',
+          rec.get('in') == 1000 and rec.get('out') == 200 and rec.get('total') == 1200, str(rec))
+
+    # J2 魔搭：usage 计入，且与 Gemini 分开累计
+    rot._post = lambda m, s, u: FakeResp(200, {
+        'choices': [{'message': {'content': 'OK-M'}, 'finish_reason': 'stop'}],
+        'usage': {'prompt_tokens': 4000, 'completion_tokens': 500, 'total_tokens': 4500}})
+    rot.models = ['Qwen/Qwen3.5-397B-A17B']
+    rot.down_until.clear()
+    check('J2 魔搭调用返回正文', rot.call('sys', 'u', tag='[J2]') == 'OK-M')
+    rec2 = rot.usage.get('Qwen/Qwen3.5-397B-A17B') or {}
+    check('J2b 魔搭 token 累计',
+          rec2.get('in') == 4000 and rec2.get('out') == 500 and rec2.get('total') == 4500, str(rec2))
+
+    # J3 失败请求不计数、不计 token
+    before = {k: dict(v) for k, v in rot.usage.items()}
+    rot._post = lambda m, s, u: FakeResp(503, {})
+    rot.call('sys', 'u', tag='[J3]', max_attempts=2)
+    check('J3 失败请求不增加 calls',
+          all(rot.usage.get(k, {}).get('calls') == v.get('calls') for k, v in before.items()),
+          str(rot.usage))
+    check('J3b 失败请求不增加 token',
+          all(rot.usage.get(k, {}).get('total') == v.get('total') for k, v in before.items()),
+          str(rot.usage))
+
+    # J4 汇报：表头 + 合计
+    rows = RG.format_usage_report()
+    text = '\n'.join(rows)
+    check('J4 汇报含表头与合计行', '本次运行模型用量' in text and '合计' in text, text[:200])
+    tl = [r for r in rows if r.strip().startswith('合计')]
+    check('J4b 合计 = 2 模型 / 2 次 / 5,700 token',
+          bool(tl) and ('2 个模型' in tl[0]) and ('5,700' in tl[0]), tl[0] if tl else '')
+
+    # J5 provider 未返回 usage → 次数照记、token 标注无法统计
+    RG.reset_usage()
+    rot2 = make_rot(['gemini-3.8-flash'], backoff_transient=0.5)
+    rot2._post = lambda m, s, u: gemini_resp('OK')
+    rot2.call('sys', 'u', tag='[J5]')
+    rows2 = RG.format_usage_report()
+    check('J5 token 缺失时标注无法统计', any('无法统计' in r for r in rows2), str(rows2))
+    check('J5b 次数仍统计', any('1 次' in r for r in rows2), str(rows2))
+
+    # J6 空账本
+    RG.reset_usage()
+    check('J6 空账本提示未调用',
+          any('未发生模型调用' in r for r in RG.format_usage_report()))
+
+
 def main():
     t_a_fallback_order()
     t_b_backoff_retry_higher()
@@ -261,6 +325,7 @@ def main():
     t_g_extract()
     t_h_build_rotator()
     t_i_all_fail()
+    t_j_usage()
     print(f'\n结果：{PASS} 项通过，{len(FAIL)} 项失败 {FAIL if FAIL else ""}')
     sys.exit(1 if FAIL else 0)
 

@@ -40,6 +40,19 @@ if SCRIPT_DIR not in sys.path:
 PASS, FAIL = [], []
 
 
+def unused_pid():
+    """返回一个当前未被占用的 PID（Windows PID 为 4 的倍数）。
+
+    ★ 为什么不用「刚退出的子进程 PID」：Windows 会快速复用 PID，
+      那个号码可能已经被分配给另一个活进程，于是「已死进程」被判为存活
+      → E4 / H3 偶发假失败（真因，2026-09-30 实测）。改用从未分配过的 PID 稳定复现。"""
+    import common   # 本文件所有 common 引用都在函数内延迟导入（保持一致的导入习惯）
+    pid = 40000
+    while pid < 65000 and common.pid_alive(pid):
+        pid += 4
+    return pid
+
+
 def check(name, cond, detail=''):
     if cond:
         PASS.append(name)
@@ -242,10 +255,7 @@ def test_lock(tmp, v):
     # （Popen 未析构时就是这样），已退出进程的 PID 在 OpenProcess 看来依然有效，
     # os.kill(pid,0) 会误报"存活"。生产场景里上一轮的进程不是本进程的子进程、
     # 我们并不持有它的句柄，所以这里必须还原成同样的前提。
-    child = subprocess.Popen([sys.executable, '-c', 'pass'])
-    dead_pid = child.pid
-    child.wait()
-    del child
+    dead_pid = unused_pid()   # 不用刚退出的子进程 PID（会被系统复用，见 unused_pid 说明）
     time.sleep(0.1)
     with open(lp, 'w', encoding='utf-8') as f:
         f.write('%d' % dead_pid)
@@ -409,10 +419,7 @@ def test_cleanup_lock(tmp, v):
     # H3 回归：旧实现之所以漏判，是因为 int(「pid 时间戳」) 抛异常后默认 pid=0。
     #    这里确保「pid 后面带时间戳」不会被解析成 0 —— 换成死 pid + 新鲜心跳，
     #    必须判为孤儿（说明 pid 确实被正确解析出来了）。
-    child = subprocess.Popen([sys.executable, '-c', 'pass'])
-    dead_pid = child.pid
-    child.wait()
-    del child
+    dead_pid = unused_pid()   # 不用刚退出的子进程 PID（会被系统复用，见 unused_pid 说明）
     time.sleep(0.1)
     with open(lp, 'w', encoding='utf-8') as f:
         f.write('%d %s' % (dead_pid, '2026-09-18T20:00:00'))

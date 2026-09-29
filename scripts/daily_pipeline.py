@@ -1456,6 +1456,13 @@ def main():
         except Exception as e:
             log('原始FLV清扫失败（不影响交付物）：%s' % e, 'WARN')
 
+        # ---- 模型用量汇报（每次运行结束必附；仅附加输出，失败不影响交付物）----
+        try:
+            for _u in R.format_usage_report():
+                log(_u)
+        except Exception as e:
+            log('模型用量汇报失败（不影响交付物）：%s' % e, 'WARN')
+
         log('daily_pipeline 本次完成')
     except KeyboardInterrupt:
         print('[daily_pipeline] 收到中断信号，已释放锁并退出（产物均为原子写，可从断点续跑）')
