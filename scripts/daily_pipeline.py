@@ -1356,6 +1356,17 @@ def main():
             % (len(sessions), len(to_process), len(skipped)))
         for s in skipped:
             log('  跳过 %s：%s' % (s[0]['live_date'].isoformat(), s[1]))
+        # ★ 2026-10-01：从录播站下载落位的文件 mtime 必然是「刚刚」，会被
+        #   is_file_stable 判成「录制中」→ 整场跳过、本次运行零产出，但退出码
+        #   仍是 0，看起来像正常跑完。这类"静默空转"必须显式告警。
+        if sessions and not to_process:
+            unstable_all = all('录制中' in (r or '') for _, r in skipped)
+            if unstable_all:
+                log('本次 0 产出：全部 %d 场因「录制中/文件不稳定」被跳过。'
+                    '若这些文件其实是刚下载的成品（mtime 很新），属误判——'
+                    '等 %d 秒后重跑即可；正式拉片请用 rec_fetch_date.py'
+                    '（会自动把 mtime 还原为真实录制收尾时刻）'
+                    % (len(skipped), 125), 'WARN')
         for s in to_process:
             tag = ('合并 %d 段%s' % (len(s['member_files']),
                                     '（跨午夜）' if s.get('crosses_midnight') else '')
