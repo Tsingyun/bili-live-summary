@@ -817,6 +817,130 @@ def test_bili_upload(tmp, v):
     check('L6 upload_one 源不存在 → 返回 None 不抛异常', r is None)
 
 
+def test_audio_enhance(tmp, v):
+    """[M] audio_enhance：自适应前处理的判档、兜底与「默认不动手」约束。
+
+    ★ 历史背景：本能力初版默认 auto（按电平自动处理）。2026-10-01 用真实素材
+    做了 8 片段 × 3 条件受控对照，结果是**前处理净收益为负**：
+        不处理 95.27% / 仅抬电平 92.43% / 抬+压缩 93.07%（相似度，越高越好）
+    因此默认改为 probe（只诊断不改音频），并用回归测试把这个约束钉死，
+    防止日后被无意改回 auto 而悄悄损失质量。
+    """
+    import shutil
+    import subprocess
+    import audio_enhance as AE
+
+    class _Collect(object):
+        def __init__(self):
+            self.msgs = []
+
+        def __call__(self, m, level='INFO'):
+            self.msgs.append((level, m))
+
+        def error(self, m):
+            self.msgs.append(('ERROR', m))
+
+    def prof(speech, floor=-72.0, dyn=None):
+        return {'speech_db': speech, 'floor_db': floor,
+                'dyn_db': (speech - floor) if dyn is None else dyn,
+                'peak_db': -10.0, 'mean_db': speech - 4, 'scan_sec': 0.1}
+
+    auto = {'audio_enhance': 'auto'}
+
+    # --- M1~M4 模式语义 ---
+    check('M1 默认模式为 probe（只诊断不改音频）',
+          AE.DEFAULTS['audio_enhance'] == 'probe')
+    af, tier, _ = AE.decide_chain(prof(-20), {'audio_enhance': 'off'})
+    check('M2 mode=off → 不处理', af == '' and tier == 'off')
+    af, tier, info = AE.decide_chain(prof(-20), {'audio_enhance': 'probe'})
+    check('M3 mode=probe → 产出画像但不动音频', af == '' and tier == 'probe')
+    check('M3b probe 画像数值透出', info.get('speech_db') == -20.0)
+    lg = _Collect()
+    af, tier, info = AE.decide_chain(prof(-46, floor=-42, dyn=4),
+                                     {'audio_enhance': 'probe'}, log=lg)
+    check('M4 低动态范围 → 低信噪比告警且仍不改音频',
+          af == '' and info.get('low_snr') is True
+          and any(lv == 'WARN' for lv, _ in lg.msgs))
+
+    # --- M5~M9 auto 判档表 ---
+    af, tier, _ = AE.decide_chain(prof(-20), auto)
+    check('M5 正常电平 -20dB → 完全不介入', af == '' and tier == 'off')
+    af, tier, _ = AE.decide_chain(prof(-24), auto)
+    check('M5b 阈值边界 -24dB（阈值 -26）→ 不介入', af == '' and tier == 'off')
+    _, tier, info = AE.decide_chain(prof(-27), auto)
+    check('M6 轻度 -27dB → light 档 / 抬升 6dB',
+          tier == 'light' and info['gain_db'] == 6.0)
+    _, tier, info = AE.decide_chain(prof(-38), auto)
+    check('M7 中度 -38dB → mid 档 / 抬升 17dB',
+          tier == 'mid' and info['gain_db'] == 17.0)
+    _, tier, info = AE.decide_chain(prof(-46), auto)
+    check('M8 重度 -46dB → strong 档 / 抬升 25dB',
+          tier == 'strong' and info['gain_db'] == 25.0)
+    _, tier, info = AE.decide_chain(prof(-60), auto)
+    check('M9 极端 -60dB → 抬升被 max_gain(26dB) 截断',
+          tier == 'strong' and info['gain_db'] == 26.0)
+    _, _, info = AE.decide_chain(prof(-60), {'audio_enhance': 'auto',
+                                             'enhance_max_gain_db': 10.0})
+    check('M9b 自定义 max_gain 生效', info['gain_db'] == 10.0)
+
+    # --- M10~M11 探测失败兜底 ---
+    lg = _Collect()
+    af, tier, info = AE.decide_chain(None, auto, log=lg)
+    check('M10 探测失败 + auto → 保守不处理（宁可不救也不瞎改）',
+          af == '' and tier == 'off')
+    af, tier, _ = AE.decide_chain(None, {'audio_enhance': 'on'})
+    check('M11 探测失败 + on → 保守中档非空链', tier == 'mid' and af != '')
+
+    # --- M12~M13 滤镜链构造 ---
+    af, _, _ = AE.decide_chain(prof(-46), {'audio_enhance': 'auto',
+                                           'enhance_denoise': True})
+    af_off, _, _ = AE.decide_chain(prof(-46), auto)
+    check('M12 降噪开关：开→含 afftdn，关→不含',
+          'afftdn' in af and 'afftdn' not in af_off)
+    parts = af_off.split(',')
+    order = [next((i for i, p in enumerate(parts) if p.startswith(k)), -1)
+             for k in ('highpass', 'volume', 'acompressor', 'alimiter')]
+    check('M13 滤镜顺序：抬电平→压缩→限幅，且限幅在最后',
+          order[1] < order[2] < order[3] and order[3] == len(parts) - 1)
+    check('M13b 整链以 aformat=fltp 开头（避免中间在 s16 上削波）',
+          parts[0].startswith('aformat=sample_fmts=fltp'))
+
+    # --- M14 增益 clamp ---
+    check('M14 增益 clamp：无需抬升时返回 0，负值方向不衰减',
+          AE._gain_db(-10, -21.0, 26.0) == 0.0
+          and AE._gain_db(-40, -21.0, 26.0) == 19.0)
+
+    # --- M15 端到端（需 ffmpeg）：合成固定电平信号，验证探测准确性 ---
+    ff = shutil.which('ffmpeg')
+    if not ff:
+        check('M15 电平探测端到端（无 ffmpeg，跳过）', True)
+        return
+    sig = os.path.join(tmp, 'sig.wav')
+    subprocess.run([ff, '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:sample_rate=16000:duration=6',
+                    '-af', 'volume=-30dB', '-c:a', 'pcm_s16le', sig],
+                   check=True)
+    p = AE.probe_profile(ff, sig, log=_Collect())
+    # ★ 不写死数值：以 ffmpeg 官方 volumedetect 为基准交叉验证。
+    #   （曾写死期望 -33dB 而失败，实测源信号本身就是 -51.1dB —— lavfi sine
+    #    的基准电平不是满量程；错的是期望值，不是探测逻辑。）
+    import re
+    vd = subprocess.run([ff, '-hide_banner', '-i', sig,
+                         '-af', 'volumedetect', '-f', 'null', '-'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    m = re.search(r'mean_volume:\s*(-?[\d.]+) dB',
+                  vd.stderr.decode('utf-8', 'ignore'))
+    ref_db = float(m.group(1)) if m else None
+    check('M15 电平探测与 ffmpeg volumedetect 交叉一致（±1.5dB）',
+          p is not None and ref_db is not None
+          and abs(p['mean_db'] - ref_db) < 1.5,
+          'probe=%s / volumedetect=%s'
+          % (p['mean_db'] if p else None, ref_db))
+    check('M15b 帧数与时长自洽（6s ≈ 60 帧 @100ms）',
+          p is not None and 55 <= p['frames'] <= 65,
+          '%s' % (p['frames'] if p else None))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -834,6 +958,7 @@ def main():
         test_hotwords(tmp, args.verbose)
         test_docx_healthcheck(tmp, args.verbose)
         test_bili_upload(tmp, args.verbose)
+        test_audio_enhance(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

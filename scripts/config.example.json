@@ -66,7 +66,15 @@
     "ncpu": 4,
     "_comment": "chunk_hours_threshold: 超过此时长强制按 chunk_minutes 切块后再转写。经验值 2h：FunASR VAD 回退在 3h+ 单文件上出现过只返回前 2h48m 的截断，切 30min 块可彻底规避。",
     "chunk_hours_threshold": 2,
-    "chunk_minutes": 30
+    "chunk_minutes": 30,
+    "audio_enhance": "probe",
+    "_comment_audio_enhance": "off|probe|auto|on。probe=只产出电平诊断、不改动音频（默认）；auto=发声段电平低于 enhance_enable_below_db 时自动前处理；on=强制。★ 2026-10-01 八片段受控对照实测：数字衰减场景下前处理净收益为负（不处理 95.27% / 仅抬电平 92.43% / 抬+压缩 93.07%），未用真实耳语素材验证前请勿默认 auto。",
+    "enhance_enable_below_db": -26.0,
+    "enhance_target_db": -21.0,
+    "enhance_max_gain_db": 26.0,
+    "enhance_denoise": false,
+    "enhance_denoise_nf_db": -30.0,
+    "enhance_low_snr_warn_db": 12.0
   },
   "cleanup": {
     "_comment": "自动清理中间文件，防止磁盘被撑爆。每跑一场临时占用 25~30GB（源视频+压缩产物+B站下载+ASR切块+16k音频），必须回收。sweep 只删 workdir 下的中间产物（tmp / MP3 / logs / backups / __pycache__ 及超期 TXT、SRT），并清理已归档的 B站下载副本与残留 ASR 切块；绝不碰成品（录播根目录里 YYYY-MM-DD/ 的 MP4、mp3_export.out_dir 的归档 MP3）和文档目录的 Word 总结。天数按文件最后修改时间计算；-1 = 永久保留。",

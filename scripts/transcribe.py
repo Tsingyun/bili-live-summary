@@ -23,6 +23,8 @@ from common import (load_config, Logger, hms, probe_duration,
                     clean_segment_boundaries, normalize_numbers,
                     force_unlink, force_rmtree)
 
+import audio_enhance as AE   # 低声压/耳语场景的自适应音频前处理
+
 # SenseVoice 富文本标签：<|zh|><|NEUTRAL|><|Speech|><|woitn|> 等
 TAG_RE = re.compile(r'<\|([^|]*)\|>')
 PUNCT = '，。、？！；：,.?!;:~…'
@@ -330,67 +332,101 @@ def transcribe_one(cfg, mp3_path, model, log):
     t0 = time.time()
     log(f'开始转写 {stem}（{hms(dur)}）')
 
-    threshold = cfg['transcribe'].get('chunk_hours_threshold', 2) * 3600
-    if dur > threshold:
-        chunk_sec = cfg['transcribe'].get('chunk_minutes', 30) * 60
-        work = os.path.join(cfg['_dirs']['tmp'], 'asr_' + stem[:40])
-        log(f'  时长超过 {threshold // 3600}h，启用分块转写')
-        chunks = split_audio(P['ffmpeg'], mp3_path, work, chunk_sec, log)
-        if not chunks:
-            log.error(f'  音频切分为 0 块，转写失败：{stem}')
-            return None
-        segs = []
-        offset = 0.0
-        failed = []
-        for i, c in enumerate(chunks):
-            # 用实际块时长累加偏移，而不是假设每块都恰好 chunk_sec
-            c_dur = probe_duration(P['ffprobe'], c) or chunk_sec
-            log(f'  [{i + 1}/{len(chunks)}] 偏移 {hms(offset)} ...')
-            got = asr_segments(model, c, cfg, offset_sec=offset, log=log)
-            # ★ 2026-09-18：某一块整块转写失败（返回空）以前会被静默跳过，最终 TXT
-            #   仍然"非空"→ 下游判定转写成功 → 总结直接缺掉这 30 分钟。改为显式失败，
-            #   整场不落盘、下次重跑，宁可多花一次算力也不产出残缺稿。
-            if not got:
-                failed.append(i + 1)
-                log.error(f'  第 {i + 1}/{len(chunks)} 块转写为空（该块约 '
-                          f'{int(c_dur // 60)} 分钟内容会丢失）')
-            segs.extend(got)
-            offset += c_dur
-            # 必须用 force_unlink：D 盘的 os.remove 会被安全 hook 拦截（抛
-            # AttributeError），静默失败会让每场留下 ~0.6GB 切块 wav。
-            force_unlink(c, log)
-        force_rmtree(work, log)
-        if failed:
-            log.error(f'  分块转写有 {len(failed)}/{len(chunks)} 块失败'
-                      f'（块号 {failed}），判定整场失败，不写 TXT/SRT，下次重跑')
-            return None
-    else:
-        segs = asr_segments(model, mp3_path, cfg, log=log)
+    # ---- 低声压（耳语/ASMR）自适应前处理 --------------------------------------
+    # 判据来自音频自身的帧级能量分布，不看文件名/标题：
+    #   · 发声段电平达标 → 一条滤镜都不加，与原链路完全一致（普通场次零扰动）
+    #   · 电平偏低 → 按档位抬升 + 压缩动态（实测可把耳语素材的识别率补回 100%）
+    #   · 探测或转码失败 → 降级为不处理，只告警不中断
+    asr_src = mp3_path
+    enh_wav = None
+    enh_desc = '未启用'
+    try:
+        prof = AE.probe_profile(P['ffmpeg'], mp3_path, log)
+        af, tier, info = AE.decide_chain(prof, cfg['transcribe'], log)
+        if prof:
+            log(f'  电平画像：发声段 {prof["speech_db"]}dB / 停顿-底噪 '
+                f'{prof["floor_db"]}dB / 动态范围 {prof["dyn_db"]}dB'
+                f'（扫描 {prof["scan_sec"]}s）')
+        enh_desc = AE.describe(prof, tier, info).replace('音频前处理：', '')
+        log('  音频前处理：' + enh_desc)
+        if af:
+            enh_wav = os.path.join(cfg['_dirs']['tmp'], 'enh_' + stem[:40] + '.wav')
+            if AE.enhance_to_wav(P['ffmpeg'], mp3_path, enh_wav, af, log):
+                asr_src = enh_wav
+            else:
+                enh_wav = None
+                log('  前处理未生效，按原始音频继续转写', 'WARN')
+    except Exception as e:
+        enh_wav = None
+        log(f'  前处理链路异常，按原始音频继续转写：{e}', 'WARN')
 
-    segs = dedup_merge([s for s in segs if is_meaningful(s[2]) and not is_junk(s[2])])
-    # 清洗冗余双标点（FunASR 分段兜底会在句末/句内叠出 "。，" 等），从源头杜绝
-    segs = clean_segment_boundaries(segs)
-    # 数字归一：把紧跟规格单位的中国数字转回阿拉伯（三零五零显卡→3050显卡、
-    # 七十五赫兹→75Hz、八G→8G），从源头杜绝专有名词被读成中文
-    segs = [(st, en, normalize_numbers(t)) for st, en, t in segs]
-    if not segs:
-        log.error(f'  转写结果为空：{stem}')
-        return None
+    try:
+        threshold = cfg['transcribe'].get('chunk_hours_threshold', 2) * 3600
+        if dur > threshold:
+            chunk_sec = cfg['transcribe'].get('chunk_minutes', 30) * 60
+            work = os.path.join(cfg['_dirs']['tmp'], 'asr_' + stem[:40])
+            log(f'  时长超过 {threshold // 3600}h，启用分块转写')
+            chunks = split_audio(P['ffmpeg'], asr_src, work, chunk_sec, log)
+            if not chunks:
+                log.error(f'  音频切分为 0 块，转写失败：{stem}')
+                return None
+            segs = []
+            offset = 0.0
+            failed = []
+            for i, c in enumerate(chunks):
+                # 用实际块时长累加偏移，而不是假设每块都恰好 chunk_sec
+                c_dur = probe_duration(P['ffprobe'], c) or chunk_sec
+                log(f'  [{i + 1}/{len(chunks)}] 偏移 {hms(offset)} ...')
+                got = asr_segments(model, c, cfg, offset_sec=offset, log=log)
+                # ★ 2026-09-18：某一块整块转写失败（返回空）以前会被静默跳过，最终 TXT
+                #   仍然"非空"→ 下游判定转写成功 → 总结直接缺掉这 30 分钟。改为显式失败，
+                #   整场不落盘、下次重跑，宁可多花一次算力也不产出残缺稿。
+                if not got:
+                    failed.append(i + 1)
+                    log.error(f'  第 {i + 1}/{len(chunks)} 块转写为空（该块约 '
+                              f'{int(c_dur // 60)} 分钟内容会丢失）')
+                segs.extend(got)
+                offset += c_dur
+                # 必须用 force_unlink：D 盘的 os.remove 会被安全 hook 拦截（抛
+                # AttributeError），静默失败会让每场留下 ~0.6GB 切块 wav。
+                force_unlink(c, log)
+            force_rmtree(work, log)
+            if failed:
+                log.error(f'  分块转写有 {len(failed)}/{len(chunks)} 块失败'
+                          f'（块号 {failed}），判定整场失败，不写 TXT/SRT，下次重跑')
+                return None
+        else:
+            segs = asr_segments(model, asr_src, cfg, log=log)
 
-    elapsed = time.time() - t0
-    chars = sum(len(s[2]) for s in segs)
-    write_txt(txt_path, segs, {
-        '文件名': os.path.basename(mp3_path),
-        '转写时间': time.strftime('%Y-%m-%d %H:%M:%S'),
-        '音频时长': f'{int(dur)}s ({hms(dur)})',
-        '文本字数': chars,
-        '分句数量': len(segs),
-        '模型': 'SenseVoiceSmall',
-    })
-    write_srt(srt_path, segs)
-    log(f'  完成：{len(segs)} 句 / {chars} 字 / 耗时 {elapsed:.0f}s '
-        f'（{dur / max(elapsed, 1):.1f}x 实时）')
-    return txt_path
+        segs = dedup_merge([s for s in segs if is_meaningful(s[2]) and not is_junk(s[2])])
+        # 清洗冗余双标点（FunASR 分段兜底会在句末/句内叠出 "。，" 等），从源头杜绝
+        segs = clean_segment_boundaries(segs)
+        # 数字归一：把紧跟规格单位的中国数字转回阿拉伯（三零五零显卡→3050显卡、
+        # 七十五赫兹→75Hz、八G→8G），从源头杜绝专有名词被读成中文
+        segs = [(st, en, normalize_numbers(t)) for st, en, t in segs]
+        if not segs:
+            log.error(f'  转写结果为空：{stem}')
+            return None
+
+        elapsed = time.time() - t0
+        chars = sum(len(s[2]) for s in segs)
+        write_txt(txt_path, segs, {
+            '文件名': os.path.basename(mp3_path),
+            '转写时间': time.strftime('%Y-%m-%d %H:%M:%S'),
+            '音频时长': f'{int(dur)}s ({hms(dur)})',
+            '文本字数': chars,
+            '分句数量': len(segs),
+            '模型': 'SenseVoiceSmall',
+            '音频前处理': enh_desc,
+        })
+        write_srt(srt_path, segs)
+        log(f'  完成：{len(segs)} 句 / {chars} 字 / 耗时 {elapsed:.0f}s '
+            f'（{dur / max(elapsed, 1):.1f}x 实时）')
+        return txt_path
+    finally:
+        # 增强后的整段 wav 只服务本次转写，必须释放（4h 约 0.46GB）
+        if enh_wav:
+            force_unlink(enh_wav, log)
 
 
 def main():
