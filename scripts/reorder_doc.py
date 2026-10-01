@@ -65,11 +65,26 @@ def reorder(doc_path=None):
         sectPr = children[-1]
         children = children[:-1]
 
-    # 用 python-docx 识别 Heading 段落对应的 lxml 元素
-    # （w:pStyle 的 w:val 在某些模板里是 styleId 数字如 '4'，不可靠，故用 style.name 判定）
+    # 章节边界只认「大纲级别 2」的场次标题。
+    # ★ 2026-10-01 起文档开头多了「标题 1（月份大标题）+ 自动目录」，若仍把所有 Heading
+    #   当章节，月份标题解析不出日期（parse_key → 9999）会被排到文档最末，目录跟着被搬走。
+    #   （w:pStyle 的 w:val 在某些模板里是 styleId 数字如 '4'，不可靠，故统一走大纲级别判定）
+    try:
+        import summarize_gemini as SG
+    except Exception:
+        SG = None
     heading_els = set()
     for p in doc.paragraphs:
-        if (p.style.name or '').strip().startswith('Heading'):
+        lv = None
+        if SG is not None:
+            try:
+                lv = SG.heading_level(p)
+            except Exception:
+                lv = None
+        if lv is None:      # 兼容极旧文档：标题既没大纲级别也没内置样式名
+            if (p.style.name or '').strip().startswith('Heading'):
+                lv = 2
+        if lv == 2:
             heading_els.add(p._p)
 
     def is_heading(el):

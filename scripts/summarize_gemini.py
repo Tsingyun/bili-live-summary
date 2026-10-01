@@ -429,6 +429,217 @@ def open_or_create(path, font):
     return doc, True
 
 
+# ---------------- 标题样式 / 大纲级别 / 自动目录 ----------------
+# Word 里「快速定位与跳转」由三件套构成，缺一不可：
+#   1) 标题样式：内置样式「标题 1 / 标题 2 / 标题 3」（英文 Heading 1/2/3）；
+#   2) 大纲级别：Outline Level 1~9 级，正文段落为「正文文本」级；
+#   3) 导航窗格（视图 → 显示 → 导航窗格）与自动目录（引用 → 目录，本质是 TOC 域）
+#      都是按大纲级别收集条目的；目录可右键「更新域」或用 F9 刷新，永不手写。
+# 结论：每场总结只要用内置标题样式 + 正确的 outlineLvl，导航窗格与目录就同时可用。
+#
+# 为什么要显式写段落级 outlineLvl：本管线产出的 docx 会被第三方编辑器
+# （腾讯文档 / WPS）改写，内置样式可能被换成自动 styleId（实测过 styleId=000069、
+# w:name 仍是 heading 2 的情形），只靠样式不再保险。段落级 outlineLvl 是兜底。
+
+_HEADING_NAME_RE = re.compile(r'^head(ing)?\s*(\d+)$', re.I)
+
+
+def heading_level(p):
+    """返回段落的标题层级（1~9）；不是标题则返回 None。
+
+    优先读段落自身的 w:outlineLvl（0-based），其次按样式名解析。
+    """
+    pPr = p._p.pPr
+    if pPr is not None:
+        ol = pPr.find(qn('w:outlineLvl'))
+        if ol is not None:
+            try:
+                v = int(ol.get(qn('w:val')))
+                if 0 <= v <= 8:
+                    return v + 1
+            except Exception:
+                pass
+    name = (p.style.name or '').strip()
+    m = _HEADING_NAME_RE.match(name)
+    if m:
+        try:
+            lv = int(m.group(2))
+        except Exception:
+            return None
+        if 1 <= lv <= 9:
+            return lv
+    return None
+
+
+def set_outline_level(p, level):
+    """显式写段落级大纲级别（level=1 → w:val=0）。
+
+    不依赖样式也能被导航窗格 / TOC 识别，是样式被第三方编辑器改写后的保底手段。
+    """
+    try:
+        lv = max(1, min(9, int(level)))
+    except Exception:
+        return
+    pPr = p._p.get_or_add_pPr()
+    for old in pPr.findall(qn('w:outlineLvl')):
+        pPr.remove(old)
+    ol = OxmlElement('w:outlineLvl')
+    ol.set(qn('w:val'), str(lv - 1))
+    pPr.append(ol)
+
+
+def ensure_heading_style(doc, level, font, size_pt):
+    """确保 Heading N 样式存在且用正文字体（中文必须写 eastAsia）。
+
+    样式缺失时返回 None，调用方退回「普通段落 + 显式大纲级别」，功能不降级。
+    """
+    try:
+        st = doc.styles['Heading %d' % level]
+    except Exception:
+        return None
+    try:
+        st.font.name = font
+        rpr = st.element.get_or_add_rPr()
+        rfonts = rpr.get_or_add_rFonts()
+        rfonts.set(qn('w:ascii'), font)
+        rfonts.set(qn('w:hAnsi'), font)
+        rfonts.set(qn('w:eastAsia'), font)
+        st.font.size = Pt(size_pt)
+    except Exception:
+        pass
+    return st
+
+
+def normalize_outline_levels(doc, font=None):
+    """给文档里所有标题段落补齐/修正大纲级别（幂等）。返回实际修改的段落数。
+
+    同时把标题 run 的字体刷成正文指定字体（中文字体需写 eastAsia）。
+    """
+    n = 0
+    for p in doc.paragraphs:
+        lv = heading_level(p)
+        if not lv:
+            continue
+        pPr = p._p.pPr
+        ol = pPr.find(qn('w:outlineLvl')) if pPr is not None else None
+        if ol is None or ol.get(qn('w:val')) != str(lv - 1):
+            set_outline_level(p, lv)
+            n += 1
+        if font:
+            for r in p.runs:
+                set_font(r, font)
+    return n
+
+
+def has_toc(doc):
+    """文档里是否已存在 TOC 域（避免重复插入目录）。"""
+    for it in doc.element.body.iter(qn('w:instrText')):
+        if 'TOC' in (it.text or '').upper():
+            return True
+    return False
+
+
+def add_toc_paragraph(doc, levels='1-3', font=None):
+    """插入一个「可自动更新」的目录域 TOC \\o "1-3" \\h \\z \\u。
+
+    \\h=目录条目带超链接（可点击跳转）、\\z \\u=Web 版式视图下隐藏、\\u=使用段落大纲级别。
+    dirty=true 让 Word 打开时自动提示/执行更新，不需要手工重建。
+    """
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(6)
+
+    r1 = p.add_run()
+    fb = OxmlElement('w:fldChar')
+    fb.set(qn('w:fldCharType'), 'begin')
+    fb.set(qn('w:dirty'), 'true')
+    r1._r.append(fb)
+
+    r2 = p.add_run()
+    ins = OxmlElement('w:instrText')
+    ins.set(qn('xml:space'), 'preserve')
+    ins.text = ' TOC \\o "%s" \\h \\z \\u ' % (levels or '1-3')
+    r2._r.append(ins)
+
+    r3 = p.add_run()
+    fs = OxmlElement('w:fldChar')
+    fs.set(qn('w:fldCharType'), 'separate')
+    r3._r.append(fs)
+
+    # 域结果占位：Word 未刷新时显示这段提示（不含引号，避免被金句规则误判）
+    r4 = p.add_run()
+    if font:
+        set_font(r4, font)
+    r4.font.size = Pt(10)
+    r4.font.color.rgb = RGBColor(0x88, 0x88, 0x88)
+    r4.text = '（目录字段尚未刷新：在 Word 里右键目录 → 更新域，或 Ctrl+A 后按 F9）'
+
+    r5 = p.add_run()
+    fe = OxmlElement('w:fldChar')
+    fe.set(qn('w:fldCharType'), 'end')
+    r5._r.append(fe)
+    return p
+
+
+def month_title_from(heading):
+    """从场次标题里解析出年月，生成月份大标题；解析不出返回 None。"""
+    m = re.search(r'(\d{4})\s*[年\-/.]\s*(\d{1,2})', heading or '')
+    if not m:
+        return None
+    return '%s年%d月 直播总结' % (m.group(1), int(m.group(2)))
+
+
+def ensure_front_matter(doc, heading, font, levels='1-3', doc_title=None):
+    """幂等地在文档开头补齐「月份大标题 + 目录标题 + 可更新目录域 + 分页符」。
+
+    结构（大纲级别）：
+        标题 1  → 2026年9月 直播总结        （大纲级别 1）
+        普通段  → 目 录                    （正文级，不进目录）
+        TOC 域  → 自动目录                  （可右键更新域 / F9 刷新）
+        分页符
+        标题 2  → 各场次标题                （大纲级别 2，导航窗格可跳转）
+
+    已有 TOC 域时不重复插入；只做大纲级别修补。返回 True 表示本次有改动。
+    """
+    changed = normalize_outline_levels(doc, font) > 0
+    if has_toc(doc):
+        return changed
+    title = doc_title or month_title_from(heading)
+    if not title:
+        return changed
+
+    h1 = doc.add_paragraph()
+    st1 = ensure_heading_style(doc, 1, font, 18)
+    if st1 is not None:
+        try:
+            h1.style = st1
+        except Exception:
+            pass
+    r = h1.add_run(title)
+    set_font(r, font)
+    r.font.size = Pt(18)
+    r.bold = True
+    set_outline_level(h1, 1)
+
+    cap = doc.add_paragraph()
+    cap.paragraph_format.space_before = Pt(10)
+    cap.paragraph_format.space_after = Pt(4)
+    rc = cap.add_run('目 录')
+    set_font(rc, font)
+    rc.font.size = Pt(14)
+    rc.bold = True
+
+    toc = add_toc_paragraph(doc, levels, font)
+
+    br = doc.add_paragraph()
+    br.add_run().add_break(WD_BREAK.PAGE)
+
+    body = doc.element.body
+    for i, el in enumerate([h1._p, cap._p, toc._p, br._p]):
+        body.insert(i, el)
+    return True
+
+
 def has_section(doc, heading_text):
     """按标题文本精确匹配（不依赖样式），防止旧版本用普通段落写的标题被判为“不存在”而重复追加。"""
     ht = heading_text.strip()
@@ -764,10 +975,18 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
     返回被丢弃的行列表（供健康检查与测试断言）。"""
     para_quote = 0  # 每段金句计数，遇到新的总结段重置
     dropped = []
+    # 文档开头必须有「月份大标题(标题1) + 自动目录(TOC 域)」，幂等插入。
+    # 目录只是导航设施，任何异常都不能影响正文写入，故整段吞掉异常。
+    try:
+        ensure_front_matter(doc, heading, font)
+    except Exception:
+        pass
     if not first_in_doc:
         doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
+    ensure_heading_style(doc, 2, font, 14)
     h = doc.add_heading(heading, level=2)
+    set_outline_level(h, 2)      # 显式大纲级别 2：导航窗格 / 目录的识别依据
     for r in h.runs:
         set_font(r, font)
         r.font.size = Pt(14)

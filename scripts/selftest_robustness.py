@@ -941,6 +941,99 @@ def test_audio_enhance(tmp, v):
           '%s' % (p['frames'] if p else None))
 
 
+def test_docx_toc(tmp, v):
+    """[N] 标题样式 / 大纲级别 / 自动目录：导航窗格与 TOC 域的可用性。
+
+    要点：每场标题必须带内置标题样式 + 显式大纲级别；文档开头有且只有一个
+    「标题 1（月份）+ 可更新 TOC 域」，且目录必须排在所有场次标题之前。
+    front matter 的插入必须幂等（重复跑管线不能堆出一堆目录）。
+    """
+    print('\n[N] 标题样式 / 大纲级别 / 自动目录（导航窗格 + TOC 域）')
+    try:
+        import summarize_gemini as S
+        from docx import Document
+        from docx.oxml.ns import qn
+    except Exception as e:
+        check('N0 导入 docx 相关模块', False, str(e))
+        return
+
+    def levels(d):
+        return [x for x in (S.heading_level(p) for p in d.paragraphs) if x]
+
+    p = os.path.join(tmp, 'toc.docx')
+    doc, _ = S.open_or_create(p, '宋体')
+    S.append_section(doc, '测试场A 2026年10月01日20点场', ['直播日期 2026-10-01'],
+                     ['[00:00:10]正文一'], '宋体', True)
+    S.append_section(doc, '测试场B 2026年10月02日20点场', ['直播日期 2026-10-02'],
+                     ['[00:00:10]正文二'], '宋体', False)
+
+    lv = levels(doc)
+    check('N1 月份大标题为大纲级别 1（唯一）', lv.count(1) == 1, str(lv))
+    check('N2 每场标题为大纲级别 2', lv.count(2) == 2, str(lv))
+    check('N3 存在可更新的 TOC 域', S.has_toc(doc))
+    instr = ''.join((t.text or '') for t in doc.element.body.iter(qn('w:instrText')))
+    check('N4 TOC 收录 1-3 级并带超链接开关',
+          'TOC' in instr and '\\o "1-3"' in instr and '\\h' in instr, instr)
+    ps = doc.paragraphs
+    first_h2 = next(i for i, x in enumerate(ps) if S.heading_level(x) == 2)
+    toc_idx = next(i for i, x in enumerate(ps)
+                   if any((t.text or '') for t in x._p.iter(qn('w:instrText'))))
+    check('N5 目录排在所有场次标题之前', toc_idx < first_h2,
+          'toc=%d first_h2=%d' % (toc_idx, first_h2))
+    check('N6 front matter 顺序 标题1→目录→TOC→分页→标题2',
+          S.heading_level(ps[0]) == 1 and ps[1].text.strip() == '目 录'
+          and toc_idx == 2 and S.heading_level(ps[4]) == 2,
+          [x.text[:12] for x in ps[:5]])
+
+    n_before = len(ps)
+    S.ensure_front_matter(doc, '测试场A 2026年10月01日20点场', '宋体')
+    check('N7 重复调用不重复插入 front matter',
+          len(doc.paragraphs) == n_before and levels(doc).count(1) == 1,
+          '%d -> %d' % (n_before, len(doc.paragraphs)))
+
+    # 旧文档（已有正文、无目录）追加章节时：补 front matter 且不得吞掉原有正文
+    d2 = Document()
+    d2.add_paragraph('旧正文段')
+    S.append_section(d2, '测试场C 2026年10月03日20点场', [], ['正文三'], '宋体', False)
+    texts = [x.text for x in d2.paragraphs]
+    check('N8 旧文档补目录后原有正文仍在', '旧正文段' in texts and '正文三' in texts,
+          str(texts[:6]))
+    check('N9 旧文档同样获得 H1 + TOC',
+          levels(d2).count(1) == 1 and S.has_toc(d2))
+    first_h2_2 = next(i for i, x in enumerate(d2.paragraphs) if S.heading_level(x) == 2)
+    check('N10 front matter 插到文档最前（旧正文在其后）',
+          d2.paragraphs[0].text.startswith('2026年10月') and first_h2_2 > 0,
+          'p0=%r first_h2=%d' % (d2.paragraphs[0].text, first_h2_2))
+
+    # heading_level / set_outline_level 的单元行为
+    d3 = Document()
+    pa = d3.add_paragraph('普通段')
+    check('N11 普通段落不是标题', S.heading_level(pa) is None, str(S.heading_level(pa)))
+    S.set_outline_level(pa, 3)
+    check('N12 手工写的大纲级别可被识别', S.heading_level(pa) == 3)
+    ol = pa._p.pPr.find(qn('w:outlineLvl'))
+    check('N13 outlineLvl 存的是 level-1',
+          ol is not None and ol.get(qn('w:val')) == '2',
+          ol.get(qn('w:val')) if ol is not None else None)
+    S.set_outline_level(pa, 99)
+    check('N14 越界级别被夹到 9', S.heading_level(pa) == 9, str(S.heading_level(pa)))
+
+    # 重排章节不能把 front matter（月份标题 + 目录）当成章节搬走
+    try:
+        import reorder_doc as RD
+    except Exception as e:
+        check('N15 导入 reorder_doc', False, str(e))
+        return
+    p3 = os.path.join(tmp, 'toc_reorder.docx')
+    S.save_doc_atomic(doc, p3)
+    RD.reorder(p3)
+    d4 = Document(p3)
+    check('N15 重排后 front matter 仍在最前',
+          S.heading_level(d4.paragraphs[0]) == 1 and S.has_toc(d4),
+          d4.paragraphs[0].text[:20])
+    check('N16 重排后场次数量不变', levels(d4).count(2) == 2, str(levels(d4)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -959,6 +1052,7 @@ def main():
         test_docx_healthcheck(tmp, args.verbose)
         test_bili_upload(tmp, args.verbose)
         test_audio_enhance(tmp, args.verbose)
+        test_docx_toc(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

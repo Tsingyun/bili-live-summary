@@ -406,6 +406,14 @@ python scripts/docx_healthcheck.py --doc "C:/.../岁己直播总结_2026年9月.
 ## 硬约束（务必保持）
 - 转录文本**必须按 30 分钟切块逐块发送 AI**，绝不允许整篇一次性发送（防超长 / 超时 / 截断）。
 - Word 文档：同月复用同一文档，每场新直播插入**分页符 + Heading2 标题**区分；总结段=**粗体 11pt**，金句=**灰色(#666666)斜体 10pt**（格式错误由 `docx_healthcheck.py` 自动纠正）。
+- ★ **标题样式 / 大纲级别 / 自动目录**（导航三件套，2026-10-01 起强制）：
+  - 层级固定为「**标题 1** = 月份大标题（`YYYY年M月 直播总结`）→ **标题 2** = 每场总结标题」。
+  - 每场标题必须同时具备：内置标题样式 **+ 段落级 `w:outlineLvl`**（`summarize_gemini.set_outline_level`）。
+    只写样式不够——docx 被腾讯文档 / WPS 改写后内置样式可能退化成自动 styleId，大纲级别是兜底。
+  - 文档开头必须有**可自动更新的目录**：`TOC \o "1-3" \h \z \u` 域（带 `dirty=true`，Word 打开即刷新），
+    由 `summarize_gemini.ensure_front_matter()` **幂等**插入（已有 TOC 时不重复插）。
+  - 对历史文档补结构用 `python docx_toc.py <docx> [--dry-run]`（正文一字不改，自动备份 `.bak_toc`）。
+  - `reorder_doc.py` 的章节边界**只认大纲级别 2**：否则月份大标题会因解析不出日期被排到文档最末，目录跟着被搬走。
 - **章节元数据行（必须）**：每个 Heading2 章节标题下方必须紧跟一行元数据：`直播日期 YYYY-MM-DD  |  时长 HH:MM:SS  |  N/N 段  |  总结于 YYYY-MM-DD HH:MM`；本地 / B站场次另起一行 `来源 <本地 mp4/flv 路径 或 https://www.bilibili.com/video/BVxxxx>`。旁路本地路径（`regen_gemini_v2.process_session`）与自动化路径（`summarize_gemini.append_section`）生成的元数据格式**必须完全一致**。
 - 断点续跑：每场每阶段写入 state.json，中断重跑自动跳过已完成部分。
 - 热词纠正：转写之后、送 AI 之前必须对 TXT/SRT 做一遍热词替换（`hotwords.md`，含主播名/术语/歌名/保护规则），确保送进模型的文本已纠正。
