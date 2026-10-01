@@ -55,7 +55,27 @@
 八、严格执行要求：
 不得遗漏关键信息，不得偷懒简化；信息过多时优先拆段而不是扩写；所有规则必须同时满足；若输出出现冗长、解释性或接近原文复述，必须重新压缩。
 
-九、输出前自检清单（逐条核对，任一条不满足必须重写后再输出）：
+九、专有名词书写规范（全局约束条款，适用于本提示词产出的全部文字）：
+1. 作品序号用阿拉伯数字：《复联3》《雷神3》《奇异博士1》《最终幻想14》《第2季》《第3部》；
+   不得写《复联三》《雷神三》《第三部》。仅续作、部数、季数、集数这类序号如此转换。
+2. 品牌、产品、技术名词一律用官方写法：iPhone、iPad、macOS、iOS、iCloud、AirPods、GitHub、YouTube、
+   Twitch、Discord、Steam、PlayStation 5（PS5）、Nintendo Switch、NVIDIA、GeForce RTX 5070 Ti、
+   Windows、Android、JavaScript、Python、Node.js、OBS、Photoshop、Blender、Wi-Fi、Bluetooth、USB-C、HDMI。
+   不得写成 Iphone、IPad、Macos、Ios、Github、Wifi、Switch（单独出现时写 Nintendo Switch）、Nvidia 等。
+3. 缩略语按通行标准大写：AI、API、GPU、CPU、SSD、HDD、RAM、ROM、USB、HDMI、DP、HDR、RGB、DLSS、FSR、
+   VR、AR、ASMR、VTuber、NPC、DLC、GTA、UI、UX、URL、HTTP、HTTPS、JSON、SQL、OCR、TTS、ASR、LLM、
+   MP3、MP4、HEVC、H.264。唯一例外：帧率单位写 fps（小写）。
+4. 计量单位与技术符号按 SI / IEEE 通行写法：存储 GB/MB/KB/TB（B 大写）；速率 Mbps/Gbps（b 小写）；
+   频率 Hz/kHz/MHz/GHz（H 大写、z 小写）；分贝 dB；分辨率 2K/4K/8K（K 大写）；
+   版本号 v2.0（小写 v 加点分）；显卡型号 RTX 5070 Ti（Ti 首字母大写且与型号间留空格）。
+5. 数字与单位之间不加空格（8GB、165Hz、100Mbps）；中文行文里用中文单位（3 分钟、30%）。
+6. 遇到不确定写法的处理原则：① 有官方写法 → 从官方；② 无官方 → 从通行标准；
+   ③ 两者都没有 → 保留转写稿里的原样写法，不得臆造、不得自行音译；
+   ④ 同一事物在同一文档内必须写法一致，优先沿用前文已出现的写法。
+7. 豁免范围（不得套用本规范改写）：录播原标题与文件名、逐字摘录的金句原文、成语与惯用语
+   （第一时间、三心二意、第一人称）、代码与命令行。
+
+十、输出前自检清单（逐条核对，任一条不满足必须重写后再输出）：
 · 全文没有出现“她/他/主播/UP主/观众/粉丝/大家”等违规指称。
 · 每个总结行都以 [HH:MM:SS] 开头、以“{streamer}”为主语、以句号结尾，且时间戳后有正文。
 · 每个总结行的长度都落在 100–180 字区间内。

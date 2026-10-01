@@ -1060,6 +1060,94 @@ def test_docx_toc(tmp, v):
           os.path.basename(p3))
 
 
+def test_terminology(tmp, v):
+    """[O] 专有名词书写规范（全局约束条款）。
+
+    要点：作品序号用阿拉伯数字、品牌用官方写法、单位按 SI/IEEE；
+    **金句行必须完全豁免**（逐字原文不得改写）；幂等（二次规范化零改动）。
+    """
+    print('\n[O] 专有名词书写规范（全局约束条款）')
+    try:
+        import terminology as TERM
+        import summarize_gemini as S
+        import docx
+    except Exception as e:
+        check('O0 导入 terminology / docx 模块', False, str(e))
+        return
+
+    def norm(s, q=False):
+        return TERM.normalize(s, is_quote=q)[0]
+
+    # --- 作品序号：中文数字 → 阿拉伯数字 ---
+    check('O1 《复联三》→《复联3》', '《复联3》' in norm('岁己看了《复联三》。'))
+    check('O2 《雷神三》《奇异博士一》转阿拉伯',
+          norm('《雷神三》《奇异博士一》') == '《雷神3》《奇异博士1》',
+          norm('《雷神三》《奇异博士一》'))
+    check('O3 《最终幻想十四》→14（支持「十」）',
+          norm('《最终幻想十四》') == '《最终幻想14》', norm('《最终幻想十四》'))
+    # --- 保护：作品名固有中文数字不得改 ---
+    check('O4 《三体》保持原样', norm('在读《三体》') == '在读《三体》')
+    check('O5 《第五人格》保持原样', norm('玩《第五人格》') == '玩《第五人格》')
+    check('O6 《落秋的第一场雨》保持原样',
+          norm('听《落秋的第一场雨》') == '听《落秋的第一场雨》')
+    # --- 大小写 / 官方拼写 ---
+    r = norm('iphone / IPad / Macos / ios / icloud / Github')
+    check('O7 品牌官方写法',
+          all(x in r for x in ['iPhone', 'iPad', 'macOS', 'iOS', 'iCloud', 'GitHub']), r)
+    check('O8 已是官方写法时不再改动', norm('用 iPhone 和 macOS') == '用 iPhone 和 macOS')
+    # --- 金句豁免：逐字原文不得改写 ---
+    q = '「我今天 iphone 坏了，《复联三》真好看」'
+    check('O9 金句行完全豁免（不改写）', TERM.normalize(q, is_quote=True)[0] == q)
+    # --- 型号 / 单位 ---
+    check('O10 5070ti → RTX 5070 Ti（不重复叠加 RTX）',
+          norm('换 5070ti') == '换 RTX 5070 Ti', norm('换 5070ti'))
+    check('O11 已有 RTX 前缀不重复叠加',
+          norm('用 RTX 5070 Ti') == '用 RTX 5070 Ti')
+    r = norm('8gb 显存，165hz 屏，100mbps，30db')
+    check('O12 计量单位', all(x in r for x in ['8GB', '165Hz', '100Mbps', '30dB']), r)
+    check('O13 4k→4K', '4K' in norm('4k 分辨率'))
+    check('O14 「2k字」是「两千」不转 K', norm('2k字') == '2k字', norm('2k字'))
+    check('O15 版本号 V2.0→v2.0', norm('V2.0 版') == 'v2.0 版', norm('V2.0 版'))
+    check('O16 NPC 不被 pc→PC 误伤', 'NPC' in norm('打 NPC 用 pc 玩'), norm('打 NPC 用 pc 玩'))
+    # --- 剧集序号 vs 成语 ---
+    check('O17 第二季/第三部 转阿拉伯',
+          norm('看第二季和第三部') == '看第2季和第3部', norm('看第二季和第三部'))
+    check('O18 成语惯用不动（第一时间/三心二意）',
+          norm('第一时间和三心二意') == '第一时间和三心二意')
+    # --- 其它 ---
+    check('O19 wifi→Wi-Fi、b站→B站',
+          norm('连 wifi 看 b站') == '连 Wi-Fi 看 B站', norm('连 wifi 看 b站'))
+    check('O20 幂等：二次规范化零改动',
+          TERM.normalize(norm('《复联三》 iphone 8gb 5070ti'))[1] == [])
+    check('O21 空文本 / 非字符串不炸', TERM.normalize('')[0] == '')
+
+    # --- 文档级：体检能检出并修复 ---
+    p = os.path.join(tmp, 'term.docx')
+    if os.path.exists(p):
+        os.remove(p)
+    d = S.open_or_create(p, '思源宋体CN Light')[0]
+    S.append_section(d, '测试场 2026年10月02日20点场', ['直播日期 2026-10-02'],
+                     ['[00:01:00] 岁己看了《复联三》，用 iphone 录了 8gb 素材，'
+                      '显卡是 5070ti。', '「我 iphone 就是坏了」'],
+                     '思源宋体CN Light', True)
+    S.save_doc_atomic(d, p, None)
+    # 写入点已集成规范化 → 落地文档应当直接合规（这是比「事后修复」更强的保证）
+    raw = '[00:01:00] 岁己看了《复联三》，用 iphone 录了 8gb 素材，显卡是 5070ti。'
+    check('O22 原始文本确有违规（≥3 处）',
+          len(TERM.find_violations(raw)) >= 3, str(TERM.find_violations(raw)))
+    n, detail = TERM.scan_docx(p, fix=False)
+    check('O22b 写入路径已规范化 → 落地文档 0 违规', n == 0, str(detail[:4]))
+    # 金句在文档里也不该被计入
+    check('O23 文档扫描不计金句（iphone 原文保留）',
+          '「我 iphone 就是坏了」' in '\n'.join(x.text for x in d.paragraphs))
+    n2, _ = TERM.scan_docx(p, fix=True)
+    d2 = docx.Document(p)
+    txt = '\n'.join(x.text for x in d2.paragraphs)
+    check('O24 修复后写入文档', '《复联3》' in txt and 'iPhone' in txt and 'RTX 5070 Ti' in txt,
+          txt[:120])
+    check('O25 修复幂等（二次扫描 0 处）', TERM.scan_docx(p, fix=False)[0] == 0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1079,6 +1167,7 @@ def main():
         test_bili_upload(tmp, args.verbose)
         test_audio_enhance(tmp, args.verbose)
         test_docx_toc(tmp, args.verbose)
+        test_terminology(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

@@ -185,7 +185,7 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
     ps = doc.paragraphs
 
     issues = {'quote_format': [], 'md_residue': [], 'abnormal': [],
-              'hotword_residue': [], 'structure': []}
+              'hotword_residue': [], 'structure': [], 'terminology': []}
     to_delete = []
     fixed = 0
     sections = []          # (idx, 日期标题文本)
@@ -296,6 +296,31 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
             issues['structure'].append({
                 'section': title[:60], 'sev': 'low',
                 'detail': '本章节没有任何金句（可能模型未输出，或写入时被误过滤）'})
+
+    # --- 专有名词书写规范（全局约束）---
+    #   只作用于「正文总结段」：金句行（逐字原文）与标题（录播原标题）一律豁免。
+    try:
+        import terminology as TERM
+    except Exception:                                 # pragma: no cover
+        TERM = None
+    if TERM is not None:
+        for p in ps:
+            if S.heading_level(p):
+                continue
+            t = p.text.strip()
+            if not t or S.is_quote_line(t):
+                continue
+            for r in [x for x in p.runs if x.text]:
+                new, ch = TERM.normalize(r.text, is_quote=False)
+                if not ch:
+                    continue
+                for a, b in ch:
+                    issues['terminology'].append({
+                        'section': (p.text or '')[:40], 'sev': 'mid',
+                        'detail': '专有名词写法：%s → %s' % (a, b)})
+                if fix:
+                    r.text = new
+                    fixed += len(ch)
 
     # --- 统一删段（索引会变，放最后）---
     if fix and to_delete:

@@ -399,6 +399,35 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ★ 改提示词后必做两项验证：① `prompt_leak_hits` / `is_meta_line` 对**已有文档正文**的误杀数必须为 0
 （提示词变长会增加指纹，实测 9 月 1615 行 + 10 月 73 行均 0 误杀）；② 跑 `selftest_robustness` + `selftest_model_router`。
 
+### 7.2 专有名词书写规范（全局约束条款，2026-10-02）
+
+**为什么必须做成代码而不是只写进提示词**：10/1 那场模型照样输出了《复联三》《雷神三》《奇异博士一》——
+提示词只能降低违规率，**只有确定性后处理才能保证 100% 一致**。故采用三层：
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| ① 源头 | `prompt_original.txt` / `prompt_template.txt` **第九节** | 让模型尽量一次写对 |
+| ② 写入点 | `summarize_gemini.append_section`（总结行 + 概要） | 落地前规范化，金句行豁免 |
+| ③ 体检 | `docx_healthcheck` 新增 `terminology` 类别 + `terminology.py --scan [--fix]` | 存量文档可扫可修 |
+
+规范表与实现都在 `scripts/terminology.py`（`CASE_FIX` / `PHRASE_FIX` / `UNIT_FIX` / `PROTECT_TITLES`）。
+
+**必须记住的四条边界**：
+1. **金句行完全豁免**——金句要求逐字摘自原文，即使原文写 `iphone` 也不能改成 `iPhone`。
+   `normalize(text, is_quote=True)` 直接原样返回。
+2. **录播原标题 / 文件名 / 来源路径豁免**——如 9 月那批「5070ti版」标题、`D:\录播\...\xxx.mp4` 路径，
+   属原始数据，改了就对不上源文件。
+3. **作品名固有中文数字豁免**——《三体》《第五人格》《第一滴血》《落秋的第一场雨》在 `PROTECT_TITLES` 里；
+   只转**结尾的序号**（《复联三》→《复联3》），「第一/之一/唯一/统一/专一」命中即不转。
+4. **`\b` 是坑**——Python 的 `\b` Unicode 感知，「购买**5070Ti**」中「买」和「5」都算词字符，
+   边界不成立导致规则静默失效。PHRASE_FIX 一律用 `(?<![A-Za-z0-9])` / `(?![A-Za-z0-9])`。
+
+**不确定写法处理原则**：① 有官方写法→从官方；② 无官方→从通行标准（SI/IEEE）；
+③ 都没有→**保留原样，不臆造不音译**；④ 同一文档内写法必须一致。
+
+回归：`[O]` 组 26 项，`selftest_robustness` 126 → **152 项**全过。
+存量修正：10 月 5 处 + 9 月 34 处（备份 `.bak_term_20261002`，正文段落数与 70/1513 条金句逐字未变）。
+
 ```bash
 # 只体检（不改文件）
 python scripts/docx_healthcheck.py --workdir "<工作目录>" --verbose

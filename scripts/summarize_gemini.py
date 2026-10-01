@@ -29,6 +29,11 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 
+try:
+    import terminology as TERM
+except Exception:                                     # pragma: no cover
+    TERM = None      # 规范模块缺失时静默降级，绝不影响正文写入
+
 from common import (load_config, Logger, hms, parse_hms, live_date,
                     force_unlink, force_rmtree)
 
@@ -1006,6 +1011,7 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
     返回被丢弃的行列表（供健康检查与测试断言）。"""
     para_quote = 0  # 每段金句计数，遇到新的总结段重置
     dropped = []
+    term_fixes = []   # 专有名词规范化改动（仅统计，不影响正文写入）
     # 文档开头必须有「月份大标题(标题1) + 自动目录(TOC 域)」，幂等插入。
     # 目录只是导航设施，任何异常都不能影响正文写入，故整段吞掉异常。
     try:
@@ -1026,10 +1032,16 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
 
     # 内容概要：紧贴标题下方，正常字重 prose，与下方加粗要点形成层级
     if overview and overview.strip():
+        _ov = overview.strip()
+        if TERM is not None:
+            _ov, _ovc = TERM.normalize(_ov)
+            if _ovc and log:
+                log.info('  专有名词规范化（概要）：%s'
+                         % '；'.join('%s→%s' % (a, b) for a, b in _ovc[:5]))
         _op = doc.add_paragraph()
         _op.paragraph_format.space_after = Pt(6)
         _op.paragraph_format.line_spacing = 1.4
-        _or = _op.add_run(overview.strip())
+        _or = _op.add_run(_ov)
         set_font(_or, font)
         _or.font.size = Pt(11)
 
@@ -1069,6 +1081,11 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
                 r.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
             else:
                 para_quote = 0  # 遇到新的总结段，重置该段金句计数
+                # ★ 专有名词书写规范（全局约束）：只作用于「总结行」。
+                #   金句行必须逐字摘自原文，即使写法违规也不改写（is_quote 分支不动）。
+                if TERM is not None:
+                    line, _tc = TERM.normalize(line, is_quote=False)
+                    term_fixes.extend(_tc)
                 p = doc.add_paragraph()
                 p.paragraph_format.space_after = Pt(4)
                 p.paragraph_format.line_spacing = 1.35
@@ -1080,6 +1097,14 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
     if dropped and log:
         log.error('  已拦截 %d 行非正文内容（提示词回显/元话语），未写入文档：%s'
                   % (len(dropped), ' | '.join(d[:40] for d in dropped[:3])))
+    if term_fixes and log:
+        seen = {}
+        for a, b in term_fixes:
+            seen[(a, b)] = seen.get((a, b), 0) + 1
+        log.info('  专有名词书写规范：修正 %d 处（%s）'
+                 % (len(term_fixes),
+                    '、'.join('%s→%s×%d' % (a, b, c)
+                              for (a, b), c in list(seen.items())[:6])))
     return dropped
 
 
