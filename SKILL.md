@@ -414,6 +414,14 @@ python scripts/docx_healthcheck.py --doc "C:/.../岁己直播总结_2026年9月.
     由 `summarize_gemini.ensure_front_matter()` **幂等**插入（已有 TOC 时不重复插）。
   - 对历史文档补结构用 `python docx_toc.py <docx> [--dry-run]`（正文一字不改，自动备份 `.bak_toc`）。
   - `reorder_doc.py` 的章节边界**只认大纲级别 2**：否则月份大标题会因解析不出日期被排到文档最末，目录跟着被搬走。
+- ★ **月度归档（2026-10-02 起）**：新总结一律写入**「直播日期所属月份」的文档**，往月文档原样归档、不再追加，**绝不跨月混写**。
+  - 保存路径：`C:\Users\Tsing\DeskBox\文档\岁己直播总结_{year}年{month}月.docx`
+    （`config.output.doc_dir` = `C:\Users\Tsing\DeskBox\文档`，`doc_name_pattern` = `岁己直播总结_{year}年{month}月.docx`）
+  - 每月 1 日第一次跑 `daily_pipeline` 时，步骤 0.5 由 `S.ensure_month_doc()` **自动新建**当月文档（幂等），
+    新文档一建立就带月份大标题 + 自动目录；文档内按时间升序逐场记录，场次之间用**分页符**明确分隔。
+  - 命名校验：文件名年月必须等于**该文档所收录场次的直播年月**（新建时按 `datetime.date.today()` 取，
+    系统跨月后立即生效）；发现不一致一律按实际年月命名。
+  - 唯一例外：补录往月缺失场次时仍写回该月文档（保证归档完整），这不算跨月混写。
 - **章节元数据行（必须）**：每个 Heading2 章节标题下方必须紧跟一行元数据：`直播日期 YYYY-MM-DD  |  时长 HH:MM:SS  |  N/N 段  |  总结于 YYYY-MM-DD HH:MM`；本地 / B站场次另起一行 `来源 <本地 mp4/flv 路径 或 https://www.bilibili.com/video/BVxxxx>`。旁路本地路径（`regen_gemini_v2.process_session`）与自动化路径（`summarize_gemini.append_section`）生成的元数据格式**必须完全一致**。
 - 断点续跑：每场每阶段写入 state.json，中断重跑自动跳过已完成部分。
 - 热词纠正：转写之后、送 AI 之前必须对 TXT/SRT 做一遍热词替换（`hotwords.md`，含主播名/术语/歌名/保护规则），确保送进模型的文本已纠正。

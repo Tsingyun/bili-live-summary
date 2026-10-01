@@ -1326,6 +1326,18 @@ def main():
         st = load_state(cfg)
         cookies = load_cookies(cfg['paths'].get('cookies'))
 
+        # ---- 步骤 0.5：确保「当月」文档已建立 ----
+        # ★ 归档语义（2026-10-02 起）：往月文档只读、原样归档；新总结只写「直播日期
+        #   所属月份」的文档，绝不跨月混写。每月 1 日第一次跑管线时自动新建当月文档。
+        if not args.dry_run:
+            try:
+                _mdoc, _mcreated = S.ensure_month_doc(cfg, log)
+                log('[步骤0.5] 当月归档文档：%s（%s）'
+                    % (os.path.basename(_mdoc), '新建' if _mcreated else '已存在'))
+            except Exception as e:
+                # 建文档失败不该拖垮整轮：真正写入时 append_section 还会再兜一次
+                log.error('当月文档初始化失败（不影响后续，写入时自动兜底）：%s' % e)
+
         # ---- 步骤 1：监测本地根目录 ----
         touch('步骤1 监测本地录播')
         sessions = scan_root_sessions(cfg, log)

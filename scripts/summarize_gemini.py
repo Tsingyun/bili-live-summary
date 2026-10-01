@@ -640,6 +640,37 @@ def ensure_front_matter(doc, heading, font, levels='1-3', doc_title=None):
     return True
 
 
+def month_doc_title(d):
+    """月度文档的开头大标题：『2026年10月 直播总结』。"""
+    return '%d年%d月 直播总结' % (d.year, d.month)
+
+
+def ensure_month_doc(cfg, log=None, today=None, font=None):
+    """确保「当月」的月度文档已存在，且带月份大标题 + 自动目录。
+
+    ★ 归档语义（2026-10-02 起）：往月文档一律只读、原样归档；
+      新总结只写「直播日期所属月份」的文档，绝不跨月混写。
+      每月 1 日第一次跑管线时自动新建当月文档（之后幂等，重复跑只补目录不重写）。
+
+    返回 (path, created)；created=True 表示本次是新建。
+    """
+    today = today or datetime.date.today()
+    font = font or (cfg.get('output') or {}).get('font', '思源宋体CN Light')
+    path = doc_path_for(cfg, datetime.date(today.year, today.month, 1))
+    exists = os.path.exists(path)
+    doc, _created = open_or_create(path, font)
+    changed = ensure_front_matter(doc, None, font, doc_title=month_doc_title(today))
+    if changed or not exists:
+        save_doc_atomic(doc, path, log=log)
+    if log is not None:
+        try:
+            log('[月度文档] %s（%s）' % (os.path.basename(path),
+                                    '本月新建' if not exists else '已存在/已补目录'))
+        except Exception:
+            pass
+    return path, (not exists)
+
+
 def has_section(doc, heading_text):
     """按标题文本精确匹配（不依赖样式），防止旧版本用普通段落写的标题被判为“不存在”而重复追加。"""
     ht = heading_text.strip()

@@ -1033,6 +1033,32 @@ def test_docx_toc(tmp, v):
           d4.paragraphs[0].text[:20])
     check('N16 重排后场次数量不变', levels(d4).count(2) == 2, str(levels(d4)))
 
+    # 月度文档：按实际年月新建，往月文档只读归档，绝不跨月混写
+    import datetime as _dt
+    docs = os.path.join(tmp, 'docs')
+    os.makedirs(docs, exist_ok=True)
+    cfg = {'output': {'doc_dir': docs, 'font': '宋体',
+                      'doc_name_pattern': '岁己直播总结_{year}年{month}月.docx'},
+           'summarize': {}}
+    p1, c1 = S.ensure_month_doc(cfg, None, today=_dt.date(2026, 10, 1))
+    check('N17 月度文档按实际年月新建',
+          c1 and os.path.basename(p1) == '岁己直播总结_2026年10月.docx',
+          os.path.basename(p1))
+    d5 = Document(p1)
+    check('N17b 新文档一建立就带月份大标题与目录',
+          S.heading_level(d5.paragraphs[0]) == 1
+          and d5.paragraphs[0].text == '2026年10月 直播总结' and S.has_toc(d5),
+          d5.paragraphs[0].text[:24])
+    p2, c2 = S.ensure_month_doc(cfg, None, today=_dt.date(2026, 10, 1))
+    check('N18 重复调用不重建也不重复插目录',
+          (not c2) and p2 == p1
+          and len(Document(p2).paragraphs) == len(d5.paragraphs),
+          'created=%s %d vs %d' % (c2, len(Document(p2).paragraphs), len(d5.paragraphs)))
+    p3, c3 = S.ensure_month_doc(cfg, None, today=_dt.date(2026, 11, 1))
+    check('N18b 换月即新建另一份文档（不跨月混写）',
+          c3 and os.path.basename(p3) == '岁己直播总结_2026年11月.docx',
+          os.path.basename(p3))
+
 
 def main():
     ap = argparse.ArgumentParser()
