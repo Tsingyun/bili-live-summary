@@ -56,15 +56,48 @@ def is_backup_file(path):
     return bool(_BACKUP_HINT.search(os.path.basename(path)))
 
 
-def _has_residue(text, orig):
-    """判断 text 里是否残留热词原词 orig。
+def _protect_spans(text, protect):
+    """保护词在 text 里覆盖的区间 [(start, end), ...]（含重叠，供残留判定排除）。"""
+    spans = []
+    for w in protect or ():
+        if not w:
+            continue
+        start = 0
+        while True:
+            j = text.find(w, start)
+            if j < 0:
+                break
+            spans.append((j, j + len(w)))
+            start = j + 1
+    return spans
 
-    ★ 关键：英文/数字原词必须按**词边界**匹配，否则 `PC` 会命中 `NPC`（实测误报 21 处）。
+
+def _has_residue(text, orig, protect=None):
+    """判断 text 里是否残留热词原词 orig；被保护词覆盖到的命中不算残留。
+
+    ★ 关键1：英文/数字原词必须按**词边界**匹配，否则 `PC` 会命中 `NPC`（实测误报 21 处）。
       中文原词无词边界概念，用普通子串匹配。
+    ★ 关键2：保护词覆盖的位置要跳过。实测：保护「几秒」之后，
+      「为了少离开饼干岁几秒」里的「岁几」是正常表达，不该被建议补表替换。
     """
+    hits = []
     if orig.isascii():
-        return re.search(r'(?<![A-Za-z0-9])%s(?![A-Za-z0-9])' % re.escape(orig), text) is not None
-    return orig in text
+        for m in re.finditer(r'(?<![A-Za-z0-9])%s(?![A-Za-z0-9])' % re.escape(orig), text):
+            hits.append((m.start(), m.end()))
+    else:
+        start = 0
+        while True:
+            j = text.find(orig, start)
+            if j < 0:
+                break
+            hits.append((j, j + len(orig)))
+            start = j + 1
+    if not hits:
+        return False
+    spans = _protect_spans(text, protect) if protect else []
+    if spans:
+        hits = [h for h in hits if not any(h[0] < e and s < h[1] for s, e in spans)]
+    return bool(hits)
 
 
 class _Log:
@@ -244,7 +277,7 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
             for a, b in hotword_rules:
                 if not a or a == b or len(a) < 2:
                     continue
-                if _has_residue(t, a):
+                if _has_residue(t, a, hotword_protect):
                     issues['hotword_residue'].append({
                         'idx': i, 'sev': 'mid', 'orig': a, 'repl': b, 'text': t[:100]})
 
