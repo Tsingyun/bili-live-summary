@@ -1107,7 +1107,10 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
         seen = {}
         for a, b in term_fixes:
             seen[(a, b)] = seen.get((a, b), 0) + 1
-        log.info('  专有名词书写规范：修正 %d 处（%s）'
+        # ★ common.Logger 只有 __call__ / error（没有 info 方法）。
+        #   这里写成 log.info 会在「本场确有术语修正」时抛 AttributeError 中断写文档
+        #   ——2026-10-02 重跑踩到：首轮 0 处修正不触发，重跑有修正才崩。
+        log('  专有名词书写规范：修正 %d 处（%s）'
                  % (len(term_fixes),
                     '、'.join('%s→%s×%d' % (a, b, c)
                               for (a, b), c in list(seen.items())[:6])))

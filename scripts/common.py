@@ -361,6 +361,20 @@ class Logger:
         except Exception:
             pass
 
+    # ★ 标准 logging 级别别名（防御性）：历史上有人在 summarize_gemini 里写 log.info(...)，
+    #   Logger 只有 __call__/error → 只在「确有术语修正」那条分支才触发，
+    #   首次跑（0 修正）完全看不出来，重跑时才崩。补全别名，写错级别也不至于中断管线。
+    def info(self, msg):
+        self(msg, 'INFO')
+
+    def warning(self, msg):
+        self(msg, 'WARN')
+
+    warn = warning
+
+    def debug(self, msg):
+        self(msg, 'DEBUG')
+
 
 # ---------- B站 ----------
 def load_cookies(path):

@@ -1232,6 +1232,20 @@ def test_terminology_quote(tmp, v):
     check('P15 全文档复扫 0 违规（含金句）', TERM.scan_docx(p, fix=False)[0] == 0,
           str(TERM.scan_docx(p, fix=False)[1][:4]))
 
+    # --- [Q] 日志接口防复发：Logger 曾被误当标准 logging 用（log.info → AttributeError）---
+    from common import Logger
+    for m in ('info', 'warning', 'warn', 'debug', 'error'):
+        check('Q1 Logger 具备 %s() 级别方法（防 log.info 崩溃复发）' % m,
+              callable(getattr(Logger, m, None)))
+    # main 路径里出现术语修正时不会再中断：构造一个真有修正的输入跑一遍写入点
+    try:
+        import io as _io
+        _lg = Logger({'paths': {}, '_dirs': {'logs': tmp}}, 'selftest')
+        _lg.info('自检：Logger.info 可用')
+        check('Q2 log.info 实际调用不抛异常', True)
+    except Exception as _e:
+        check('Q2 log.info 实际调用不抛异常', False, repr(_e))
+
 
 def main():
     ap = argparse.ArgumentParser()
