@@ -1071,6 +1071,13 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
                 if para_quote >= 2:
                     continue  # 该段金句已达 2 句上限，跳过多余金句行
                 para_quote += 1
+                # ★ 专有名词书写规范：金句也适用（2026-10-02）。
+                #   金句虽是逐字原文，但其中的人名 / 地名 / 机构名 / 产品名 / 专业术语
+                #   必须与正文、标题、摘要写法完全一致，否则同一场里会出现 iphone / iPhone 两种写法。
+                #   is_quote=True 只做术语层面替换，不动语气、口语词、标点与断句。
+                if TERM is not None:
+                    line, _tc = TERM.normalize(line, is_quote=True)
+                    term_fixes.extend(_tc)
                 p = doc.add_paragraph()
                 p.paragraph_format.space_after = Pt(4)
                 p.paragraph_format.line_spacing = 1.35
@@ -1081,8 +1088,7 @@ def append_section(doc, heading, meta_lines, segments, font, first_in_doc, overv
                 r.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
             else:
                 para_quote = 0  # 遇到新的总结段，重置该段金句计数
-                # ★ 专有名词书写规范（全局约束）：只作用于「总结行」。
-                #   金句行必须逐字摘自原文，即使写法违规也不改写（is_quote 分支不动）。
+                # ★ 专有名词书写规范（全局约束）：作用于「总结行」。
                 if TERM is not None:
                     line, _tc = TERM.normalize(line, is_quote=False)
                     term_fixes.extend(_tc)

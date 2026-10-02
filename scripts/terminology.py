@@ -4,13 +4,19 @@
 ★ 设计原则：
   1. 规范化是**确定性后处理**，不是提示词请求。提示词只能降低违规率，
      只有代码才能保证 100% 一致（实测 10/1 那场就出了《复联三》《雷神三》）。
-  2. **金句行豁免**：金句必须逐字摘自原文，即使原文写法违规也不改写。
-     因此 normalize() 只在「总结行 / 概要」上调用（调用方负责判定）。
+  2. **金句同样适用**（2026-10-02 修订）：金句虽是逐字原文，但其中的
+     人名、地名、机构名、产品名、专业术语必须与正文 / 标题 / 摘要写法完全一致，
+     否则同一场直播里会出现「iphone」和「iPhone」两种写法。
+     金句模式只做「专有名词层面」的替换（大小写、官方拼写、序号、型号、单位），
+     **绝不触碰语气、口语词、断句与标点**；且 QUOTE_EXEMPT 里的译名类词不改
+     （如 weibo→微博 会把说话人的原话书面化，金句内保留）。
   3. **不确定即不改**：表里没有的词一律原样保留，绝不臆造或模糊替换。
+  4. 真正豁免的只有：录播原标题 / 文件名 / 来源路径、成语惯用语、代码命令行。
 
 CLI：
   python terminology.py --scan <docx> [--fix]     扫描（可选就地修复）文档
   python terminology.py --check "<一句话>"          单行自检
+  python terminology.py --check "<一句>" --quote    按金句模式自检
 """
 
 import argparse
@@ -77,6 +83,14 @@ CASE_FIX = {
     # 常用游戏 / 作品相关
     'minecraft': 'Minecraft', 'boss': 'Boss',
 }
+
+# 金句（逐字原文）里**不做**的替换：这类是「译名 / 改名」，改了就不是说话人的原话。
+#   例：「我在 weibo 上发的」→ 若改成「我在微博上发的」，口语质感被书面化。
+#   而 iphone→iPhone、复联三→复联3 只是写法规范化，不改变用词，金句内照改。
+QUOTE_EXEMPT = {'weibo', 'golang'}
+
+# 个别词需要额外的否定预查（避免误伤英文里同形的缩写点写法，如 Mr.）
+_CASE_NEG_LOOKAHEAD = {'mr': r'(?!\.)'}
 
 # 需要「整体匹配」的写法（含非字母字符，无法用词边界简单处理）
 # ★ 一律用 `(?<![A-Za-z0-9])` / `(?![A-Za-z0-9])` 而不是 `\b`：
@@ -162,6 +176,64 @@ _EPISODE_RE = re.compile(r'第([一二三四五六七八九十两]{1,3})([部季
 # 书名号内不参与转换的保护片段（含这些字则不转）
 _TITLE_KEEP_HINT = ('第一', '之一', '唯一', '统一', '专一')
 
+# 口语里常**不带书名号**直接说系列作品（「复联三真好看」），书名号规则覆盖不到。
+# 这类只在白名单内、且序号紧跟作品名时转换，避免误伤普通中文数字。
+SERIES_TITLES = [
+    '复仇者联盟', '复联', '雷神', '奇异博士', '蜘蛛侠', '钢铁侠', '美国队长',
+    '银河护卫队', '黑寡妇', '惊奇队长', '蚁人', '尚气', '永恒族', '死侍',
+    '金刚狼', 'X战警', '哈利波特', '指环王', '霍比特人', '侏罗纪世界', '侏罗纪公园',
+    '变形金刚', '加勒比海盗', '速度与激情', '使命召唤', '生化危机', '古墓丽影',
+    '最终幻想', '星球大战', '星际迷航', '名侦探柯南', '哆啦A梦', '蜡笔小新',
+    '精灵宝可梦', '宝可梦', '数码宝贝', '龙珠', '海贼王', '火影忍者', '银魂',
+    '进击的巨人', '鬼灭之刃', '咒术回战', '电锯人', '间谍过家家', '葬送的芙莉莲',
+    '魔法少女小圆', '超时空要塞', '机动战士高达', '新世纪福音战士', '攻壳机动队',
+    '异形', '铁血战士', '虎胆龙威', '终结者', '黑客帝国', '碟中谍', '谍影重重',
+    '狂暴之路', '寂静岭', '死亡空间', '生化奇兵', '质量效应', '上古卷轴',
+    '刺客信条', '孤岛惊魂', '半条命', '传送门', '守望先锋', '魔兽世界',
+    '暗黑破坏神', '星际争霸', '魔兽争霸', '炉石传说', '英雄联盟', '王者荣耀',
+    '明日方舟', '原神', '崩坏', '赛博朋克', '荒野大镖客', '侠盗猎车手',
+    '极品飞车', '愤怒的小鸟', '植物大战僵尸', '我的世界', '泰拉瑞亚',
+]
+
+_SERIES_RE = None
+
+
+def _build_series_re():
+    global _SERIES_RE
+    alts = sorted(SERIES_TITLES, key=len, reverse=True)
+    # 否定预查（两层保险）：
+    #   ① 量词 / 时间词 → 「原神三十次」「原神两个小时」「龙珠三部曲」都不是序号
+    #   ② 「十」→ 单字数字后紧跟「十」时说明是「三十」这类数量词，不是序号；
+    #      真正的「十四」会由 {1,3} 的贪婪匹配先整体命中，不受影响
+    _SERIES_RE = re.compile(
+        r'(%s)([一二三四五六七八九十两]{1,3})'
+        r'(?![部集季次遍回个只条块年月日天小时分钟秒钟层关卡章节十分秒时])'
+        % '|'.join(re.escape(a) for a in alts)
+    )
+
+
+def _fix_series_seq(text):
+    """口语里不带书名号的系列作品序号：复联三 → 复联3。"""
+    if _SERIES_RE is None:
+        _build_series_re()
+    out, changes = [], []
+
+    def _rep(m):
+        n = _cn2num(m.group(2))
+        if n is None:
+            return m.group(0)
+        new = '%s%d' % (m.group(1), n)
+        changes.append((m.group(0), new))
+        return new
+
+    pos = 0
+    for m in _SERIES_RE.finditer(text):
+        out.append(text[pos:m.start()])
+        out.append(_rep(m))
+        pos = m.end()
+    out.append(text[pos:])
+    return ''.join(out), changes
+
 
 def _fix_title_seq(text):
     """《复联三》→《复联3》；《三体》等保护作品名不动。"""
@@ -221,7 +293,8 @@ def _compile_case_rules():
     parts = []
     for k in keys:
         esc = re.escape(k)
-        parts.append(r'(?<![A-Za-z0-9])%s(?![A-Za-z0-9])' % esc)
+        neg = _CASE_NEG_LOOKAHEAD.get(k, '')
+        parts.append(r'(?<![A-Za-z0-9])%s%s(?![A-Za-z0-9])' % (esc, neg))
     return re.compile('|'.join(parts), re.IGNORECASE)
 
 
@@ -233,13 +306,16 @@ _CANON = {v.lower(): v for v in CASE_FIX.values()}
 def normalize(text, is_quote=False):
     """规范化一段文本。返回 (新文本, 改动列表[(旧, 新), ...])。
 
-    is_quote=True 表示这是逐字摘录的金句 → **完全不改**（原样返回）。
+    is_quote=True 表示这是逐字摘录的**金句/原文**：
+      · 依然应用全部专有名词规则（大小写、官方拼写、作品序号、型号、单位），
+        以保证金句与正文 / 标题 / 摘要的术语、姓名写法完全一致；
+      · 但跳过 QUOTE_EXEMPT 里的「译名类」替换，避免把说话人的原话书面化；
+      · 任何规则都不会增删字词、改动标点或断句，因此语气与口语表达不受影响。
     """
     if not text:
         return text, []
-    if is_quote:
-        return text, []
     changes = []
+    exempt = QUOTE_EXEMPT if is_quote else ()
 
     # 1) 短语级（含空格/连字符/型号）
     #    ★ 不能直接 re.sub(pat, rep, m.group(0))：含零宽断言（如 (?=站)）时
@@ -261,6 +337,8 @@ def normalize(text, is_quote=False):
     # 2) 词形：大小写 / 官方拼写
     def _case_rep(m):
         old = m.group(0)
+        if old.lower() in exempt:
+            return old
         want = CASE_FIX.get(old.lower())
         if want is None or want == old:
             return old
@@ -278,11 +356,13 @@ def normalize(text, is_quote=False):
             return new
         text = re.sub(pat, _u, text)
 
-    # 4) 作品序号 / 剧集序号
+    # 4) 作品序号 / 剧集序号 / 口语里的系列作品序号
     text, c1 = _fix_title_seq(text)
     text, c2 = _fix_episode_seq(text)
+    text, c3 = _fix_series_seq(text)
     changes.extend(c1)
     changes.extend(c2)
+    changes.extend(c3)
     return text, changes
 
 
@@ -295,10 +375,40 @@ def find_violations(text):
 # ---------------------------------------------------------------------------
 # 五、文档级扫描 / 修复
 # ---------------------------------------------------------------------------
-def scan_docx(path, fix=False, log=None):
-    """扫描 docx。金句行（灰色斜体、非粗体）豁免；标题 2（场次原标题）豁免。
+# 形如文件路径 / 文件名的文本：原始数据，改了就对不上源文件 → 整体豁免
+_PATH_RE = re.compile(r'[A-Za-z]:[\\/]|\.(mp4|flv|mp3|m4a|wav|docx?|srt|txt|json)\b', re.I)
 
-    返回 (修复条数, 明细列表)。
+
+def _kind_of(p, r):
+    """判断一个 run 属于哪类文本，决定用哪种模式规范化。
+
+    返回 'summary' | 'quote' | 'skip'。
+      summary → 总结行（粗体），应用完整规范
+      quote   → 金句行（斜体非粗体），应用完整规范但豁免译名类替换
+      skip    → 标题（场次原标题）、来源路径、目录域等，一律不改
+    """
+    style = (p.style.name or '')
+    if style.startswith('Heading') or style.startswith('标题'):
+        return 'skip'
+    if _PATH_RE.search(r.text or ''):
+        return 'skip'
+    bold = r.bold is True
+    italic = r.italic is True
+    if bold:
+        return 'summary'
+    if italic:
+        return 'quote'
+    return 'skip'      # 9pt 灰色来源行等 → 原始数据
+
+
+def scan_docx(path, fix=False, log=None):
+    """扫描 docx。三类文本分别处理：
+
+      · 总结行（粗体）   → 完整规范
+      · 金句行（斜体）   → 同样应用规范（金句术语须与正文一致），豁免译名类替换
+      · 标题 / 来源路径  → 豁免（原始数据，改了就对不上源文件）
+
+    返回 (修复条数, 明细列表[(旧, 新, 上下文, 类别), ...])。
     """
     import docx
     d = docx.Document(path)
@@ -309,15 +419,15 @@ def scan_docx(path, fix=False, log=None):
         runs = [r for r in p.runs if r.text]
         if not runs:
             continue
-        # 金句豁免：非粗体（斜体灰字）
-        if not any(r.bold for r in runs):
-            continue
         for r in runs:
-            new, ch = normalize(r.text, is_quote=False)
+            kind = _kind_of(p, r)
+            if kind == 'skip':
+                continue
+            new, ch = normalize(r.text, is_quote=(kind == 'quote'))
             if not ch:
                 continue
             for old, nw in ch:
-                detail.append((old, nw, r.text[:40]))
+                detail.append((old, nw, r.text[:40], kind))
             total += len(ch)
             if fix:
                 r.text = new
@@ -336,11 +446,13 @@ def main():
     ap.add_argument('--scan', help='docx 路径')
     ap.add_argument('--fix', action='store_true', help='就地修复')
     ap.add_argument('--check', help='单行自检')
+    ap.add_argument('--quote', action='store_true',
+                    help='配合 --check：按金句模式（保留口语用词）自检')
     a = ap.parse_args()
 
     if a.check:
-        new, ch = normalize(a.check)
-        print('原文：', a.check)
+        new, ch = normalize(a.check, is_quote=a.quote)
+        print('原文：', a.check, '（%s）' % ('金句模式' if a.quote else '正文模式'))
         print('规范：', new)
         for old, nw in ch:
             print('   %s → %s' % (old, nw))
@@ -352,8 +464,13 @@ def main():
         n, detail = scan_docx(a.scan, fix=a.fix)
         print('文档：%s' % a.scan)
         print('违规 %d 处%s' % (n, '（已修复）' if a.fix and n else ''))
+        kinds = {}
+        for _, _, _, k in detail:
+            kinds[k] = kinds.get(k, 0) + 1
+        for k, c in sorted(kinds.items(), key=lambda x: -x[1]):
+            print('   其中 %s %d 处' % ({'summary': '总结行', 'quote': '金句行'}.get(k, k), c))
         seen = {}
-        for old, new, ctx in detail:
+        for old, new, _ctx, _k in detail:
             seen.setdefault((old, new), 0)
             seen[(old, new)] += 1
         for (old, new), c in sorted(seen.items(), key=lambda x: -x[1])[:40]:

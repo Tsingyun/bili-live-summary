@@ -406,27 +406,39 @@ python scripts/install_scheduled_task.py --remove    # 删除
 
 | 层 | 位置 | 作用 |
 |---|---|---|
-| ① 源头 | `prompt_original.txt` / `prompt_template.txt` **第九节** | 让模型尽量一次写对 |
-| ② 写入点 | `summarize_gemini.append_section`（总结行 + 概要） | 落地前规范化，金句行豁免 |
+| ① 源头 | `prompt_original.txt` / `prompt_template.txt` **第九节** + **第七节第1条**（金句） | 让模型尽量一次写对 |
+| ② 写入点 | `summarize_gemini.append_section`（总结行 + 概要 + **金句行**） | 落地前规范化 |
 | ③ 体检 | `docx_healthcheck` 新增 `terminology` 类别 + `terminology.py --scan [--fix]` | 存量文档可扫可修 |
 
-规范表与实现都在 `scripts/terminology.py`（`CASE_FIX` / `PHRASE_FIX` / `UNIT_FIX` / `PROTECT_TITLES`）。
+规范表与实现都在 `scripts/terminology.py`（`CASE_FIX` / `PHRASE_FIX` / `UNIT_FIX` /
+`PROTECT_TITLES` / `SERIES_TITLES` / `QUOTE_EXEMPT`）。
 
-**必须记住的四条边界**：
-1. **金句行完全豁免**——金句要求逐字摘自原文，即使原文写 `iphone` 也不能改成 `iPhone`。
-   `normalize(text, is_quote=True)` 直接原样返回。
+**★ 金句同样适用（2026-10-02 修订，勿回退到「完全豁免」）**：
+金句是原话，但其中的人名、地名、机构名、产品名、作品名、专业术语**必须与正文 / 标题 / 摘要写法完全一致**，
+否则同一场直播会出现 `iphone` 与 `iPhone` 两种写法。`normalize(text, is_quote=True)` 仍应用全部术语规则，
+只额外豁免 `QUOTE_EXEMPT`（`weibo`、`golang` 这类**译名类**替换——会把说话人的原话书面化）。
+术语规则不改字词、不改标点、不改断句，因此语气与口语质感不受影响。
+错别字段句、口误与机械重复词的删改属于**模型层**职责，写在提示词第七节第 2–4 条，代码不做（无法确定性判断）。
+
+**必须记住的五条边界**：
+1. **金句内豁免译名类替换**（`QUOTE_EXEMPT`）——`weibo→微博` 在金句里不做；正文里照做。
 2. **录播原标题 / 文件名 / 来源路径豁免**——如 9 月那批「5070ti版」标题、`D:\录播\...\xxx.mp4` 路径，
-   属原始数据，改了就对不上源文件。
+   属原始数据，改了就对不上源文件（`_kind_of()` 判为 `skip`）。
 3. **作品名固有中文数字豁免**——《三体》《第五人格》《第一滴血》《落秋的第一场雨》在 `PROTECT_TITLES` 里；
    只转**结尾的序号**（《复联三》→《复联3》），「第一/之一/唯一/统一/专一」命中即不转。
 4. **`\b` 是坑**——Python 的 `\b` Unicode 感知，「购买**5070Ti**」中「买」和「5」都算词字符，
-   边界不成立导致规则静默失效。PHRASE_FIX 一律用 `(?<![A-Za-z0-9])` / `(?![A-Za-z0-9])`。
+   边界不成立导致规则静默失效。一律用 `(?<![A-Za-z0-9])` / `(?![A-Za-z0-9])`。
+5. **口语里的系列作品（`SERIES_TITLES`）必须带量词否定**——只写白名单 + 序号仍会误伤
+   「原神**三十次**」「原神**两个小时**」「龙珠**三部曲**」。否定预查里必须包含量词与「十」
+   （「十」用于让「三十」整体回溯失败，「十四」则由 `{1,3}` 贪婪匹配先整体命中）。
 
 **不确定写法处理原则**：① 有官方写法→从官方；② 无官方→从通行标准（SI/IEEE）；
 ③ 都没有→**保留原样，不臆造不音译**；④ 同一文档内写法必须一致。
 
-回归：`[O]` 组 26 项，`selftest_robustness` 126 → **152 项**全过。
-存量修正：10 月 5 处 + 9 月 34 处（备份 `.bak_term_20261002`，正文段落数与 70/1513 条金句逐字未变）。
+回归：`[O]` 组 26 项 + `[P]` 组 17 项，`selftest_robustness` 152 → **168 项**全过。
+存量修正：10 月 5 处 + 9 月 34 处（备份 `.bak_term_20261002`）；金句专项 9 月 18 处
+（备份 `.bak_quote_20261002`，段落数 3441 与 1513 条金句行数均不变，改动全为单字符级
+`b→B` / `s→S` / `p→P` / `c→C` / `一→1` / `二→2` / `三→3`）。
 
 ```bash
 # 只体检（不改文件）
@@ -435,6 +447,11 @@ python scripts/docx_healthcheck.py --workdir "<工作目录>" --verbose
 python scripts/docx_healthcheck.py --workdir "<工作目录>" --fix --json report.json
 # 也可只查单个文档
 python scripts/docx_healthcheck.py --doc "C:/.../岁己直播总结_2026年9月.docx" --fix
+# 只扫专有名词写法（总结行 + 金句行；标题/路径豁免）
+python scripts/terminology.py --scan "C:/.../岁己直播总结_2026年9月.docx"
+python scripts/terminology.py --scan "C:/.../岁己直播总结_2026年9月.docx" --fix
+python scripts/terminology.py --check "我这个 iphone 才 8gb"            # 正文模式
+python scripts/terminology.py --check "我这个 iphone 才 8gb" --quote     # 金句模式
 ```
 
 - 检查项：① 金句/正文格式（金句=灰色斜体 10pt 非粗体；正文=粗体 11pt 非斜体）

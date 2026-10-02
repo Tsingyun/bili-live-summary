@@ -1095,9 +1095,11 @@ def test_terminology(tmp, v):
     check('O7 品牌官方写法',
           all(x in r for x in ['iPhone', 'iPad', 'macOS', 'iOS', 'iCloud', 'GitHub']), r)
     check('O8 已是官方写法时不再改动', norm('用 iPhone 和 macOS') == '用 iPhone 和 macOS')
-    # --- 金句豁免：逐字原文不得改写 ---
+    # --- 金句：术语同样规范化（2026-10-02 修订：与正文写法必须一致）---
     q = '「我今天 iphone 坏了，《复联三》真好看」'
-    check('O9 金句行完全豁免（不改写）', TERM.normalize(q, is_quote=True)[0] == q)
+    qn = TERM.normalize(q, is_quote=True)[0]
+    check('O9 金句同样规范化（iphone→iPhone、《复联三》→3）',
+          'iPhone' in qn and '《复联3》' in qn, qn)
     # --- 型号 / 单位 ---
     check('O10 5070ti → RTX 5070 Ti（不重复叠加 RTX）',
           norm('换 5070ti') == '换 RTX 5070 Ti', norm('换 5070ti'))
@@ -1137,15 +1139,98 @@ def test_terminology(tmp, v):
           len(TERM.find_violations(raw)) >= 3, str(TERM.find_violations(raw)))
     n, detail = TERM.scan_docx(p, fix=False)
     check('O22b 写入路径已规范化 → 落地文档 0 违规', n == 0, str(detail[:4]))
-    # 金句在文档里也不该被计入
-    check('O23 文档扫描不计金句（iphone 原文保留）',
-          '「我 iphone 就是坏了」' in '\n'.join(x.text for x in d.paragraphs))
+    # 金句行同样被写入点规范化 → 落地即与正文术语一致
+    check('O23 写入点已把金句术语规范化（iphone→iPhone）',
+          '「我 iPhone 就是坏了」' in '\n'.join(x.text for x in d.paragraphs),
+          str([x.text for x in d.paragraphs if 'iphone' in x.text.lower()]))
     n2, _ = TERM.scan_docx(p, fix=True)
     d2 = docx.Document(p)
     txt = '\n'.join(x.text for x in d2.paragraphs)
     check('O24 修复后写入文档', '《复联3》' in txt and 'iPhone' in txt and 'RTX 5070 Ti' in txt,
           txt[:120])
     check('O25 修复幂等（二次扫描 0 处）', TERM.scan_docx(p, fix=False)[0] == 0)
+
+
+def test_terminology_quote(tmp, v):
+    """[P] 金句的专有名词规范化（2026-10-02 修订）。
+
+    金句虽是逐字原文，但人名 / 地名 / 机构名 / 产品名 / 专业术语必须与
+    正文、标题、摘要写法完全一致；同时**必须保留**口语词、语气词、标点与断句，
+    不得把原话书面化（译名类替换在金句内豁免）。
+    """
+    print('\n[P] 金句的专有名词规范化（保留口语与语气）')
+    try:
+        import terminology as TERM
+        import summarize_gemini as S
+        import docx
+    except Exception as e:
+        check('P0 导入 terminology / docx 模块', False, str(e))
+        return
+
+    def nq(s):
+        return TERM.normalize(s, is_quote=True)[0]
+
+    # --- 术语层面：金句与正文写法必须一致 ---
+    check('P1 金句内品牌官方写法 iphone→iPhone',
+          nq('「我这个 iphone 卡死了」') == '「我这个 iPhone 卡死了」',
+          nq('「我这个 iphone 卡死了」'))
+    check('P2 金句内作品序号（带书名号）',
+          nq('「《复联三》真的绝了」') == '「《复联3》真的绝了」',
+          nq('「《复联三》真的绝了」'))
+    check('P3 金句内口语作品序号（无书名号也统一）',
+          nq('「雷神三我觉得一般吧」') == '「雷神3我觉得一般吧」',
+          nq('「雷神三我觉得一般吧」'))
+    check('P4 金句内型号与单位',
+          nq('「我这个 5070ti 才 8gb 啊」') == '「我这个 RTX 5070 Ti 才 8GB 啊」',
+          nq('「我这个 5070ti 才 8gb 啊」'))
+    # --- 保留项：口语 / 语气 / 标点 / 断句一律不动 ---
+    check('P5 语气词、重复与标点原样保留',
+          nq('「啊？这个这个……我也不知道嘛！」') == '「啊？这个这个……我也不知道嘛！」',
+          nq('「啊？这个这个……我也不知道嘛！」'))
+    check('P6 译名类不书面化：金句内 weibo 保留',
+          nq('「我在 weibo 上发的」') == '「我在 weibo 上发的」',
+          nq('「我在 weibo 上发的」'))
+    check('P7 正文里 weibo→微博（与金句的唯一差异项；原空格保留）',
+          TERM.normalize('岁己在 weibo 上发了一条')[0].replace(' ', '')
+          == '岁己在微博上发了一条',
+          TERM.normalize('岁己在 weibo 上发了一条')[0])
+    s = '「我这个iphone啊，真的8gb不够用吧？」'
+    ns = nq(s)
+    check('P8 只替换术语、不增删任何字词（长度不变）', len(ns) == len(s), ns)
+    check('P9 幂等：金句二次规范化零改动', TERM.normalize(ns, is_quote=True)[1] == [])
+    _s = '龙珠三部曲、三体、原神三十次、原神两个小时、蜘蛛侠三也不错'
+    check('P10 系列白名单不误伤（三部曲 / 三体 / 数量词）',
+          TERM.normalize(_s)[0] == '龙珠三部曲、三体、原神三十次、原神两个小时、蜘蛛侠3也不错',
+          TERM.normalize(_s)[0])
+    check('P10b 无书名号的两位序号仍转换（最终幻想十四）',
+          TERM.normalize('最终幻想十四真好玩')[0] == '最终幻想14真好玩',
+          TERM.normalize('最终幻想十四真好玩')[0])
+
+    # --- 文档级：写入点已把金句规范化，术语与正文一致 ---
+    p = os.path.join(tmp, 'term_quote.docx')
+    if os.path.exists(p):
+        os.remove(p)
+    d = S.open_or_create(p, '思源宋体CN Light')[0]
+    S.append_section(d, '测试场 2026年10月03日20点场', ['直播日期 2026-10-03'],
+                     ['[00:01:00] 岁己用 iphone 看了《复联三》，显卡是 5070ti。',
+                      '「我这个 iphone 看复联三，8gb 真不够」'],
+                     '思源宋体CN Light', True)
+    S.save_doc_atomic(d, p, None)
+    txt = '\n'.join(x.text for x in d.paragraphs)
+    check('P11 文档里金句术语已与正文统一',
+          '「我这个 iPhone 看复联3，8GB 真不够」' in txt, txt[:200])
+    # _kind_of 判别：标题 / 路径 skip，金句 quote，总结 summary
+    heads = [x for x in d.paragraphs if S.heading_level(x)]
+    check('P12 标题（录播原标题）判为 skip',
+          all(TERM._kind_of(x, r) == 'skip' for x in heads for r in x.runs if r.text))
+    quotes = [x for x in d.paragraphs if S.is_quote_line(x.text.strip())]
+    check('P13 金句 run 判为 quote',
+          any(TERM._kind_of(x, r) == 'quote' for x in quotes for r in x.runs if r.text))
+    check('P14 来源路径 / 文件名判为 skip',
+          TERM._PATH_RE.search('D:/录播/25788785-岁己SUI/a.mp4') is not None
+          and TERM._PATH_RE.search('岁己看了复联三') is None)
+    check('P15 全文档复扫 0 违规（含金句）', TERM.scan_docx(p, fix=False)[0] == 0,
+          str(TERM.scan_docx(p, fix=False)[1][:4]))
 
 
 def main():
@@ -1168,6 +1253,7 @@ def main():
         test_audio_enhance(tmp, args.verbose)
         test_docx_toc(tmp, args.verbose)
         test_terminology(tmp, args.verbose)
+        test_terminology_quote(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

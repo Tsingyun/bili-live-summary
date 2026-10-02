@@ -298,7 +298,9 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
                 'detail': '本章节没有任何金句（可能模型未输出，或写入时被误过滤）'})
 
     # --- 专有名词书写规范（全局约束）---
-    #   只作用于「正文总结段」：金句行（逐字原文）与标题（录播原标题）一律豁免。
+    #   作用于「正文总结段」与「金句行」：金句里的专有名词必须与正文写法一致。
+    #   金句用 is_quote=True（只做术语层面替换，不动语气 / 口语词 / 标点 / 断句）。
+    #   仍豁免：标题（录播原标题）、来源路径等原始数据。
     try:
         import terminology as TERM
     except Exception:                                 # pragma: no cover
@@ -308,16 +310,20 @@ def check_doc(path, hotword_rules=None, hotword_protect=None, fix=False,
             if S.heading_level(p):
                 continue
             t = p.text.strip()
-            if not t or S.is_quote_line(t):
+            if not t:
                 continue
             for r in [x for x in p.runs if x.text]:
-                new, ch = TERM.normalize(r.text, is_quote=False)
+                kind = TERM._kind_of(p, r)
+                if kind == 'skip':
+                    continue
+                new, ch = TERM.normalize(r.text, is_quote=(kind == 'quote'))
                 if not ch:
                     continue
                 for a, b in ch:
                     issues['terminology'].append({
                         'section': (p.text or '')[:40], 'sev': 'mid',
-                        'detail': '专有名词写法：%s → %s' % (a, b)})
+                        'detail': '专有名词写法（%s）：%s → %s'
+                                  % ('金句' if kind == 'quote' else '正文', a, b)})
                 if fix:
                     r.text = new
                     fixed += len(ch)
