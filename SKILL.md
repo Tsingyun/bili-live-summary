@@ -506,6 +506,55 @@ python scripts/terminology.py --check "我这个 iphone 才 8gb" --quote     # �
 
 注：直播「实际日期」从标题解析（如「2026年08月01日19点场」），避免凌晨下播投稿导致的跨天 / 跨月错位。
 
+## 投稿到 B 站小号（auto_upload_daily.py）
+### 两个开关别搞混
+| 键 | 管什么 |
+|---|---|
+| `upload.enabled` | 总结管线（`daily_pipeline`）内是否触发上传 |
+| `upload.auto_enabled` | **每日自动上传总开关**（`auto_upload_daily.py`，计划任务 `BiliUpload_Daily` / WorkBuddy 自动化 06:00） |
+| `upload.auto_since` | 只自动上传 live_date ≥ 该值的录播（防擅自把历史积压传出去） |
+
+### ★ 正式上传必须走 `auto_upload_daily.py`，别用 `bili_upload.py` 直传
+- `auto_upload_daily.py`：标题规范 = **日期 + 原标题 + 岁己SUI**（用户拍板）、幂等（`upload_auto_state.json`）、
+  超 `auto_max_single_gb`（默认 7.5GB）自动 ffmpeg 流复制无损分 P、`--report` 只汇报不传、`--date` 只传某天。
+- `bili_upload.py --src` 直传走的是 `upload.title_template` 旧模板，会把标题覆盖成
+  「岁己 2026-10-02 直播回放」，**丢掉原标题**。只适合手工补传单个文件。
+- 汇报状态：`auto_upload_daily.py --report`（不需要 cookie，可随时跑）。
+
+### cookie 失效是最高频故障，先认这两个症状
+- `bili_upload.py --check-cookie` → `code=-101 账号未登录` = cookie 过期
+- 上传时 `member.bilibili.com/preupload` → **HTTP 403** = 同一个原因（不是被风控）
+- cookie 是 Netscape 格式，关键三项 `SESSDATA` / `bili_jct` / `DedeUserID`，路径 `upload.cookies_path`
+
+### 换 cookie：优先 `scripts/login_by_qr.js`（手机扫码，≈1 分钟）
+```bash
+cd C:/Users/Tsing/AppData/Local/Temp
+NODE_PATH=C:/Users/Tsing/.workbuddy/binaries/node/workspace/node_modules \
+  C:/Users/Tsing/.workbuddy/binaries/node/versions/22.22.2-3/node.exe \
+  C:/Users/Tsing/.workbuddy/skills/bili-live-summary/scripts/login_by_qr.js
+```
+把生成的二维码图 `present_files` 给用户，用户用手机 B 站 App 扫；脚本轮询到成功就写回
+cookie 文件（先自动备份 `.bak_YYYY-MM-DD`）并打印账号昵称+uid。**先看清昵称是不是小号。**
+
+兜底：`scripts/import_cookies.py`（手工粘贴或整份 Netscape 文件导入，写盘后自动在线校验）
+```bash
+python import_cookies.py --kv "SESSDATA=xxx; bili_jct=yyy; DedeUserID=zzz"
+python import_cookies.py --netscape "C:/Users/Tsing/Downloads/cookies.txt"
+```
+
+### ★ 本机 Chrome 不要再想解 cookie
+Chrome 154 起 cookie 用 **App-Bound Encryption（v20）**，沙箱内读得见记录、解不出明文
+（`Local State` 里的 v20 密钥需 SYSTEM 级 elevation service）。`Default/Network/Cookies` 只能确认
+「有没有登录」，不能拿值。别再在这条路上耗时间，直接扫码。
+
+### `login_by_qr.js` 三个实测坑（勿回退）
+1. 直接 `goto passport.bilibili.com/h5/passport/login/web` 会落到「二维码已失效」页 → 必须先访问
+   `www.bilibili.com` 拿到 buvid，再调 `/x/passport-login/web/qrcode/generate`。
+2. 凭据在 poll 成功响应的 **`data.url` query** 里（SESSDATA=…），**不是** `ctx.cookies()`
+   （HttpOnly + 域隔离，context 里取不到）。
+3. 未登录时 poll **也返回 `code=0` 但 `data.url` 为空** → 判据必须是「三项凭据齐全」，
+   不能只看 `code==0`；否则会静默空转。二维码截图要 `deviceScaleFactor: 3` 否则手机扫不出。
+
 ## 硬约束（务必保持）
 - 转录文本**必须按 30 分钟切块逐块发送 AI**，绝不允许整篇一次性发送（防超长 / 超时 / 截断）。
 - Word 文档：同月复用同一文档，每场新直播插入**分页符 + Heading2 标题**区分；总结段=**粗体 11pt**，金句=**灰色(#666666)斜体 10pt**（格式错误由 `docx_healthcheck.py` 自动纠正）。
