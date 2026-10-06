@@ -356,6 +356,30 @@ def upload_once(cfg, cfg_path, it, parts, log):
     return bvid, (tail if r.returncode != 0 or not bvid else '')
 
 
+def _is_hard_fail(err):
+    """判断这次失败是否**不该重试**（重试只会更糟）。
+
+    ★ 2026-10-06 实测：同一份 cookie 连续 3 次撞上
+      `member.bilibili.com/preupload` 的 HTTP 403 之后，
+      `space/myinfo` 就变成 `code=-101 账号未登录` —— **SESSDATA 被风控作废**。
+      所以 4xx（尤其 403）与 cookie 失效类错误必须**立即停止**，
+      换成新 cookie 再来，而不是用同一份硬扛 `auto_retries`。
+
+    可重试的：网络抖动、5xx、429、超时、分片级失败（内部已有自己的重试）。
+    """
+    if not err:
+        return False
+    e = err.lower()
+    # cookie 失效 / 账号未登录
+    if 'code=-101' in e or '账号未登录' in e or 'cookie 无效' in e or 'cookie 校验失败' in e:
+        return True
+    # 明确的 4xx（不可重试）：403 风控 / 404 / 401 等
+    for code in ('http 400', 'http 401', 'http 403', 'http 404', 'http 409'):
+        if code in e:
+            return True
+    return False
+
+
 def process_item(cfg, cfg_path, it, auto, log):
     """带重试地上传一个成品。返回 (bvid 或 None, 原因)。"""
     parts, tmp = [it['path']], None
@@ -374,6 +398,12 @@ def process_item(cfg, cfg_path, it, auto, log):
                 return bvid, ''
             last_err = err or '未拿到 BV（输出无 BV 且 state 未记录）'
             log('❌ 第 %d 次上传失败：%s' % (attempt, last_err), 'WARN')
+            # 403 / cookie 失效：再试只会把这份 cookie 也弄废，立刻停
+            if _is_hard_fail(last_err):
+                log('⛔ 硬失败（4xx 或 cookie 失效），不再重试 —— '
+                    '继续用同一份 cookie 重试会触发 B站风控把它作废；'
+                    '请换一份新 cookie 后再跑', 'WARN')
+                return None, last_err
             if attempt < auto['auto_retries']:
                 time.sleep(auto['auto_retry_delay_sec'])
         return None, last_err

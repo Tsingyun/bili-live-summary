@@ -1399,6 +1399,46 @@ def test_drop_session(tmp, v):
         check('S7 import_cookies 解析', False, repr(e))
 
 
+def test_upload_hard_fail(tmp, v):
+    """[T] 投稿重试的「硬失败即停」判定（2026-10-06）。
+
+    ★ 实测教训：同一份 cookie 连续 3 次撞 preupload 403 之后，
+      space/myinfo 就变成 -101 —— SESSDATA 被 B站风控作废。
+      所以 403 / cookie 失效必须**立即停止**，而网络抖动、5xx、429、
+      分片级失败仍要照常重试（分片内部本就有自己的重试）。
+    """
+    print('\n[T] 投稿重试：硬失败即停（保护 cookie）')
+    try:
+        import auto_upload_daily as AUD
+    except Exception as e:
+        check('T0 导入 auto_upload_daily', False, str(e))
+        return
+
+    cases_hard = [
+        ('HTTP 403（不可重试）https://member.bilibili.com/preupload', '403 风控'),
+        ("cookie 无效（space/myinfo code=-101 账号未登录）", '-101 未登录'),
+        ('[upload] cookie 校验失败：cookie 无效', 'cookie 校验失败'),
+        ('HTTP 400 Bad Request', '400'),
+        ('HTTP 401 Unauthorized', '401'),
+        ('HTTP 404 Not Found', '404'),
+    ]
+    for err, tag in cases_hard:
+        check('T1 硬失败：%s' % tag, AUD._is_hard_fail(err) is True, err[:60])
+
+    cases_soft = [
+        ('分片 12 上传失败，终止', '分片失败'),
+        ('HTTP 503 Service Unavailable', '503'),
+        ('HTTP 429 Too Many Requests', '429'),
+        ('子进程异常：TimeoutError', '超时'),
+        ('未拿到 BV（输出无 BV 且 state 未记录）', '无 BV'),
+        ('', '空消息'),
+    ]
+    for err, tag in cases_soft:
+        check('T2 可重试：%s' % tag, AUD._is_hard_fail(err) is False, err[:60])
+
+    check('T3 None 输入不崩', AUD._is_hard_fail(None) is False)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1421,6 +1461,7 @@ def main():
         test_terminology(tmp, args.verbose)
         test_terminology_quote(tmp, args.verbose)
         test_drop_session(tmp, args.verbose)
+        test_upload_hard_fail(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
