@@ -31,14 +31,32 @@ import shutil
 import sys
 import time
 
-# 投稿最小必需集（这三个缺一不可）
+# 投稿最小必需集（这三个缺一不可，缺任何一个直接拒绝导入）
 REQUIRED = ('SESSDATA', 'bili_jct', 'DedeUserID')
-# 顺手保留的辅助项（有则带上，无不影响）
-NICE_TO_HAVE = ('DedeUserID__ckMd5', 'sid', 'buvid3', 'buvid4', 'b_nut', 'CURRENT_FNVAL')
+# ★ 不再按固定白名单过滤 —— 用户从 DevTools 复制过来的是**整份** cookie，
+#   B站 WAF 会看 cookie 集合特征（数量/组合），只留 9 项会被
+#   member.bilibili.com/preupload 直接 403（实测：9 项 → 网关拦 HTML 页；
+#   28 项 → 正常放行）。所以只要 host 含 bilibili 就全量保留。
+NICE_TO_HAVE = ()
 
 
 def _log(msg):
     print('[%s] [INFO] %s' % (time.strftime('%H:%M:%S'), msg))
+
+
+def _unq(v):
+    """URL 解码 cookie 值。
+
+    ★ 必须解码。用户从 DevTools / 插件复制来的值里，`,` `*` `=` 会被编码成
+      %2C / %2A / %3D%3D（buvid3 尤其明显）。浏览器发出去的是**解码后**的值；
+      直接原样写进 Netscape 文件会让 WAF 判定为构造出来的 cookie。
+      含 '%' 但不是合法转义时 unquote 原样返回，不会误伤。
+    """
+    from urllib.parse import unquote
+    try:
+        return unquote(v)
+    except Exception:
+        return v
 
 
 def parse_netscape(text):
@@ -57,8 +75,7 @@ def parse_netscape(text):
         domain, name, value = parts[0], parts[5], parts[6]
         if 'bilibili' not in domain:
             continue
-        if name in REQUIRED or name in NICE_TO_HAVE:
-            out[name] = value
+        out[name] = _unq(value)
     return out
 
 
@@ -87,9 +104,8 @@ def parse_kv(text):
         if not chunk or '=' not in chunk:
             continue
         k, v = chunk.split('=', 1)
-        k, v = k.strip(), v.strip()
-        if k in REQUIRED or k in NICE_TO_HAVE:
-            out[k] = v
+        k, v = k.strip(), _unq(v.strip())
+        out[k] = v          # 全量保留（见 NICE_TO_HAVE 处的说明）
     return out
 
 

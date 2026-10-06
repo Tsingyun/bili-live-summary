@@ -119,10 +119,23 @@ function qs(u) {
         }
         const lines = ['# Netscape HTTP Cookie File',
           '# 由 login_by_qr.js（Playwright 扫码登录）生成，请勿外传', ''];
-        for (const k of NEED) lines.push('\t.bilibili.com\tTRUE\t/\tTRUE\t0\t' + k + '\t' + map[k]);
+        // ★ 导出**全量** bilibili 域 cookie，不要只留 SESSDATA/bili_jct/DedeUserID 三项。
+        //   实测：只写 3~9 项时 member.bilibili.com/preupload 一律返回 HTML 403
+        //   （WAF 看 cookie 集合特征），账号校验能过但投稿网关直接拦。
+        //   data.url 里的凭据只用来兜底补齐必需三项。
+        const full = {};
+        for (const c of await ctx.cookies()) {
+          if (!/bilibili/.test(c.domain)) continue;
+          if (c.value) full[c.name] = c.value;
+        }
+        for (const k of NEED) if (!full[k] && map[k]) full[k] = map[k];
+        for (const k of Object.keys(full)) {
+          lines.push('\t.bilibili.com\tTRUE\t/\tTRUE\t0\t' + k + '\t' + full[k]);
+        }
         fs.writeFileSync(CK, lines.join('\n') + '\n', 'utf8');
         console.log('LOGIN OK -> ' + who);
-        console.log('SESSDATA 已加载（长度 ' + map.SESSDATA.length + '）');
+        console.log('已写入 cookie 项数：' + Object.keys(full).length);
+        console.log('SESSDATA 已加载（长度 ' + full.SESSDATA.length + '）');
         console.log('cookie 文件：' + CK);
         done = true;
       } else if (code === 86101) {

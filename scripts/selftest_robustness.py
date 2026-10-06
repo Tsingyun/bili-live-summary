@@ -1367,6 +1367,7 @@ def test_drop_session(tmp, v):
               '.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tabc\n'
               '.bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tdef\n'
               '.bilibili.com\tTRUE\t/\tTRUE\t0\tDedeUserID\t789\n'
+              '.bilibili.com\tTRUE\t/\tTRUE\t0\tsid\txyz\n'
               '.example.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tWRONG\n')
         got = IC.parse_netscape(ns)
         check('S7 解析出三项必需 cookie',
@@ -1377,8 +1378,23 @@ def test_drop_session(tmp, v):
               all(kv.get(k) for k in IC.REQUIRED), str(kv))
         ren = IC.render_netscape(got)
         check('S7 渲染为 Netscape 格式', '.bilibili.com' in ren and 'SESSDATA\tabc' in ren)
-        check('S7 渲染行数=3 项', len([l for l in ren.splitlines()
-                                       if l and not l.startswith('#')]) == 3)
+        # 全量保留：sid 这类非必需项也必须留下（WAF 看 cookie 集合特征）
+        check('S7 全量保留非必需项 sid', 'sid' in got, str(sorted(got)))
+        check('S7 渲染行数=4 项（3 必需 + sid）', len([l for l in ren.splitlines()
+                                                    if l and not l.startswith('#')]) == 4,
+              ren.replace('\t', '|'))
+        # URL 解码：DevTools 复制来的值里 , * = 被编码成 %2C %2A %3D
+        enc = IC.parse_kv('SESSDATA=7d10%2C1806%2Aabc%3D%3D; bili_jct=b; DedeUserID=c')
+        check('S7 SESSDATA 被 URL 解码',
+              enc.get('SESSDATA') == '7d10,1806*abc==', repr(enc.get('SESSDATA')))
+        enc2 = IC.parse_netscape(
+            '.bilibili.com\tTRUE\t/\tTRUE\t0\tbuvid3\tE9D8%2D466120infoc\n')
+        check('S7 buvid3 被 URL 解码',
+              enc2.get('buvid3') == 'E9D8-466120infoc', repr(enc2.get('buvid3')))
+        # 值里含合法 % 但非转义时不能被破坏
+        pct = IC.parse_kv('SESSDATA=100%A%A; bili_jct=b; DedeUserID=c')
+        check('S7 非转义 % 不被破坏', pct.get('SESSDATA') == '100%A%A',
+              repr(pct.get('SESSDATA')))
     except Exception as e:
         check('S7 import_cookies 解析', False, repr(e))
 

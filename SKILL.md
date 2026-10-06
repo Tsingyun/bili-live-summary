@@ -538,9 +538,32 @@ cookie 文件（先自动备份 `.bak_YYYY-MM-DD`）并打印账号昵称+uid。
 
 兜底：`scripts/import_cookies.py`（手工粘贴或整份 Netscape 文件导入，写盘后自动在线校验）
 ```bash
-python import_cookies.py --kv "SESSDATA=xxx; bili_jct=yyy; DedeUserID=zzz"
+python import_cookies.py --kv "SESSDATA=xxx; bili_jct=yyy; DedeUserID=zzz; ..."
 python import_cookies.py --netscape "C:/Users/Tsing/Downloads/cookies.txt"
 ```
+
+### ★★ preupload 403 的两个根因（2026-10-06 实测，别再踩）
+1. **cookie 只留必需三项 / 少数几项 → 403。** `member.bilibili.com/preupload` 会看 cookie
+   **集合特征**，只写 3~9 项一律返回 **HTML 403 页面**（不是 API 的 JSON 错误）。
+   而 `space/myinfo` 账号校验**照样通过** → 极易误判为「cookie 没问题」。
+   所以 `import_cookies` / `login_by_qr` 一律**全量保留** bilibili 域 cookie，别按白名单过滤。
+2. **反复重试会把 SESSDATA 作废。** 同一份 cookie 连续 403 三次后，
+   `space/myinfo` 就变成 `code=-101 账号未登录` —— 触发风控。
+   所以 **403 必须「只试一次」**：先单发一次 preupload 探接口（不传数据、秒回），
+   通了再启动整体上传；不通就换新 cookie，别用同一份硬扛 `auto_retries`。
+
+### cookie 值必须 URL 解码
+DevTools / 插件复制来的值里 `,` `*` `=` 被编码成 `%2C` `%2A` `%3D`
+（`buvid3` 尤其明显）。浏览器发出去的是**解码后**的值。
+`import_cookies._unq()` 统一 `unquote`；含合法 `%` 但非转义时 unquote 原样返回，不会误伤。
+回归 [S7] 锁住这三点。
+
+### 排障口诀
+| 现象 | 结论 |
+|---|---|
+| `space/myinfo` 通过但 `preupload` 403 | cookie 项数太少 → 全量导入 |
+| `preupload` 403 且随后 `myinfo` 也 -101 | 已被风控作废 → 必须换新 cookie，别再重试 |
+| 扫码脚本连续 TIMEOUT | 二维码没被扫，不是代码故障 |
 
 ### ★ 本机 Chrome 不要再想解 cookie
 Chrome 154 起 cookie 用 **App-Bound Encryption（v20）**，沙箱内读得见记录、解不出明文
