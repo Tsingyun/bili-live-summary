@@ -23,6 +23,7 @@
 """
 import argparse
 import http.server
+import io
 import json
 import os
 import shutil
@@ -1247,6 +1248,141 @@ def test_terminology_quote(tmp, v):
         check('Q2 log.info 实际调用不抛异常', False, repr(_e))
 
 
+def test_drop_session(tmp, v):
+    """[S] 整场重置工具（补档后重跑用，2026-10-06）。
+
+    背景：本地录播只落了一部分（录播软件 22:26 才启动），管线把残缺场当整场
+    写进 state 与月度文档；之后从录播站补齐完整场次，必须整场清干净再重跑，
+    否则 done_dates 门禁会跳过新场次、月度文档会出现同一天两个章节。
+
+    ★ 这里最该锁住的是 S1/S2：日期 token 若只给「不补零」形式
+      （2026年10月5日），而文档标题走「补零」（2026年10月05日），
+      匹配会**静默返回 0 个**且不报错 —— 实测踩过，最容易误以为「文档里没有章节」。
+    """
+    print('\n[S] 整场重置工具 drop_session（补档后重跑）')
+    try:
+        import datetime
+        import drop_session as DS
+        from redo_session import remove_section
+        import docx
+    except Exception as e:
+        check('S0 导入 drop_session 模块', False, str(e))
+        return
+
+    d = datetime.date(2026, 10, 5)
+    toks = DS._date_tokens(d)
+
+    # --- S1/S2 日期 token 覆盖补零与不补零两种写法 ---
+    check('S1 token 含补零形式 2026年10月05日', '2026年10月05日' in toks, str(toks))
+    check('S1 token 含不补零形式 2026年10月5日', '2026年10月5日' in toks, str(toks))
+    check('S1 token 含 ISO 与紧凑形式',
+          '2026-10-05' in toks and '20261005' in toks, str(toks))
+    for title in ('陪你这个猪拉银河护卫队1-2 2026年10月05日22点场',
+                  '陪你这个猪过周日！唱唱聊聊 2026年10月05日20点场',
+                  '2026-10-05 直播回放'):
+        check('S2 标题「%s」被命中' % title[:22], DS._match_heading(title, toks))
+    check('S2 别场次不被误命中（10月04日）',
+          not DS._match_heading('陪你这个猪过周日 2026年10月04日20点场', toks))
+    check('S2 同月不同日不误命中（10月15日）',
+          not DS._match_heading('某场 2026年10月15日20点场', toks))
+
+    # --- S3 remove_section 边界：只删到下一个 level-2，不伤邻场 ---
+    p = os.path.join(tmp, 'S3.docx')
+    doc = docx.Document()
+    doc.add_heading('2026年10月 直播总结', level=1)
+    doc.add_heading('A 2026年10月04日20点场', level=2)
+    doc.add_paragraph('[00:00:00] 甲场总结。')
+    doc.add_paragraph('“甲场金句。”')
+    doc.add_heading('B 2026年10月05日22点场', level=2)
+    doc.add_paragraph('[00:00:00] 乙场总结。')
+    doc.add_paragraph('“乙场金句。”')
+    doc.add_heading('C 2026年10月06日20点场', level=2)
+    doc.add_paragraph('[00:00:00] 丙场总结。')
+    doc.save(p)
+    doc = docx.Document(p)
+    n = remove_section(doc, 'B 2026年10月05日22点场')
+    doc.save(p)          # ★ 必须落盘，否则 S4 的「重复删除」等于再删一次原文
+    left = [(x.text or '') for x in docx.Document(p).paragraphs]
+    check('S3 删除了乙场整段（3 段：标题+总结+金句）', n == 3, 'n=%d' % n)
+    check('S3 甲场保留', any('甲场总结' in t for t in left))
+    check('S3 丙场保留', any('丙场总结' in t for t in left))
+    check('S3 乙场内容已消失', not any('乙场' in t for t in left))
+
+    # --- S4 幂等：章节已不存在时返回 0 而不是误删邻场 ---
+    doc2 = docx.Document(p)
+    n2 = remove_section(doc2, 'B 2026年10月05日22点场')
+    check('S4 重复删除返回 0（幂等）', n2 == 0, 'n=%d' % n2)
+    check('S4 重复删除未误伤甲/丙场',
+          all(any(k in (x.text or '') for x in doc2.paragraphs)
+              for k in ('A 2026年10月04日20点场', 'C 2026年10月06日20点场')),
+          str([x.text for x in doc2.paragraphs]))
+
+    # --- S5 state 重置：done_dates / processed 精确移除，且不动别场 ---
+    sp = os.path.join(tmp, 'state.json')
+    st = {'done_dates': ['2026-10-02', '2026-10-04', '2026-10-05'],
+          'processed': {'LOCAL-20261004': {'live_date': '2026-10-04'},
+                        'LOCAL-20261005': {'live_date': '2026-10-05'}},
+          'uploads': {'2026-10-04': {'bvid': 'BVx'}}}
+    with open(sp, 'w', encoding='utf-8') as f:
+        json.dump(st, f, ensure_ascii=False)
+    iso = d.isoformat()
+    st = json.load(io.open(sp, encoding='utf-8'))
+    st['done_dates'].remove(iso)
+    st['processed'].pop('LOCAL-20261005', None)
+    check('S5 done_dates 移除目标日', iso not in st['done_dates'])
+    check('S5 done_dates 保留其他日',
+          '2026-10-04' in st['done_dates'] and '2026-10-02' in st['done_dates'])
+    check('S5 processed 移除目标场', 'LOCAL-20261005' not in st['processed'])
+    check('S5 processed 保留其他场', 'LOCAL-20261004' in st['processed'])
+    check('S5 uploads 未被误删', '2026-10-04' in st['uploads'])
+
+    # --- S6 隔离 glob：只命中本日的 MP3 与压缩视频 ---
+    import glob as _g
+    rec = os.path.join(tmp, 'rec', '2026-10-05')
+    os.makedirs(rec, exist_ok=True)
+    m1 = os.path.join(rec, '录制-25788785-20261005-222641-555-x_compressed.mp4')
+    m2 = os.path.join(rec, '录制-25788785-20261004-203804-999-y_compressed.mp4')
+    for x in (m1, m2):
+        open(x, 'wb').write(b'0')
+    mp3 = os.path.join(tmp, '20261005-222641-555-x.mp3')
+    mp3b = os.path.join(tmp, '20261004-203804-999-y.mp3')
+    for x in (mp3, mp3b):
+        open(x, 'wb').write(b'0')
+    compact = d.strftime('%Y%m%d')
+    hits = set()
+    for pat in (os.path.join(tmp, '*%s*' % compact),
+                os.path.join(tmp, 'rec', '*', '*%s*_compressed.mp4' % compact),
+                os.path.join(tmp, 'rec', '*%s*_compressed.mp4' % compact)):
+        for p in _g.glob(pat):
+            hits.add(os.path.basename(p))
+    check('S6 命中本日的 MP3', os.path.basename(mp3) in hits, str(sorted(hits)))
+    check('S6 命中本日的压缩视频', os.path.basename(m1) in hits, str(sorted(hits)))
+    check('S6 不误伤前一日 MP3', os.path.basename(mp3b) not in hits, str(sorted(hits)))
+    check('S6 不误伤前一日压缩视频', os.path.basename(m2) not in hits, str(sorted(hits)))
+
+    # --- S7 import_cookies：解析必须排除域外 cookie，且缺项要报错 ---
+    try:
+        import import_cookies as IC
+        ns = ('# comment\n'
+              '.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tabc\n'
+              '.bilibili.com\tTRUE\t/\tTRUE\t0\tbili_jct\tdef\n'
+              '.bilibili.com\tTRUE\t/\tTRUE\t0\tDedeUserID\t789\n'
+              '.example.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tWRONG\n')
+        got = IC.parse_netscape(ns)
+        check('S7 解析出三项必需 cookie',
+              all(got.get(k) for k in IC.REQUIRED), str(sorted(got)))
+        check('S7 排除非 bilibili 域', 'WRONG' not in got.values(), str(got))
+        kv = IC.parse_kv('SESSDATA=a; bili_jct=b, DedeUserID=c')
+        check('S7 kv 串容忍分号/逗号/换行',
+              all(kv.get(k) for k in IC.REQUIRED), str(kv))
+        ren = IC.render_netscape(got)
+        check('S7 渲染为 Netscape 格式', '.bilibili.com' in ren and 'SESSDATA\tabc' in ren)
+        check('S7 渲染行数=3 项', len([l for l in ren.splitlines()
+                                       if l and not l.startswith('#')]) == 3)
+    except Exception as e:
+        check('S7 import_cookies 解析', False, repr(e))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1268,6 +1404,7 @@ def main():
         test_docx_toc(tmp, args.verbose)
         test_terminology(tmp, args.verbose)
         test_terminology_quote(tmp, args.verbose)
+        test_drop_session(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

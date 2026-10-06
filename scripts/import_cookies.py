@@ -71,9 +71,17 @@ def re_split_fallback(line):
 
 
 def parse_kv(text):
-    """解析 'k=v; k=v' 或多行 key=value。"""
+    """解析 'k=v; k=v' / 逗号分隔 / 多行 key=value。
+
+    ★ 逗号不能无脑替换：cookie 值本身可能含逗号。只有「逗号 + 紧跟
+    key=」这种形态才当分隔符，否则会把合法值截断（实测踩过）。
+    """
+    import re
+    text = re.sub(r';\s*', '\n', text)
+    # 仅当逗号后面紧跟 key= 时才算分隔符
+    text = re.sub(r',\s*(?=[A-Za-z_][A-Za-z0-9_]*\s*=)', '\n', text)
+    text = text.replace('\r', '\n')
     out = {}
-    text = text.replace('\r', '\n').replace(';', '\n')
     for chunk in text.split('\n'):
         chunk = chunk.strip()
         if not chunk or '=' not in chunk:

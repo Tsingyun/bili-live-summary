@@ -555,6 +555,45 @@ Chrome 154 起 cookie 用 **App-Bound Encryption（v20）**，沙箱内读得见
 3. 未登录时 poll **也返回 `code=0` 但 `data.url` 为空** → 判据必须是「三项凭据齐全」，
    不能只看 `code==0`；否则会静默空转。二维码截图要 `deviceScaleFactor: 3` 否则手机扫不出。
 
+## 补档后「整场重置」（本地录播残缺时必读，2026-10-06）
+### 症状：某场总结明显偏短，开播时间比实际晚
+本地录播目录里**只落了整场的一部分**（实测 2026-10-05：录播软件 22:26:41 才启动，
+本地只有 22:26 起的 1 段；而 rec.darkpy.cn 上该日是 6 段 / 9.78 GB，从 **20:17:08** 开始）。
+管线会把残缺场当整场处理并写进 `state.done_dates` 与月度文档，**不报错、不告警**。
+
+### 为什么自动补档没救回来（关键）
+`backfill` 的缺失检查是「按 live_date 看该日**有没有**场次」。本地已有一段 → 判定该日已覆盖 →
+不再从录播站补齐。**残缺场 ≠ 缺失场**，这是设计盲区。
+
+### 处置：`scripts/drop_session.py`（先干跑，再执行）
+```bash
+# ① 先只查录播站，确认该日真实场次结构（不下载）
+python rec_fetch_date.py --date 2026-10-05 --session 0 --dry-run
+# ② 备份已完成（docx + state.json 手动 cp 也行）
+# ③ 干跑重置计划
+python drop_session.py --date 2026-10-05 --reset-state --quarantine --dry-run
+# ④ 执行：删该日全部 level-2 章节 + 清 state 门禁 + 隔离旧产物
+python drop_session.py --date 2026-10-05 --reset-state --quarantine
+# ⑤ 从录播站补齐完整场次（--no-pipeline 只落位，便于先清理再跑）
+python rec_fetch_date.py --date 2026-10-05 --session 0 --no-pipeline
+# ⑥ 重跑整场
+python daily_pipeline.py --date 2026-10-05
+```
+- `--quarantine` 是**改名**（加 `.partial_<yyyymmdd>` 后缀）不是删除，上传器按 `*_compressed.mp4`
+  匹配，改名后既不会被当待传稿件，也随时能改回来。
+- 落位文件名用**首段**时间戳（`_rec_name`），所以完整场会以 `...20261005-201708-027-....mp4`
+  出现在录播根目录，与旧的残缺段**并存**——这正是要靠 ③ 把旧记录清掉的原因。
+
+### 踩过的坑
+- **`state.done_dates` 是硬门禁**：新落位场次的 live_date 与已处理最晚日相同 → `latest_by_live_date`
+  会直接跳过，`--date` 显式指定也绕不过「已完成」判定。必须先 `drop_session --reset-state`。
+- **月度文档会出现同一天两个章节**，且新章节 append 在旧章节之后 → 必须先删旧章节。
+- `drop_session` 的日期 token **必须同时给补零与不补零**两种（`2026年10月05日` / `2026年10月5日`），
+  只写一种会静默 0 命中（`--dry-run` 报「章节命中 0 个」但不报错）→ 回归 [S1/S2] 锁住。
+- MP3 的真实落点是 `config.mp3_export.out_dir`（本机 = `C:\Users\Tsing\DeskBox\文档`），
+  **不是** `_dirs.mp3`（`D:\岁己直播自动总结\MP3` 常年是空的）——按 `_dirs.mp3` 找会漏。
+- 磁盘参考：9.78 GB 素材补档峰值约需 20 GB（分段 + 合并双份），D 盘剩 60 GB 才敢开工。
+
 ## 硬约束（务必保持）
 - 转录文本**必须按 30 分钟切块逐块发送 AI**，绝不允许整篇一次性发送（防超长 / 超时 / 截断）。
 - Word 文档：同月复用同一文档，每场新直播插入**分页符 + Heading2 标题**区分；总结段=**粗体 11pt**，金句=**灰色(#666666)斜体 10pt**（格式错误由 `docx_healthcheck.py` 自动纠正）。
