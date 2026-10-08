@@ -164,6 +164,10 @@ def check_cookie(cfg, uc, log):
             return False, {'error': 'cookie 无效（space/myinfo code=%s %s）'
                                    % (d.get('code'), d.get('message'))}
         data = d.get('data') or {}
+        allowed = uc.get('allowed_mid')
+        if allowed and data.get('mid') is not None and int(data['mid']) != int(allowed):
+            return False, {'error': '账号白名单不匹配：当前登录 mid=%s（%s），期望小号 mid=%s，拒绝投稿'
+                                   % (data.get('mid'), (data.get('name') or '').strip(), allowed)}
         return True, {'mid': data.get('mid'), 'name': (data.get('name') or '').strip(),
                       'level': (data.get('level') or 0)}
     except Exception as e:
@@ -408,6 +412,10 @@ def upload_api(cfg, log, uc, video_path, meta, cookies, submit_ts=None):
 
 def upload_multi(cfg, log, uc, segments, meta, cookies, submit_ts=None):
     """多 P 投稿：segments=[{path, part_title}]，列表顺序即分P顺序；流复制无损，画质不变。"""
+    ok_ck, info_ck = check_cookie(cfg, uc, log)
+    if not ok_ck:
+        log.error('[upload] 上传前账号校验失败，拒绝投稿：%s' % info_ck.get('error'))
+        return None
     s = _new_session(uc)
     s.cookies.update(cookies)
     videos = []

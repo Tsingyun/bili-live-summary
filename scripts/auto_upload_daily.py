@@ -516,6 +516,19 @@ def main():
     lock_acquire(workdir)
     try:
         with Heartbeat(workdir):
+            # 账号预检：cookie 必须是白名单小号，防止误传大号（用户 2026-10-08 要求）
+            try:
+                import bili_upload as _bili_upload
+                pok, pinfo = _bili_upload.check_cookie(cfg, uc, log)
+                if not pok:
+                    raise RuntimeError(pinfo.get('error') or 'cookie 校验失败')
+                log('[preflight] 账号校验通过：mid=%s（%s）' % (pinfo.get('mid'), pinfo.get('name')))
+            except Exception as e:
+                msg = '账号预检失败，本轮全部拒传：%s' % e
+                log(msg, 'WARN')
+                fail_list = [(it['stem'], msg) for it in plan]
+                print_summary(log, run_date, [], fail_list, skip)
+                return 1
             ok_list, fail_list = [], []
             for it in plan:
                 bvid, why = process_item(cfg, args.config, it, auto, log)
