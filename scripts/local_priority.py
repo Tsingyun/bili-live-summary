@@ -318,6 +318,24 @@ def extract_audio(cfg, log, src, mp3_path):
 
 
 def summarize_local_one(cfg, st, session, log, progress):
+    # ---- 完整性护栏（用户规则 2026-10-07）---------------------------------
+    # 本地文件不保证是完整的一场：可能只下到某一段、或录制中断只剩尾段。
+    # 真实事故：2026-10-06 本地只有 6 段中的第 5 段（49%），却按整场出了总结，
+    # 漏掉 2h44m 且跨了两场标题。处理前必须与 rec 站比对当天时长。
+    try:
+        import completeness_guard as CG
+        _g = CG.check_local_completeness(
+            cfg, session['live_date'], session['member_files'], log=log,
+            cover_ratio=float((cfg.get('local_completeness_guard') or {})
+                              .get('cover_ratio', CG.DEFAULT_COVER_RATIO)))
+        if _g.get('suspect'):
+            log.error('[guard] 本地疑似截断，已中止本场总结（避免输出残缺总结）：%s'
+                      % _g.get('reason'))
+            log.error('[guard] 请走 rec 站补档合并全量分段后重跑')
+            return False
+    except Exception as e:
+        log('[guard] 完整性校验异常（忽略，不阻塞）：%s' % e, 'WARN')
+
     live_date = session['live_date']
     clean_title = session['clean_title']
     hour = session['hour']

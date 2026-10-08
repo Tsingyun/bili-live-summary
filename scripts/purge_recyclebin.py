@@ -56,6 +56,31 @@ def parse_i(path):
         return None
 
 
+def actual_size(ipath):
+    """$I 里记的是「原大小」，对目录条目会偏大；这里返回 $R 的**实测占用**。
+
+    ★ 2026-10-08 踩坑：只信 $I 会把回收站体积算成 171.74GB，
+      而 $R 实测只有 11.05GB —— 差距来自 $I 记录的是删除瞬间的逻辑大小。
+      拿这个错数字去做清理决策会误导人。目录要 walk 求和。
+    """
+    rpath = ipath.replace('$I', '$R', 1)
+    if not os.path.exists(rpath):
+        return 0
+    if os.path.isdir(rpath):
+        total = 0
+        for r, _d, fs in os.walk(rpath):
+            for f in fs:
+                try:
+                    total += os.path.getsize(os.path.join(r, f))
+                except OSError:
+                    pass
+        return total
+    try:
+        return os.path.getsize(rpath)
+    except OSError:
+        return 0
+
+
 def bucket_of(orig, exts):
     """返回 (类别, 是否属于本管线中间产物)。"""
     if not orig:
@@ -120,6 +145,7 @@ def main():
         if not got:
             continue
         orig, size = got
+        size = actual_size(ipath)          # 用 $R 实测，别用 $I 记录
         cat, safe = bucket_of(orig, exts)
         g = groups[cat]
         g['n'] += 1
