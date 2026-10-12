@@ -521,6 +521,37 @@ python scripts/terminology.py --check "我这个 iphone 才 8gb" --quote     # �
   「岁己 2026-10-02 直播回放」，**丢掉原标题**。只适合手工补传单个文件。
 - 汇报状态：`auto_upload_daily.py --report`（不需要 cookie，可随时跑）。
 
+### ★★★ 绝不传大号（用户 2026-10-08、10-12 两次强调，最高优先级）
+大号 = `奶蛋厨` **mid 9669499**；投稿小号 = `岁己SUI单推人` **mid 168235532**。
+2026-10-12 事故：10/10、10/11 两场 3 个录播被传进大号，根因是
+`daily_pipeline.py` 步骤6 直读 `cfg['paths']['cookies']`（那文件是**大号** cookie），
+把 `load_upload_cfg()` 算出的小号路径丢掉不用，且该分支没有账号预检。
+
+**两条上传入口的 cookie 来源不同，改任一处都必须同时检查另一处：**
+
+| 入口 | cookie 来源 | 白名单预检 |
+|---|---|---|
+| `auto_upload_daily.py` | `upload.cookies_path`（小号） | 有（10/8 加的） |
+| `daily_pipeline.py` 步骤6 | ~~`paths.cookies`~~ → 现改为 `load_upload_cfg()['cookies_path']` | 有（10/12 补的） |
+
+铁律：
+- `paths.cookies` 这个键**永远指向大号**（`C:\Users\Tsing\.bilibili_cookies.txt`），
+  只有 `setup.py` 生成默认配置时会写它。任何代码都不要用它上传。
+- 上传前一律走 `bili_upload.check_cookie()`，`upload.allowed_mid=168235532` 不匹配就拒传。
+- 回归 `[U]` 组用源码级断言锁死「不准直读 paths.cookies」，改回来看见测试红。
+
+### 删除误传的稿件（2026-10-12 实测）
+- 正确接口：`POST https://member.bilibili.com/x/web/archive/delete`
+  参数 `aid`（av号，从 view 接口取）+ `csrf`（bili_jct）。
+  **注意是 `delete` 不是 `del`**——`/x/vu/web/del` 等老路径全是 404。
+- 但 B站已对删除稿件加**强制风控验证码**（`code=340022 验证码错误`），
+  脚本化不可达，只能让用户在创作中心手动删。
+  Playwright 路线也不通：cookie 里的 `deviceFingerprint` 与沙箱 Chromium 指纹不匹配，
+  服务端直接判 `-101`（同一份 cookie 用 requests 却正常）。
+- 删完必须清 `state.uploads` 与 `upload_auto_state.json` 里对应记录，否则不会补传小号。
+  ★ 清的时候按 **bvid 的 owner** 判断归属，别按日期一刀切——10/11 小号那条
+  （BV1i7pQ6wE3F）差点被误删，删错会导致重复投稿。
+
 ### cookie 失效是最高频故障，先认这两个症状
 - `bili_upload.py --check-cookie` → `code=-101 账号未登录` = cookie 过期
 - 上传时 `member.bilibili.com/preupload` → **HTTP 403** = 同一个原因（不是被风控）
