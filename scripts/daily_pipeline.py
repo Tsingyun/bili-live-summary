@@ -514,6 +514,27 @@ def already_done_local(cfg, st, session):
             return False, ''
         from docx import Document as _Docx
         if S.has_section(_Docx(doc_path), heading):
+            # ★ 2026-10-11 修复：Word 章节存在 ≠ 整场完成。
+            # local 原始录制（flv/mkv/avi/ts 等需压缩格式）在压缩开启时，
+            # 若日期子目录缺压缩 MP4，说明「总结已写、但压缩被环境回收」→ 判未完成，
+            # 下次重跑只补做压缩（process_session 内步骤3 会因章节已存在而跳过 Gemini，幂等）。
+            # .mp4 源（B站兜底保留原片 / 已压缩成品）不要求压缩，避免误重压。
+            cc = cfg.get('compress') or {}
+            if cc.get('enabled', True) and session.get('member_files'):
+                _se = os.path.splitext(session['member_files'][0])[1].lower()
+                if _se in ('.flv', '.mkv', '.avi', '.ts', '.m2ts', '.mov'):
+                    _root = (cfg.get('local') or {}).get('root') or ''
+                    if _root:
+                        _ymd = session['live_date'].strftime('%Y-%m-%d')
+                        _dd = os.path.join(_root, _ymd)
+                        _has = False
+                        if os.path.isdir(_dd):
+                            for _f in os.listdir(_dd):
+                                if _f.endswith('_compressed.mp4'):
+                                    _has = True
+                                    break
+                        if not _has:
+                            return False, 'Word 章节存在但缺压缩 MP4（压缩未完成，待补压）'
             return True, 'Word 已存在该章节'
         return False, ''
     except Exception:
@@ -927,16 +948,29 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
     #     H.264 转码仅作兜底，block_hevc=true 才阻断）；
     #   · 失败不影响总结成品：TXT/SRT/Word/MP3/压缩 MP4 已全部落盘，state 占位照写，
     #     下次重跑时只补做上传（幂等，已上传标记会跳过）。
+    #   ★ 2026-10-12 事故修复：原来这里写 `load_cookies(cfg['paths']['cookies'])`
+    #     ——那是**大号** cookie（C:\Users\Tsing\.bilibili_cookies.txt，DedeUserID=9669499
+    #     奶蛋厨），把 10/10、10/11 两场共 3 个录播误传到用户大号。load_upload_cfg 已算出
+    #     小号路径 upload.cookies_path，却被扔掉不用。现已改为用 uc['cookies_path']，
+    #     并补上与 auto_upload_daily 一致的账号白名单预检（双保险）。
     try:
         uc = bili_upload.load_upload_cfg(cfg)
         if uc.get('enabled'):
             up_src = compressed_path if (compressed_path and os.path.exists(compressed_path)) \
                 else (src_video if src_kind == 'bilibili' else None)
             if up_src and os.path.exists(up_src):
-                cookies = load_cookies(cfg['paths'].get('cookies'))
-                bili_upload.upload_one(cfg, log, uc, up_src,
-                                       {'date_iso': date_iso, 'fname': fname,
-                                        'src_kind': src_kind}, cookies, st=st)
+                # 账号预检：cookie 必须是白名单小号，否则拒传（用户两次强调：绝不传大号）
+                pok, pinfo = bili_upload.check_cookie(cfg, uc, log)
+                if not pok:
+                    log('[upload] ⛔ 账号预检失败，拒绝上传：%s' % (pinfo.get('error') or '未知原因'),
+                        'WARN')
+                else:
+                    log('[upload] 账号预检通过：mid=%s（%s）'
+                        % (pinfo.get('mid'), pinfo.get('name')))
+                    cookies = load_cookies(uc['cookies_path'])
+                    bili_upload.upload_one(cfg, log, uc, up_src,
+                                           {'date_iso': date_iso, 'fname': fname,
+                                            'src_kind': src_kind}, cookies, st=st)
             else:
                 log('[upload] 无可上传视频（压缩产物缺失且非 B站源），跳过', 'WARN')
         else:
@@ -1324,7 +1358,11 @@ def main():
         if not args.dry_run and not wait_network(log, cfg):
             sys.exit(3)
         st = load_state(cfg)
-        cookies = load_cookies(cfg['paths'].get('cookies'))
+        # 统一只读小号 cookie（upload.cookies_path）。这里原来是
+        # `load_cookies(cfg['paths']['cookies'])` ——那是**大号** cookie 文件
+        # （DedeUserID=9669499），2026-10-12 误传事故的根因之一。backfill 只读
+        # 公开合集，用小号凭据足够，且避免任何代码路径再碰大号 cookie。
+        cookies = load_cookies(bili_upload.load_upload_cfg(cfg)['cookies_path'])
 
         # ---- 步骤 0.5：确保「当月」文档已建立 ----
         # ★ 归档语义（2026-10-02 起）：往月文档只读、原样归档；新总结只写「直播日期

@@ -23,6 +23,7 @@
 """
 import argparse
 import http.server
+import re
 import io
 import json
 import os
@@ -1439,6 +1440,66 @@ def test_upload_hard_fail(tmp, v):
     check('T3 None 输入不崩', AUD._is_hard_fail(None) is False)
 
 
+def test_upload_cookie_path(tmp, v):
+    """[U] 上传必须走白名单小号 cookie（2026-10-12 大号误传事故的防回归）。
+
+    ★ 事故还原：daily_pipeline 步骤6 原来写 `load_cookies(cfg['paths']['cookies'])`
+      ——paths.cookies 指向 **大号** cookie（DedeUserID=9669499 奶蛋厨），
+      而 load_upload_cfg 已算出小号路径 upload.cookies_path 却被丢弃。
+      结果 10/10、10/11 两场 3 个录播误传大号，且该分支没有账号预检。
+    这里用「源码级断言」锁死：既防止直读 paths.cookies 复活，
+    也保证白名单预检在位。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    raw = io.open(os.path.join(here, 'daily_pipeline.py'), encoding='utf-8').read()
+    # 剥掉注释再断言，否则注释里的「事故还原」示例会被误判为违规代码
+    src = '\n'.join(re.sub(r'#.*$', '', ln) for ln in raw.splitlines())
+    check('U1 daily_pipeline 不再直读 paths.cookies 传视频',
+          "load_cookies(cfg['paths']" not in src and "cfg['paths'].get('cookies')" not in src)
+    check('U1 daily_pipeline 用 uc[cookies_path]（小号）',
+          "load_cookies(uc['cookies_path'])" in src)
+    check('U1 daily_pipeline 上传前有账号预检',
+          'check_cookie(cfg, uc, log)' in src)
+
+    # load_upload_cfg 的优先级：upload.cookies_path 必须压过 paths.cookies
+    import bili_upload as BU
+    cfg = {'upload': {'cookies_path': r'C:\small.txt', 'allowed_mid': 168235532},
+           'paths': {'cookies': r'C:\big.txt'},
+           'summarize': {'streamer': '岁己'}}
+    uc = BU.load_upload_cfg(cfg)
+    check('U2 upload.cookies_path 优先于 paths.cookies', uc['cookies_path'] == r'C:\small.txt',
+          str(uc.get('cookies_path')))
+    check('U2 allowed_mid 透传', uc.get('allowed_mid') == 168235532)
+    cfg2 = {'upload': {}, 'paths': {'cookies': r'C:\big.txt'}, 'summarize': {}}
+    check('U2 未配 cookies_path 时回落 paths.cookies（兼容旧配置）',
+          BU.load_upload_cfg(cfg2)['cookies_path'] == r'C:\big.txt')
+
+    # check_cookie 的白名单：mid 不匹配必须拒绝（不联网，只测逻辑分支）
+    who = {'mid': 9669499, 'name': '奶蛋厨', 'level': 6}
+    big_ck = os.path.join(tmp, 'big_cookies.txt')
+    small_ck = os.path.join(tmp, 'small_cookies.txt')
+    for _p in (big_ck, small_ck):
+        with io.open(_p, 'w', encoding='utf-8') as f:
+            for k in ('SESSDATA', 'bili_jct', 'DedeUserID'):
+                f.write('\t.bilibili.com\tTRUE\t/\tTRUE\t0\t%s\tx\n' % k)
+    old = BU.bili_get
+    BU.bili_get = lambda *a, **k: {'code': 0, 'data': dict(who)}
+    try:
+        uc3 = dict(BU.DEFAULTS); uc3['cookies_path'] = big_ck; uc3['allowed_mid'] = 168235532
+        ok, info = BU.check_cookie({}, uc3, lambda *a, **k: None)
+        check('U3 大号 mid 被白名单拒绝', ok is False and '白名单' in (info.get('error') or ''), str(info))
+        who['mid'], who['name'] = 168235532, '岁己SUI单推人'
+        uc4 = dict(BU.DEFAULTS); uc4['cookies_path'] = small_ck; uc4['allowed_mid'] = 168235532
+        ok2, info2 = BU.check_cookie({}, uc4, lambda *a, **k: None)
+        check('U3 小号 mid 通过', ok2 is True and info2.get('mid') == 168235532, str(info2))
+        who['mid'], who['name'] = 9669499, '奶蛋厨'
+        uc5 = dict(BU.DEFAULTS); uc5['cookies_path'] = big_ck
+        ok3, info3 = BU.check_cookie({}, uc5, lambda *a, **k: None)
+        check('U3 未配白名单时仅校验登录态（兼容）', ok3 is True, str(info3))
+    finally:
+        BU.bili_get = old
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1462,6 +1523,7 @@ def main():
         test_terminology_quote(tmp, args.verbose)
         test_drop_session(tmp, args.verbose)
         test_upload_hard_fail(tmp, args.verbose)
+        test_upload_cookie_path(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
