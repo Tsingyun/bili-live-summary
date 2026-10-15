@@ -57,7 +57,7 @@ def run_sweep(cfg, log, dry_run=True):
     """扫描并删除「已产出完整 _compressed.mp4 但原始录播 FLV 仍在」的原文。
 
     门禁（与管线一致）：压缩产物存在 + 体积>1MB + ffprobe 时长≥各分段之和95%，
-    任一不满足则保留原文。删除走 force_unlink（本机软删进回收站，可恢复）。
+    任一不满足则保留原文。删除走 force_unlink（原生永久删除，不进回收站，无需确认）。
     幂等：原文已不在即跳过。可作为 daily_pipeline 的开跑前/收尾清扫步骤调用，
     也可独立 CLI 运行（python cleanup_originals.py [--apply]）。
     """

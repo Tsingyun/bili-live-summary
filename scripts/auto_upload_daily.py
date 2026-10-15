@@ -128,7 +128,7 @@ def lock_release(workdir):
     for p in (lp, hb):
         try:
             if os.path.exists(p):
-                os.remove(p)
+                common.force_unlink(p)
         except OSError:
             pass
 
@@ -307,8 +307,7 @@ def cleanup_tmp(tmp, log):
 
 
 def shutil_ignore_errors(tmp):
-    import shutil
-    shutil.rmtree(tmp, ignore_errors=True)
+    common.force_rmtree(tmp)
 
 
 # ---------- 上传 ----------

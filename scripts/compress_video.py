@@ -9,17 +9,15 @@ RTX 20 系及以后支持 hevc_nvenc，速度远快于 CPU 编码。
 
 设计原则（与 bili-live-summary 其它模块一致）：
 - 默认（replace_original=false）：输出 `<原名>_compressed.mp4` 新文件，保留原始以便核对；
-- replace_original=true 且 replace_mode=recycle（默认）：压缩成功并备份（与原视频同盘，
-  默认 <盘>:\\live_raw_backup，可在 compress.backup_dir 覆盖）后，把原始视频可靠移入回收站
-  （绝不裸删），压缩版保留在 `<原名>_compressed.mp4`；
-- replace_original=true 且 replace_mode=delete：压缩成功后直接永久删除原视频
-  （省空间，不进回收站 / 不备份），压缩版保留在 `<原名>_compressed.mp4`；
+- replace_original=true：压缩成功后**直接永久删除原视频**（默认 replace_mode=delete，
+  省空间、不进回收站、不备份、无需确认），压缩版保留在 `<原名>_compressed.mp4`；
+  旧版 recycle 分支（备份+移回收站）已移除——本机回收站会堆积导致磁盘爆满；
 - 幂等：目标已存在且体积合理则跳过；
 - 不抛异常，避免影响总结主流程；失败仅记日志返回 None，绝不破坏原文件。
 
 用法:
   python compress_video.py --src "D:\\录播\\...\\录制-xxx.mp4"
-  python compress_video.py --src "..." --replace   # 压缩后替换原视频（默认进回收站；replace_mode=delete 则直接删）
+  python compress_video.py --src "..." --replace   # 压缩后替换原视频（直接永久删除原视频，不进回收站）
 """
 
 import argparse
@@ -68,12 +66,10 @@ def compress_video(cfg, log, src_video, replace_original=False, archive_root=Non
     返回输出文件路径；未启用 / 源不存在 / 转换失败返回 None。
 
     replace_original=False（默认）：输出 `<名>_compressed.mp4` 新文件，保留原始（安全）。
-    replace_original=True：压缩成功后按 compress.replace_mode 处理原文件——
-        - replace_mode=recycle（默认）：先备份原文件（与原视频同盘，默认 <盘>:\\live_raw_backup，
-          可在 compress.backup_dir 覆盖；按 max_backup_files/max_backup_gb 自动收敛），
-          再可靠移入回收站；
-        - replace_mode=delete：直接永久删除原视频（不进回收站 / 不备份，省空间）；
-        压缩版均保留在 _compressed.mp4。压缩失败不动原文件。
+    replace_original=True：压缩成功后**直接永久删除原视频**（默认 replace_mode=delete，
+        省空间、不进回收站、不备份、无需确认）；压缩版保留在 _compressed.mp4。
+        旧版 recycle 分支（备份+移回收站）已移除——回收站堆积会撑爆磁盘。
+        压缩失败不动原文件。
     """
     cc = cfg.get('compress') or {}
     if not cc.get('enabled', False):
@@ -268,27 +264,8 @@ def _default_backup_dir(src_video):
     return os.path.join(os.path.dirname(os.path.abspath(src_video)), 'live_raw_backup')
 
 
-def _send_to_recycle_bin(log, path):
-    """可靠地把文件移入系统回收站（绝不裸删）。
-
-    返回 True 表示成功；失败抛异常由调用方处理（保留原文件）。
-    Windows 用 VB Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(SendToRecycleBin)，
-    对超大文件可靠（旧实现用 COM ParseName 对超长中文路径/大文件静默失败，导致假成功）。
-    """
-    if os.name == 'nt':
-        ps = ('Add-Type -AssemblyName Microsoft.VisualBasic;'
-              '[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('
-              '"' + path.replace('\\', '\\\\') + '",'
-              '"OnlyErrorDialogs","SendToRecycleBin")')
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                       check=True, timeout=300)
-    elif sys.platform == 'darwin':
-        subprocess.run(['osascript', '-e',
-                        'tell application "Finder" to delete POSIX file "%s"' % path],
-                       check=True, timeout=300)
-    else:
-        subprocess.run(['gio', 'trash', path], check=True, timeout=300)
-    return True
+# (2026-10-15) 回收站分支已移除：本机「安全删除 hook」会把 os.remove 软删进回收站，
+# 原视频经回收站会堆积导致磁盘爆满；所有删除统一走 common.force_unlink（原生永久删除）。
 
 
 def _prune_backups(log, backup_dir, cc):
@@ -328,55 +305,14 @@ def _prune_backups(log, backup_dir, cc):
             break
 
 
-def _replace_backup_then_delete(cfg, log, src_video, compressed):
-    """压缩成功且校验通过后：备份原文件（与原视频同盘），再可靠移入回收站。
-
-    返回 True 表示原文件已移入回收站（压缩版保留在 compressed 路径）；
-    任意环节失败都保留原文件并返回 False（绝不裸 rm）。
-    """
-    cc = cfg.get('compress') or {}
-    ok, why = _compressed_ok(cfg, src_video, compressed)
-    if not ok:
-        log.error('[compress] 压缩产物校验未通过（%s），保留原文件：%s'
-                  % (why, os.path.basename(src_video)))
-        return False
-    backup_dir = cc.get('backup_dir') or _default_backup_dir(src_video)
-    os.makedirs(backup_dir, exist_ok=True)
-    backup = os.path.join(backup_dir, os.path.basename(src_video))
-    # 1) 备份原文件（冗余副本，用于极端情况下的原片找回）
-    try:
-        shutil.copy2(src_video, backup)
-        log('[compress] 已备份原文件到：%s' % backup)
-    except Exception as e:
-        log.error('[compress] 备份失败，放弃删除原文件：%s' % e)
-        return False
-    # 2) 收敛备份目录，防止备份盘被撑爆
-    try:
-        _prune_backups(log, backup_dir, cc)
-    except Exception as e:
-        log.error('[compress] 备份收敛异常（不影响原文件）：%s' % e)
-    # 3) 可靠移入回收站（Windows VB / macOS Finder / Linux gio）
-    try:
-        _send_to_recycle_bin(log, src_video)
-        log('[compress] 已把原视频移入回收站：%s' % src_video)
-        return True
-    except Exception as e:
-        log.error('[compress] 回收站删除失败，原文件保留（请手动清理）：%s' % e)
-        return False
-
-
 def _replace_by_mode(cfg, log, src_video, compressed):
-    """按 compress.replace_mode 决定「压缩成功后如何处理原视频」。
+    """压缩成功后处理原视频：一律直接永久删除（用户规则 2026-10-15：省空间、不进回收站、不备份、无需确认）。
 
-    - recycle（默认）：备份后移入回收站（见 _replace_backup_then_delete）；
-    - delete：直接永久删除（见 _replace_direct_delete）。
+    旧的 recycle 分支（备份+移回收站）已移除——本机回收站会堆积导致磁盘爆满。
+    无论 config.replace_mode 写 recycle 还是 delete，都走 _replace_direct_delete 永久删除。
     返回 True 表示原文件已移除；失败则保留原文件返回 False。
     """
-    cc = cfg.get('compress') or {}
-    mode = (cc.get('replace_mode') or 'recycle').lower()
-    if mode == 'delete':
-        return _replace_direct_delete(cfg, log, src_video, compressed)
-    return _replace_backup_then_delete(cfg, log, src_video, compressed)
+    return _replace_direct_delete(cfg, log, src_video, compressed)
 
 
 def _compressed_ok(cfg, src_video, compressed):

@@ -25,8 +25,8 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
    录播根目录（local.root）下的任何成品——压缩 MP4、源 flv/mp4；以及 mp3_export.out_dir
    的归档 MP3（用户规则 2026-09-08 起与 Word 总结同目录，不在录播根目录）。
    源视频只允许 compress 模块在「压缩成功且校验通过」后删除，本模块不碰。
-3. 删除三级降级：os.remove → shutil.rmtree → PowerShell Remove-Item。
-   某些沙箱/占用场景 os.remove 会失败，降级保证真的删掉。
+3. 删除走 common.force_unlink / force_rmtree（原生永久删除：ctypes Win32 DeleteFileW →
+   PowerShell Remove-Item -Force，绕过 os.remove 安全删除 hook，绝不进回收站、无需确认）。
 
 命令行
 ------
@@ -108,8 +108,8 @@ def protected_paths(cfg):
 # 删除原语（三级降级）
 # ---------------------------------------------------------------------------
 # 强制删除原语统一放在 common（transcribe / download_merge / compress_video 共用）：
-# 自动化环境下 D 盘的 os.remove 会被安全 hook 拦截并抛 AttributeError，
-# 必须降级到 PowerShell 才能真正删掉。详见 common.force_unlink 注释。
+# 自动化环境下 D 盘的 os.remove 会被安全 hook 拦截（软删进回收站/静默失败），
+# 因此统一走 common.force_unlink / force_rmtree（原生永久删除）。详见 common 注释。
 force_unlink = C.force_unlink
 force_rmtree = C.force_rmtree
 

@@ -108,7 +108,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 - **本地录播 & rec站补档**：压缩后输出到 **`录播根目录/YYYY-MM-DD/`** 日期文件夹（源已在同日期目录则直接复用、不重复建层），文件 `<原名>_compressed.mp4`（用户规则 2026-09-08：**不要 MP4/ 文件夹，直接用日期命名文件夹**）。
 - 曾被试用又搁置的模式（代码仍兼容、配置勿再用）：`mp4_folder`（2026-09-05，统一 `根/MP4/`）、`mp4_date_folder`（2026-09-06，`根/MP4/YYYY-MM-DD/`）。
 - 日期从文件名里的 8 位日期 `20260824` 解析（自动跳过 UID 等非法日期串）。
-- `replace_original=true` 时按 `replace_mode` 处理原视频——`recycle` = 先备份到 `~/.workbuddy/backups/live_raw/` 再移入**回收站**；`delete` = **直接永久删除**（省空间，岁己当前配置）。**压缩失败不动原文件**。
+- `replace_original=true` 时压缩成功且 ffprobe 校验通过后**一律直接永久删除原视频**（`replace_mode` 已统一为 `delete`，省空间、不进回收站/不备份/无需确认；旧版 `recycle` 分支已废弃——本机回收站会堆积导致磁盘爆满）。**压缩失败不动原文件**。
 - **B站源**：**不压缩**，原样保留下载到的 MP4，按直播日期归档到 `根目录/YYYY-MM-DD/`（默认 `bilibili.keep_mp4=true`）。设 `keep_mp4=false` 才删除下载视频。
 
 ### 工作目录 `D:\岁己直播自动总结`（运行时产物，config 所在）
@@ -149,7 +149,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
 | `local_merge` | `enabled/max_gap_sec/allow_overlap_sec/exclude_dates` | 多段**先合并再总结**（禁止逐段总结）；场次判定**只看相邻间隙、不看日期变更**，跨 0 点连续段归属开播那一场；`allow_overlap_sec`(默认60) 容忍重连时的轻微负间隙；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
-| `compress` | `replace_mode` | `delete` = 直接永久删原视频（岁己当前，省空间）；`recycle` = 先备份再移回收站 |
+| `compress` | `replace_mode` | 已统一为 `delete` = 压缩成功后直接永久删原视频（省空间，不进回收站/不备份/无需确认）；旧版 `recycle` 已废弃 |
 | `compress` | `codec/target_size_gb/cq` | `hevc_nvenc` / `5` / `24` |
 | `bilibili` | `keep_mp4` / `compress` | `true` / `false`（B站兜底录播**保留 MP4、不压缩**，归档到 `根目录/YYYY-MM-DD/`） |
 | `darkpy` | `enabled/host/port/file_port/room_dir` | rec.darkpy.cn 第二备份：`true` / `rec.darkpy.cn` / `5144`(页面) / `5143`(文件) / `25788785-岁己SUI` |
@@ -184,7 +184,7 @@ Word 月度文档已有该日章节、或本地存在该日完整视频（> `bac
 | dry-run 显示「录制中，跳过」 | 文件还在写（大小增长 / mtime 太新）。等录制结束、文件稳定后下次运行会自动处理。**不要手动移动或处理正在录制的文件。** |
 | 某场总结残缺 / 缺后半段 | 长音频未切块导致 FunASR VAD 截断。确认 `transcribe.chunk_hours_threshold ≤ 2`，重跑该场会自动补齐（脚本按块续跑，失败场不写完成标记）。 |
 | Gemini 429（每日配额耗尽） | 当天该模型额度用尽。`process_session` 遇到 429 立即失败返回、不重试，整场不写完成标记，次日续跑。 |
-| 压缩后原视频没删 / 压缩版没生成 | 看 `logs/errors.log`：压缩失败不动原文件（安全）；回收站删除被安全策略拦截时会保留原文件并提示手动清理。 |
+| 压缩后原视频没删 / 压缩版没生成 | 看 `logs/errors.log`：压缩失败不动原文件（安全）；永久删除因文件被占用仍失败时保留原文件并记日志提示（原生删除绕过 os.remove 安全删除 hook，不进回收站）。 |
 | B站兜底重复下了本地已处理的日期 | 看 `state.json` 的 `done_dates` 是否含该日期；根目录若仍留有原 flv，本地监测会优先处理、不会走 B站。 |
 | 缺失检查报告说某天「本地缺失」但明明录了 | ① 该日视频 < `min_cover_video_mb`(20MB) 视为残缺；② 看 Word 是否有该日章节 / `done_dates` 是否收录。 |
 | rec站补档下载慢 / 失败 | `darkpy.timeout/retries` 调大；断点续传 `.part` 已保留，重跑接着下。rec站文件服务端口 5143，列表走 file.php（四参数），勿直连 `/file/<目录>/`（403）。 |
@@ -223,10 +223,10 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
 ## 7. 安全与风险红线（必须遵守）
 
 1. **正在录制的文件绝不处理**：靠 `is_file_stable`（大小稳定 + mtime 够老）兜底，宁可跳过等下一轮。
-2. **原视频的处置由 `compress.replace_mode` 决定**（用户 2026-08-28 选定 `delete`）：
-   `delete` = 压缩成功且 ffprobe 校验通过后**直接永久删除**（省空间，不进回收站、不备份）；
-   `recycle` = 先备份到 `~/.workbuddy/backups/live_raw/` 再移入回收站。
-   两种模式都**只在压缩产物校验通过后才删**，失败一律保留原文件。
+2. **原视频的处置**（用户 2026-08-28 选定 `delete`，且 2026-10-15 起 `replace_mode` 已统一为 `delete`）：
+   压缩成功且 ffprobe 校验通过后**一律直接永久删除原视频**（省空间，不进回收站、不备份、无需确认）。
+   旧版 `recycle` 分支（备份+移回收站）已废弃——本机回收站会堆积过程文件导致磁盘爆满。
+   **只在压缩产物校验通过后才删**，失败一律保留原文件。
    且必须用 `common.force_unlink`（降级删除），裸 `os.remove` 在 D 盘会静默失败。
 3. **ffmpeg / 中文路径用原生 Windows 路径**（PowerShell / 脚本内 `subprocess` 直接传路径），避免 Git Bash 改动中文路径。
 4. **长任务前台跑完再回报**：一期 5 小时录播约 15~25 分钟，别中途打断。

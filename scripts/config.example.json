@@ -129,7 +129,7 @@
     "enabled": true
   },
   "compress": {
-    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder（当前规则，用户2026-09-08：不用 MP4/ 文件夹，直接用日期文件夹）时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」；mp4_folder/mp4_date_folder（2026-09-05/06 曾用，已搁置）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 决定 recycle=备份+回收站 / delete=直接永久删除）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
+    "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder（当前规则，用户2026-09-08：不用 MP4/ 文件夹，直接用日期文件夹）时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」；mp4_folder/mp4_date_folder（2026-09-05/06 曾用，已搁置）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 已统一为 delete=压缩成功后直接永久删除原视频，不进回收站/不备份/无需确认；旧版 recycle 已废弃）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
     "enabled": true,
     "codec": "hevc_nvenc",
     "target_size_gb": 5,
@@ -139,8 +139,8 @@
     "out_dir_mode": "date_subfolder",
     "mp4_folder_name": "MP4",
     "replace_original": false,
-    "replace_mode": "recycle",
-    "_comment_replace_mode": "replace_original=true 时如何处理原视频：recycle=先备份再移回收站（默认，安全）；delete=压缩成功后直接永久删除原视频（省空间，不进回收站/不备份）。"
+    "replace_mode": "delete",
+    "_comment_replace_mode": "replace_original=true 时如何处理原视频：已统一为 delete=压缩成功后直接永久删除原视频（省空间，不进回收站/不备份/无需确认）；旧版 recycle（备份+移回收站）已废弃，因本机回收站会堆积导致磁盘爆满。"
   },
   "darkpy": {
     "_comment": "第二备份源 rec.darkpy.cn（用户规则 2026-09-05：备份顺序 本地 → rec.darkpy.cn → B站）。站点是 phpstudy+自研PHP文件浏览器：5144=页面、5143=文件服务；列表走 file.php（需 dir/dir_s/dir_f/dir_file 四参数），下载直链 http://host:file_port/file/<room_dir>/<文件名>.flv。一场直播常切成多个 FLV，按 max_gap_sec 时间间隙（段末时间到下一段开始）归组后 concat 无损合并（不重编码）。room_dir 填主播在 rec站的目录名（一般是 uid-主播名）。",

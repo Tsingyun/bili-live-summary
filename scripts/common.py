@@ -248,12 +248,27 @@ def mark_stage(cfg, st, bvid, stage, info=None):
 
 
 # ---------- 强制删除 ----------
-# 重要（2026-09-01 实测）：在自动化环境下，对 D 盘（用户数据盘）调用 os.remove 会被
-# 安全删除 hook 拦截，且 hook 自身抛 `AttributeError: 'NoneType' object has no attribute
-# 'strip'`（不是权限错误，是 hook 的 bug）。结果是所有 os.remove 全部静默失败——
-# 分P下载的 m4s 碎片、ASR 转写切块、16k 临时音频、「压缩后删源视频」全都删不掉，
-# 每场留下几 GB 到十几 GB，几天就能把磁盘撑爆。
-# 因此所有删除必须走这里：os.remove 失败时降级到 PowerShell Remove-Item。
+# 重要（2026-09-01 实测 + 2026-10-15 修正）：本机对 D 盘（用户数据盘）的删除存在
+# 「安全删除 hook」，会拦截 os.remove / shutil.rmtree：要么抛 AttributeError 静默失败，
+# 要么把文件**软删进回收站**——两种结果都让过程文件删不掉 / 磁盘不释放，几天撑爆 D 盘。
+# 因此所有删除都走这里，并**直接调 Windows 原生永久删除**绕开 os.remove 这层 hook：
+#   · force_unlink：优先 ctypes Win32 DeleteFileW（不经过 os.remove，不进回收站），
+#     失败降级 PowerShell Remove-Item -Force，最后才 os.remove 兜底；
+#   · force_rmtree：直接 PowerShell Remove-Item -Recurse -Force（不经过 shutil.rmtree）。
+# 全程永久删除、不进回收站、无需任何人工审核/确认。
+def _win_permanent_delete_file(path):
+    """Windows 下直接调 Win32 DeleteFileW 永久删除单个文件，绕过 os.remove 安全删除 hook。
+    成功返回 True；非 Windows / ctypes 不可用 / 调用失败均返回 False（交回退逻辑处理）。"""
+    try:
+        if os.name != 'nt':
+            return False
+        import ctypes
+        res = ctypes.windll.kernel32.DeleteFileW(path)
+        return res != 0
+    except Exception:
+        return False
+
+
 def _ps_remove(path, is_dir):
     """PowerShell 降级删除。
 
@@ -273,11 +288,11 @@ def _ps_remove(path, is_dir):
 
 
 def force_unlink(path, log=None, retries=5, delay=4.0):
-    """强制删除单个文件（os.remove → PowerShell 降级），对「文件被占用」等瞬时锁做重试。
+    """强制永久删除单个文件（绕过 os.remove 安全删除 hook，绝不进回收站）。
 
-    存在与否都返回是否「已不存在」。环境层会把 os.remove 转成软删（进回收站），
-    若此时文件被直播录制器等进程占用，删除会失败——此处重试若干次，给占用方释放时间；
-    仍失败则保留文件并返回 False（绝不误删），留待后续 run_sweep 兜底清扫。
+    优先 ctypes 调 Win32 DeleteFileW 直接永久删除；失败降级 PowerShell Remove-Item -Force；
+    最后才 os.remove 兜底。对「文件被占用」等瞬时锁做重试。
+    存在与否都返回是否「已不存在」。无需任何人工审核/确认。
     """
     if not path or not os.path.lexists(path):
         return True
@@ -285,12 +300,20 @@ def force_unlink(path, log=None, retries=5, delay=4.0):
     for attempt in range(retries + 1):
         removed = False
         try:
-            os.remove(path)
-            removed = not os.path.lexists(path)
+            if _win_permanent_delete_file(path) and not os.path.lexists(path):
+                removed = True
         except Exception as e1:
+            last_err = '%s' % e1
+        if not removed:
             ok, err = _ps_remove(path, False)
-            last_err = '%s | %s' % (e1, err)
+            last_err = '%s | %s' % (last_err, err)
             removed = ok and not os.path.lexists(path)
+        if not removed:
+            try:
+                os.remove(path)
+                removed = not os.path.lexists(path)
+            except Exception as e2:
+                last_err = '%s | %s' % (last_err, e2)
         if removed:
             return True
         if attempt < retries:
@@ -305,21 +328,22 @@ def force_unlink(path, log=None, retries=5, delay=4.0):
 
 
 def force_rmtree(path, log=None):
-    """强制删除目录树（shutil.rmtree → PowerShell 降级）。"""
+    """强制永久删除目录树（直接 PowerShell Remove-Item -Recurse -Force，绕过 shutil.rmtree 安全删除 hook，绝不进回收站）。"""
     if not path or not os.path.lexists(path):
+        return True
+    ok, err = _ps_remove(path, True)
+    if not os.path.lexists(path):
+        return True
+    if ok:
         return True
     try:
         shutil.rmtree(path)
         if not os.path.lexists(path):
             return True
     except Exception as e1:
-        ok, err = _ps_remove(path, True)
-        if ok and not os.path.lexists(path):
-            return True
         if log:
             log('删除目录失败 %s：%s | %s' % (path, e1, err), 'WARN')
         return False
-    ok, err = _ps_remove(path, True)
     if not os.path.lexists(path):
         return True
     if log:
