@@ -284,6 +284,12 @@ class GeminiRotator:
         """清除某模型的退避（成功或恢复后）。"""
         self.down_until.pop(model, None)
 
+    def _provider_of(self, model):
+        """模型所属 provider（子类 MultiProviderRotator 按 Gemini/ModelScope 覆写）。
+        基类只有 Gemini 一条链，统一返回 'gemini'。网络层异常时按 provider 整批退避，
+        让 _pick 跨到另一条 provider（如 Gemini 不通→自动切 ModelScope/Qwen）。"""
+        return 'gemini'
+
     def _note_usage(self, model, d):
         """累计 token 消耗：取 Gemini usageMetadata 或 OpenAI 兼容 usage。
         成功与空响应都记（都真实消耗）；失败请求无 usage 可记。"""
@@ -360,10 +366,23 @@ class GeminiRotator:
             try:
                 r = self._post(model, system_prompt, user_content)
             except Exception as e:
-                # 网络层异常：不降级（多半是链路问题），退避后重试同一模型
+                # 网络层异常（超时/连接重置/DNS 等）：该模型及其同 provider 的其它模型
+                # 整批标记退避（应对整条 provider 链路故障），让 _pick 跨到另一条
+                # provider（如 Gemini 整条不通→自动切 ModelScope/Qwen），而不是死磕
+                # 同一个模型把预算烧光。
+                # ★ 2026-10-14 修：此前此处不 mark_down，导致 Gemini 端点硬不可达时
+                # _pick 永远优先返回 gemini-3.8-flash，36 次预算全砸一个模型、链里
+                # 其它 17 个一次没被试用，最终误报「所有模型失败」。
                 last_err = f'{model} 请求异常 {type(e).__name__}: {e}'
-                self.log(f'  [{self.provider_tag}] {last_err}，退避重试')
-                time.sleep(min(5 * attempts, 30))
+                prov = self._provider_of(model)
+                n_down = 0
+                for m in self.models:
+                    if self._provider_of(m) == prov:
+                        self._mark_down(m, self.backoff_transient)
+                        n_down += 1
+                self.log(f'  [{self.provider_tag}] {last_err}：{prov} 链路异常，'
+                         f'标记 {n_down} 个同 provider 模型退避并切换下一可用模型')
+                time.sleep(1)
                 continue
 
             now = time.time()

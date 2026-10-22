@@ -3,7 +3,9 @@
 """
 阶段 3：FunASR 语音转文字，输出带时间轴的 TXT 与标准 SRT。
 
-模型：SenseVoiceSmall + fsmn-vad + punc_ct-transformer（首次运行自动从 ModelScope 下载）
+模型：由 config.transcribe.model 选择 —— "nano"（默认，Fun-ASR-Nano-2512）
+或 "sensevoice"（SenseVoiceSmall + fsmn-vad + punc_ct-transformer）。
+首次运行自动从 ModelScope 下载对应权重。
 超过阈值时长的音频自动切块转写并做时间轴偏移，避免显存溢出。
 
 用法:
@@ -102,16 +104,36 @@ def load_model(cfg, log):
         log('未检测到可用 GPU，退回 CPU（长音频会非常慢）', 'WARN')
 
     from funasr import AutoModel
-    log('加载 FunASR 模型 (SenseVoiceSmall + VAD + PUNC) ...')
-    model = AutoModel(
-        model='iic/SenseVoiceSmall',
-        vad_model='iic/speech_fsmn_vad_zh-cn-16k-common-pytorch',
-        vad_kwargs={'max_single_segment_time': 30000},
-        punc_model='iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch',
-        device=device,
-        disable_update=True,
-    )
-    log('模型加载完成')
+    kind = str(cfg['transcribe'].get('model', 'sensevoice')).lower()
+    cfg['_asr_kind'] = kind
+    if kind == 'nano':
+        # Fun-ASR-Nano-2512：0.8B（SenseVoice 编码器 + Qwen3-0.6B 解码器），
+        # 中文更准、官方主推、可持续维护。原生不保证返回时间戳（模型卡 TODO），
+        # 时间轴统一由独立 fsmn-vad 切段兜底（见 _vad_fallback）。
+        # ★ 必须带 vad_model：Nano 不带 vad_model 时 generate(numpy 切片) 会抛异常，
+        #   逐段 ASR 全部失败 → 0 句。带 vad_model 后单切片内部走 VAD→ASR 正常。
+        log('加载 FunASR 模型 (Fun-ASR-Nano-2512) ...')
+        model = AutoModel(
+            model='FunAudioLLM/Fun-ASR-Nano-2512',
+            trust_remote_code=True,
+            vad_model='iic/speech_fsmn_vad_zh-cn-16k-common-pytorch',
+            vad_kwargs={'max_single_segment_time': 30000},
+            device=device,
+            disable_update=True,
+        )
+        log('Fun-ASR-Nano-2512 加载完成')
+    else:
+        log('加载 FunASR 模型 (SenseVoiceSmall + VAD + PUNC) ...')
+        model = AutoModel(
+            model='iic/SenseVoiceSmall',
+            vad_model='iic/speech_fsmn_vad_zh-cn-16k-common-pytorch',
+            vad_kwargs={'max_single_segment_time': 30000},
+            punc_model='iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch',
+            device=device,
+            disable_update=True,
+        )
+        log('模型加载完成')
+    model._asr_kind = kind
     return model
 
 
@@ -135,6 +157,9 @@ def _get_vad_model(device, log):
 
 def _try_sentence_timestamp(model, audio_path, cfg, offset_sec, log):
     """首选：funasr 原生 sentence_timestamp。失败或未产出时间戳则返回 []。"""
+    # Nano 原生不保证返回时间戳（官方模型卡 TODO），直接走 VAD 切段兜底
+    if getattr(model, '_asr_kind', 'sensevoice') == 'nano':
+        return []
     try:
         res = model.generate(
             input=audio_path, cache={}, language='auto', use_itn=True,
@@ -178,6 +203,7 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
     返回 [(start_sec, end_sec, text), ...]，start/end 为绝对秒（含 offset）。"""
     import soundfile as sf
     import re as _re
+    _vad_fallback._errs = 0
     try:
         import torch as _torch
         device = 'cuda:0' if _torch.cuda.is_available() else 'cpu'
@@ -191,6 +217,7 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
             return []
         wav, sr = sf.read(audio_path, dtype='float32')
         out = []
+        kind = getattr(model, '_asr_kind', 'sensevoice')
         for (s_ms, e_ms) in raw:
             s = int(s_ms / 1000.0 * sr)
             e = int(e_ms / 1000.0 * sr)
@@ -198,16 +225,31 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
                 continue
             slice_w = wav[s:e]
             try:
-                r = model.generate(input=slice_w, cache={}, language='auto',
-                                   use_itn=True, batch_size_s=300,
-                                   ncpu=cfg['transcribe'].get('ncpu', 4),
-                                   merge_vad=True, merge_length_s=15)
-                txt = _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '').strip()
-            except Exception:
+                if kind == 'nano':
+                    # Nano：language="中文" + itn=True；原生不带 <|...|> 标签，无需剥离
+                    r = model.generate(input=slice_w, cache={}, language='中文',
+                                       itn=True, batch_size=1)
+                    raw_text = r[0].get('text', '') or ''
+                else:
+                    r = model.generate(input=slice_w, cache={}, language='auto',
+                                       use_itn=True, batch_size_s=300,
+                                       ncpu=cfg['transcribe'].get('ncpu', 4),
+                                       merge_vad=True, merge_length_s=15)
+                    raw_text = _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '')
+                txt = raw_text.strip()
+            except Exception as e:
+                # 逐段 ASR 异常不再静默吞掉：前 3 次打印，便于排查（曾因 Nano 未带
+                # vad_model 导致 generate(numpy) 全段失败、整场 0 句却无报错）
+                if log and _vad_fallback._errs < 3:
+                    try:
+                        log(f'  逐段 ASR 异常（跳过该段）：{type(e).__name__}: {e}', 'WARN')
+                        _vad_fallback._errs += 1
+                    except Exception:
+                        pass
                 continue
             if not txt:
                 continue
-            events = TAG_RE.findall(txt)
+            events = TAG_RE.findall(txt) if kind != 'nano' else ()
             ct = clean_text(txt)
             if not is_meaningful(ct) or is_junk(ct, events):
                 continue
@@ -416,7 +458,7 @@ def transcribe_one(cfg, mp3_path, model, log):
             '音频时长': f'{int(dur)}s ({hms(dur)})',
             '文本字数': chars,
             '分句数量': len(segs),
-            '模型': 'SenseVoiceSmall',
+            '模型': 'Fun-ASR-Nano-2512' if cfg.get('_asr_kind') == 'nano' else 'SenseVoiceSmall',
             '音频前处理': enh_desc,
         })
         write_srt(srt_path, segs)

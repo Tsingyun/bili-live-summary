@@ -203,6 +203,10 @@ class MultiProviderRotator(GeminiRotator):
         """单模型本轮成功调用上限：Gemini 20（免费层配额紧），魔搭 450（单模型 500/日）。"""
         return self.ms_max_per_model if is_modelscope(model) else self.max_per_model
 
+    def _provider_of(self, model):
+        """覆写基类：按组织前缀区分 Gemini / modelscope 两条 provider 链路。"""
+        return 'modelscope' if is_modelscope(model) else 'gemini'
+
     # ---- 限流：从 call() 前置的统一限流改为 _post 内按 provider 限流 ----
     def _rpm_wait(self):
         pass  # 由 _post 内的 _gemini_rpm_wait / _ms_rpm_wait 接管
