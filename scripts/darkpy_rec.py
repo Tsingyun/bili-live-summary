@@ -176,9 +176,12 @@ def _fetch_index_impl(cfg, log):
         rec['end'] = None
         if mt:
             try:
-                rec['end'] = datetime.datetime(
+                # 站点 mtime 为 UTC；转本地时间，否则会比真实结束早 8h，
+                # 导致段间间隙被算成 ~8h 而把一场连续直播拆成多场（2026-10-26 踩到）
+                _naive = datetime.datetime(
                     int(mt.group(1)), int(mt.group(2)), int(mt.group(3)),
                     int(mt.group(4)), int(mt.group(5)), int(mt.group(6) or 0))
+                rec['end'] = _naive.replace(tzinfo=datetime.timezone.utc).astimezone().replace(tzinfo=None)
             except ValueError:
                 rec['end'] = None
         rec['end'] = rec['end'] or rec.get('start')
