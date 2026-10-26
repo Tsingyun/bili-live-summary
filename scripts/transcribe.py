@@ -229,12 +229,19 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
                     # Nano：language="中文" + itn=True；原生不带 <|...|> 标签，无需剥离
                     r = model.generate(input=slice_w, cache={}, language='中文',
                                        itn=True, batch_size=1)
-                    raw_text = r[0].get('text', '') or ''
                 else:
                     r = model.generate(input=slice_w, cache={}, language='auto',
                                        use_itn=True, batch_size_s=300,
                                        ncpu=cfg['transcribe'].get('ncpu', 4),
                                        merge_vad=True, merge_length_s=15)
+                # ★ 2026-10-27：Nano 对个别切片（极短/边界段）会返回空列表而非异常，
+                #   直接 r[0] 会 IndexError 被外层 except 吞掉 → 该段静默丢失。判空后跳过，
+                #   既不再崩溃，也避免误吞真实失败（这类切片多为无语音静音段，丢弃无害）。
+                if not r:
+                    continue
+                if kind == 'nano':
+                    raw_text = r[0].get('text', '') or ''
+                else:
                     raw_text = _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '')
                 txt = raw_text.strip()
             except Exception as e:
