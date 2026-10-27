@@ -183,6 +183,7 @@ def analyze(cfg, st, log, start, end, sources=None):
         log('[backfill] rec站索引失败：%s' % e, 'WARN')
         dp_files = []
     dp_by = {}
+    all_sess = []
     if dp_files:
         # 先全局归组一次（跨午夜尾巴归到开播日），再按天取场次
         all_sess = D.group_all_sessions(dp_files, dd['max_gap_sec'], log)
@@ -197,6 +198,49 @@ def analyze(cfg, st, log, start, end, sources=None):
             e['gb'] = round(e['gb'] + gb, 2)
 
     min_cover = cfg_backfill(cfg)['min_cover_video_mb'] * 1024 * 1024
+
+    # ---- 跨午夜延续日识别（2026-10-27）------------------------------------
+    # 直播常跨 0 点：rec 站/B站都按「自然日」切分资源，会把同一个 0 点后的尾巴
+    # 记成次日的新录播。若不当成「前一日的延续」剔除，每个自然日的补档都会把它
+    # 当成「次日缺失」重复下载、重复总结，文档里就多出一个独立小节
+    # （典型：10-23 场播到 10-24 00:50 → 文档出现「10月24日0点场」重复小节）。
+    # 判据（三重，全部满足才算延续日）：
+    #   ① rec 站没有任何「当天开播」的场次；
+    #   ② 前一日的场次实际录到了这一天（成员 end 的日期 == 本日）；
+    #   ③ 前一日已覆盖（done_dates / Word 章节 / 本地完整视频）。
+    # 另支持 state.ignored_dates 人工忽略（值写原因），优先级最高。
+    ignored = st.get('ignored_dates')
+    ignored = ignored if isinstance(ignored, dict) else {}
+    tail_dates = {}
+    if all_sess:
+        starts, spans = set(), {}
+        for sess in all_sess:
+            iso0 = _norm(sess[0].get('ymd') or '')
+            if not iso0:
+                continue
+            starts.add(iso0)
+            ends = [x.get('end') for x in sess
+                    if isinstance(x.get('end'), datetime.datetime)]
+            if ends:
+                e_iso = max(ends).date().isoformat()
+                if e_iso > iso0:
+                    spans[iso0] = max(spans.get(iso0, ''), e_iso)
+        for start_iso, end_iso in spans.items():
+            prev_ok = (start_iso in done or start_iso in word or
+                       loc.get(start_iso, {}).get('bytes', 0) >= min_cover)
+            if not prev_ok:
+                continue
+            cur = datetime.date.fromisoformat(start_iso) + datetime.timedelta(days=1)
+            last = datetime.date.fromisoformat(end_iso)
+            while cur <= last:
+                di = cur.isoformat()
+                if di not in starts:
+                    tail_dates[di] = start_iso
+                cur += datetime.timedelta(days=1)
+        if tail_dates:
+            log('[backfill] 跨午夜延续日（已并入前一日，不再单独补档）：%s'
+                % '、'.join('%s←%s' % (k, v) for k, v in sorted(tail_dates.items())))
+
     rows = []
     for d in dates:
         local = loc.get(d, {'bytes': 0, 'files': []})
@@ -205,8 +249,14 @@ def analyze(cfg, st, log, start, end, sources=None):
         if d in dp_by:
             row.update(darkpy_flv=dp_by[d]['flv'], darkpy_sess=dp_by[d]['sess'],
                        darkpy_gb=dp_by[d]['gb'])
-        if d in done:
+        if d in ignored:
+            row['status'] = 'covered'
+            row['detail'] = '已忽略（%s）' % (ignored[d] or '人工标记')
+        elif d in done:
             row['status'], row['detail'] = 'covered', '已处理（state.done_dates）'
+        elif d in tail_dates:
+            row['status'] = 'covered'
+            row['detail'] = '跨午夜延续（已并入 %s 的总结，不单独成场）' % tail_dates[d]
         elif d in word:
             row['status'], row['detail'] = 'covered', 'Word 月度文档已有该日章节'
         elif local['bytes'] >= min_cover:
