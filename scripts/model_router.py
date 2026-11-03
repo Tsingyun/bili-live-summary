@@ -46,9 +46,10 @@ MS_MODELS = {
     'Qwen/Qwen3.8-Flash-Next':         {'extra': {'enable_thinking': False}},
     'ZhipuAI/GLM-5.2':                 {'extra': {'thinking': {'type': 'disabled'}}},
     # DeepSeek 系为推理模型，思维链会吞噬输出预算，故给更大的 max_tokens（教训见 yami 项目）
-    'deepseek-ai/DeepSeek-V4.1-Flash': {'extra': {'thinking': {'type': 'disabled'}},
-                                        'max_tokens': 16384},
-    'stepfun-ai/Step-3.7-Flash':       {'extra': {}},
+    # 2026-11-04 实测：无日期 ID 已 400 has no provider supported，
+    # 带日期版 -1017 实测 200 可用（仍为推理模型，思维链会吞输出预算，故加大 max_tokens）。
+    'deepseek-ai/DeepSeek-V4.1-Flash-1017': {'extra': {'thinking': {'type': 'disabled'}},
+                                             'max_tokens': 16384},
 }
 
 # ---------------------------------------------------------------------------
@@ -63,12 +64,14 @@ MODELS_MIXED = [
     'gemini-3.6-flash',               # ⑤ 长期主力，实战验证
     'Qwen/Qwen3.5-122B-A10B',         # ⑥ 备份3：魔搭次旗舰 MoE
     'gemini-3.5-flash',               # ⑦ 3.x 中端
-    'deepseek-ai/DeepSeek-V4.1-Flash',# ⑧ 备份4：DeepSeek 新一代 Flash（思考已关）
+    'deepseek-ai/DeepSeek-V4.1-Flash-1017',  # ⑧ 备份4：DeepSeek 新一代 Flash（思维已关）
     'gemini-3-flash-preview',         # ⑨ Gemini 3 首发 Flash
     'Qwen/Qwen3.8-27B',               # ⑩ 备份5：Qwen3.8 中杯，速度与质量均衡
     'gemini-2.5-flash',               # ⑪ 稳定老将
     'Qwen/Qwen3.5-27B',               # ⑫ 备份6：Qwen3.5 中杯
-    'stepfun-ai/Step-3.7-Flash',      # ⑬ 备份7：阶跃 Flash，中文流畅
+    # ⑬ 已摘除：stepfun-ai/Step-3.7-Flash（2026-11-04 实测 400 has no provider supported，
+    #    同族 Step-3.5-Flash / Step-5-Preview 同样报错 → 魔搭侧整个 Step 家族无 provider 上线）。
+    #    恢复办法：待其 provider 回归后把该行加回此处并在 MS_MODELS 补 {'extra': {}}。
     'gemini-3.5-flash-lite',          # ⑭ Lite 档（500 RPD）
     'Qwen/Qwen3.8-Flash-Next',        # ⑮ 备份8：魔搭最快轻量档
     'gemini-3.1-flash-lite',          # ⑯ Lite 档，响应最快

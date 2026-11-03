@@ -155,7 +155,7 @@ def t_e_prompt():
         'Qwen/Qwen3.8-27B': 'qwen',
         'Qwen/Qwen3.5-397B-A17B': 'qwen',
         'ZhipuAI/GLM-5.2': 'glm',
-        'deepseek-ai/DeepSeek-V4.1-Flash': 'deepseek',
+        'deepseek-ai/DeepSeek-V4.1-Flash-1017': 'deepseek',
         'stepfun-ai/Step-3.7-Flash': 'step',
     }
     for model, fam in fams.items():
@@ -191,7 +191,7 @@ def t_f_ms_payload():
     check('F4 max_tokens 默认 8192', j.get('max_tokens') == 8192)
     check('F5 system+user 双消息', [m['role'] for m in j['messages']] == ['system', 'user'])
     check('F6 Bearer 鉴权', captured['headers']['Authorization'] == 'Bearer m')
-    rot2.models = ['deepseek-ai/DeepSeek-V4.1-Flash']
+    rot2.models = ['deepseek-ai/DeepSeek-V4.1-Flash-1017']
     rot2.down_until.clear()
     rot2.call('sys', 'user', tag='[F2]', max_attempts=2)
     j2 = captured['json']
@@ -229,9 +229,10 @@ def t_h_build_rotator():
         check('H2 有 MS key → MultiProviderRotator', isinstance(rot2, MultiProviderRotator))
         check('H3 混合链首模型=主用 gemini-3.8-flash', rot2.models[0] == 'gemini-3.8-flash')
         check('H4 第 2 位为魔搭备份', is_modelscope(rot2.models[1]))
-        check('H5 魔搭 8 模型在链',
-              sum(1 for m in rot2.models if is_modelscope(m)) == 8)
-        check('H6 链长 18', len(rot2.models) == 18, len(rot2.models))
+        # 快照式断言：链上增删模型时必须同步改这里，避免「改了链没验证」
+        check('H5 魔搭 7 模型在链（Step 系 2026-11-04 摘除后）',
+              sum(1 for m in rot2.models if is_modelscope(m)) == 7)
+        check('H6 链长 17', len(rot2.models) == 17, len(rot2.models))
         cfg2 = {'summarize': {'modelscope_api_key': 'mskey'}, '_workdir': '.'}
         rot3 = build_rotator(cfg2, log=lambda *_: None)
         check('H7 无 Gemini key → 纯魔搭链', isinstance(rot3, MultiProviderRotator)
