@@ -133,8 +133,11 @@ def main():
             with open(log_path, 'a', encoding='utf-8', errors='replace') as lf:
                 lf.write(header)
                 lf.flush()
+                # 标记触发来源：管线据此在用量汇报里写「计划任务」而不是「手动」
+                _env = dict(os.environ)
+                _env['BLS_TRIGGER'] = 'scheduled'
                 p = subprocess.run(plan, stdout=lf, stderr=subprocess.STDOUT,
-                                   timeout=max(60, args.max_minutes) * 60)
+                                   timeout=max(60, args.max_minutes) * 60, env=_env)
                 rc = p.returncode
         except subprocess.TimeoutExpired:
             print('[run_scheduled] 单次执行超时（%d 分钟），已终止' % args.max_minutes)

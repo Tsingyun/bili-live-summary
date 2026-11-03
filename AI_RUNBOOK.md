@@ -263,6 +263,14 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
   但 PID 复用很快，所以不能只看 PID —— 这也是必须叠心跳的原因。
 - **排查顺序**：先看 `logs/scheduled_last_run.json`（计划任务那条跑得怎样）→ 再看 `WORKDIR/.daily_pipeline.stage`
   （卡在哪一阶段）→ 最后才翻 `logs/` 明细日志。看到 `.part` 文件是正常现象，说明上次被中断，下轮会重做该步。
+- **模型用量汇报会落成文件（2026-11-04 新增）**：`daily_pipeline` 收尾把本轮用量写进
+  `WORKDIR/logs/usage/usage_<YYYY-MM-DD_HHMMSS>.md`（每次一份，留档）和 `logs/usage/latest.md`
+  （覆盖写，随时看最近一次）。**必须落文件**——计划任务已改静默启动，控制台看不见，只 `log()` 进
+  `logs/YYYY-MM-DD.log` 等于没有汇报。正常完成 / Ctrl+C / 异常退出三条路径都会写。
+  内容：触发方式（计划任务 or 手动）、起止时间与耗时、处理/跳过场次、逐模型 token 表、分 provider 汇总；
+  若主用 `gemini-3.8-flash` 本次 0 次成功，会额外标一行「全程走降级链」。
+  实现见 `scripts/usage_report.py`，管线内由 `_save_usage(locals(), 状态)` 调用。
+  触发来源靠环境变量 `BLS_TRIGGER=scheduled`（`run_scheduled.py` 拉起时注入）。
 
 > 结论：**任何「自动化没产物」先怀疑宿主回收，而不是脚本 bug**。重跑一次 `daily_pipeline.py` 就能从断点续上。
 
@@ -292,6 +300,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
 | `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 + 06:20 两次，交互式免提权，正在跑时不强杀）；`--silent` 改用 `scripts/silent/*.vbs` 隐藏窗口启动（2026-11-03 新增，**排障：不加就每天弹控制台窗口**） |
 | `scripts/silent/run_*.vbs` | 计划任务静默启动器（2026-11-03 新增）：`WScript.Shell.Run(cmd, 0, True)` 隐藏控制台跑 python 并回传退出码。**纯 ASCII**，工作目录由 `_workdir.json` 解析（WSH 按 ANSI 读，含中文会乱码） |
+| `scripts/usage_report.py` | 模型用量汇报落盘（2026-11-04 新增）：`render(meta, usage)` 出 Markdown、`save(cfg, log, meta)` 写 `logs/usage/usage_<时间戳>.md` + `latest.md`。纯附加输出，内部异常全吞（绝不影响交付物与退出码）；`python usage_report.py` 可直接预览当前渲染效果 |
 | `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，85 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**、**金句格式/异常内容过滤/文档体检**、**小号上传模块纯逻辑（[L]，2026-09-26）**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
 | `scripts/docx_healthcheck.py` | **Word 成品体检与修复**（2026-09-24 新增）：① 格式（金句=灰色斜体/正文=粗体）② markdown 残留 ③ 提示词回显与元话语 ④ 热词表原词回扫 ⑤ 结构提示。`--fix` 就地修复（留 `.bak`）。已接入 `daily_pipeline` 收尾步骤 4 自动执行 |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |

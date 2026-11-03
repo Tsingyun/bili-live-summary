@@ -65,6 +65,7 @@ import reorder_doc as RD
 import summarize_gemini as S
 import regen_gemini_v2 as R
 import model_router as MR  # Gemini + ModelScope 混合模型路由
+import usage_report as UR   # 每次运行结束的模型用量汇报落盘（静默运行时也能看到）
 import cleanup
 import bili_upload
 import cleanup_originals  # 压完删原始 FLV 的闭环清扫（run_sweep）
@@ -1210,6 +1211,51 @@ def _healthcheck(cfg, log, dry_run=False):
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def _save_usage(scope, status):
+    """把本轮模型用量写进 logs/usage/*.md。
+
+    `scope` 直接传 main() 的 locals()：正常收尾、Ctrl+C、异常三条路径都能拿到
+    同一份上下文，且不会因某个变量还没赋值就 KeyError（缺字段按默认值渲染）。
+    纯附加输出——任何异常都被吞掉，绝不影响交付物与退出码。
+    """
+    try:
+        cfg = scope.get('cfg')
+        if not cfg:
+            return
+        log = scope.get('log')
+        args = scope.get('args')
+        now = datetime.datetime.now()
+        t0 = scope.get('t_start') or time.time()
+
+        trig = os.environ.get('BLS_TRIGGER') or ''
+        if trig == 'scheduled':
+            trig = '计划任务（静默启动）'
+        elif getattr(args, 'dry_run', False):
+            trig = '手动（dry-run）'
+        else:
+            trig = '手动'
+
+        skipped = []
+        for it in (scope.get('skipped') or []):
+            try:
+                skipped.append((it[0]['live_date'].isoformat(), it[1]))
+            except Exception:
+                continue
+
+        meta = {
+            'trigger': trig,
+            'started': datetime.datetime.fromtimestamp(t0).strftime('%H:%M:%S'),
+            'ended': now.strftime('%H:%M:%S'),
+            'elapsed': int(time.time() - t0),
+            'status': status,
+            'processed': list(scope.get('done_sessions') or []),
+            'skipped': skipped,
+        }
+        UR.save(cfg, log, meta=meta)
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dry-run', action='store_true')
@@ -1225,6 +1271,7 @@ def main():
                     help='工作目录（含 config.json）；不传则按 BILI_WORKDIR / _workdir.json / BILI_LIVE_CONFIG 推断')
     ap.add_argument('--config', default=None, help='直接指定 config.json 路径（优先级最高）')
     args = ap.parse_args()
+    t_start = time.time()          # 本轮起始时刻（用量汇报要记耗时）
 
     cfg_path = resolve_config_arg(args)
     wd = os.path.dirname(os.path.abspath(cfg_path))
@@ -1389,6 +1436,7 @@ def main():
 
         # 过滤已处理 + 跳过录制中文件
         to_process, skipped = [], []
+        done_sessions = []          # 本轮成功写进 Word 的场次（模型用量汇报要用）
         for s in sessions:
             done, reason = already_done_local(cfg, st, s)
             if done:
@@ -1469,6 +1517,7 @@ def main():
                                              member_files=s['member_files'])
                     if ok:
                         mark_local_done(st, cfg, s, fname)
+                        done_sessions.append(s['live_date'].isoformat())
                 except KeyboardInterrupt:
                     raise                      # 优雅退出信号：交给外层 finally 收尾
                 except Exception as ex:
@@ -1518,15 +1567,28 @@ def main():
             log('原始FLV清扫失败（不影响交付物）：%s' % e, 'WARN')
 
         # ---- 模型用量汇报（每次运行结束必附；仅附加输出，失败不影响交付物）----
+        # 2026-11-04：除写日志外，另落一份 Markdown 到 logs/usage/
+        #   —— 计划任务已改静默启动，控制台看不见，不落文件就等于没有汇报。
         try:
             for _u in R.format_usage_report():
                 log(_u)
         except Exception as e:
             log('模型用量汇报失败（不影响交付物）：%s' % e, 'WARN')
+        _save_usage(locals(), '正常完成')
 
         log('daily_pipeline 本次完成')
     except KeyboardInterrupt:
         print('[daily_pipeline] 收到中断信号，已释放锁并退出（产物均为原子写，可从断点续跑）')
+        # 被中断也留一份汇报：否则「凌晨跑了一半没产物」时完全看不出烧了多少额度
+        _save_usage(locals(), '被中断（Ctrl+C / 关闭控制台 / 进程被终止）')
+    except Exception as _ex:
+        # 异常退出同样留档，并显式写错误日志（此前异常会静默穿透，日志停在半截）
+        try:
+            log('daily_pipeline 异常退出：%s: %s' % (type(_ex).__name__, _ex), 'ERROR')
+        except Exception:
+            pass
+        _save_usage(locals(), '异常退出：%s' % type(_ex).__name__)
+        raise
     finally:
         hb_stop['v'] = True
         try:
