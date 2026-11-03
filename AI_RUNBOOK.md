@@ -249,9 +249,15 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 **B. 长任务搬出 agent 进程树（耐久安全网）**
 - `scripts/run_scheduled.py` 是**耐久入口**：查锁 → 子进程跑 daily_pipeline → 失败重试 2 次 → 结果写 `logs/scheduled_last_run.json`。
 - 用 Windows 计划任务（**Task Scheduler 服务**拉起，不是 agent 的子进程）挂它，就绕开了回收：
-  `python scripts/install_scheduled_task.py install --workdir "D:/岁己直播自动总结"`
-  （注册 `BiliLiveSummary_Daily`：每天 04:20 起每 60 分钟一次、共 3 小时，交互式免提权；**正在跑时不强杀**。）
-  查看 `install_scheduled_task.py show`、手动触发 `... run`、卸载 `... remove`。
+  `python scripts/install_scheduled_task.py --install --silent`（`--silent` 必带，见下条）
+  （注册 `BiliLiveSummary_Daily`：每天 04:20 + 06:20 两次，交互式免提权；**正在跑时不强杀**。）
+  查看 `install_scheduled_task.py --query`、手动触发 `... --run`、卸载 `... --remove`。
+- **★ 必须配 `--silent`，否则每天会在桌面弹控制台窗口**：动作直接写 `python.exe` 时，因为它是控制台子系统程序、
+  任务又以 `LogonType=Interactive` 运行，Task Scheduler 会开一个**真实可见窗口**。
+  2026-11-03 排障确认的「间歇性随机弹窗」就是这个（04:20/05:20/06:20/07:20 各一次，时长 30s~数小时不等）。
+  `--silent` 把动作换成 `wscript.exe //nologo scripts/silent/run_<任务名>.vbs`，
+  VBS 以窗口样式 0 隐藏启动 python，并用 `WScript.Quit` 回传退出码（任务结果与原来一致，实测 `LastTaskResult=0`）。
+  **VBS 必须保持纯 ASCII**：WSH 按 ANSI 读 `.vbs`，写中文工作目录会乱码失效 → 工作目录改由 `_workdir.json` 解析。
 - **锁改心跳驱动**：判活要求「PID 存在 **且** 心跳新鲜（<1200s=20min）」。运行中的进程后台线程每 60s 刷锁，
   被杀后 20 分钟内即可被下一轮接管。**注意**：Windows 下 `os.kill(pid,0)` 是**纯探活、不会杀进程**（已实测），
   但 PID 复用很快，所以不能只看 PID —— 这也是必须叠心跳的原因。
@@ -284,7 +290,8 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/common.py` | 配置/状态/日志/B站接口/标点清洗/数字归一 + **`force_unlink`/`force_rmtree`（强制删除，必用）** + **原子写 `atomic_write_bytes/text/json`（`.part`+fsync+`os.replace`）** + **锁基础设施 `lock_owner_alive`（PID 存在且心跳 <20min 双条件）** + `timeout_for_source`/`run_tool` |
 | `scripts/cleanup.py` | **垃圾清理器**：按保留天数清扫中间产物、清孤儿下载/ASR切块、磁盘水位检查（`sweep`/`after_session`/`check_disk_guard`/`report`） |
 | `scripts/run_scheduled.py` | **耐久执行入口**（2026-09-18 新增）：先查锁（复用 `common.lock_owner_alive`）→ 以**子进程**跑 daily_pipeline → 失败自动重试（默认 2 次）→ 结果落 `WORKDIR/logs/scheduled_last_run.json`。给 Windows 计划任务调，**不在 agent 进程树下，不会被环境回收株连** |
-| `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 起每 60 分钟、持续 3 小时，交互式免提权，正在跑时不强杀） |
+| `scripts/install_scheduled_task.py` | 计划任务管理（2026-09-18 新增）：`--install` / `--query` / `--run` / `--remove`（**标志位，非子命令**），注册 `BiliLiveSummary_Daily`（默认 04:20 + 06:20 两次，交互式免提权，正在跑时不强杀）；`--silent` 改用 `scripts/silent/*.vbs` 隐藏窗口启动（2026-11-03 新增，**排障：不加就每天弹控制台窗口**） |
+| `scripts/silent/run_*.vbs` | 计划任务静默启动器（2026-11-03 新增）：`WScript.Shell.Run(cmd, 0, True)` 隐藏控制台跑 python 并回传退出码。**纯 ASCII**，工作目录由 `_workdir.json` 解析（WSH 按 ANSI 读，含中文会乱码） |
 | `scripts/selftest_robustness.py` | **离线健壮性回归自测**（2026-09-18 新增，85 项）：mock HTTP 复现「忽略 Range / 截断 / 正常续传」、原子写、锁判活、docx 回退、压缩门禁、**清理器误删活锁**、**ffmpeg `.part` 输出格式推断**、**热词表解析/保护/审计/原子写**、**金句格式/异常内容过滤/文档体检**、**小号上传模块纯逻辑（[L]，2026-09-26）**等。改完关键脚本先跑它。⚠️ **必须用 `bili-archive` venv 的 python 跑**（基础 3.13.12 缺 requests/python-docx，会假失败 6 项） |
 | `scripts/docx_healthcheck.py` | **Word 成品体检与修复**（2026-09-24 新增）：① 格式（金句=灰色斜体/正文=粗体）② markdown 残留 ③ 提示词回显与元话语 ④ 热词表原词回扫 ⑤ 结构提示。`--fix` 就地修复（留 `.bak`）。已接入 `daily_pipeline` 收尾步骤 4 自动执行 |
 | `SKILL.md` | skill 说明（本手册的精简版，给 skill 加载器读） |
