@@ -495,9 +495,13 @@ def fetch_series(mid, series_id, cookies=None, max_pages=60, stop_before_pubdate
 _LIVE_DATE_RE = re.compile(r'(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日')
 
 
-def live_date(title, pubdate):
-    """直播实际日期。标题里通常带「2026年08月01日19点场」，以它为准；
-    因为凌晨下播后投稿会导致 pubdate 落到第二天，甚至跨月。"""
+def title_live_date(title):
+    """★ 只从标题解析直播日期；解析不出返回 None。
+
+    与 live_date() 的区别：live_date() 在解析失败时会退化用 pubdate 近似，
+    而「限定缺失日期补档」这类精确匹配场景必须知道日期到底是不是标题给的，
+    否则凌晨投稿会把前一天的回放当成次日缺失补进去（2026-11-08 事故）。
+    """
     m = _LIVE_DATE_RE.search(title or '')
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -505,6 +509,15 @@ def live_date(title, pubdate):
             return datetime.date(y, mo, d)
         except ValueError:
             pass
+    return None
+
+
+def live_date(title, pubdate):
+    """直播实际日期。标题里通常带「2026年08月01日19点场」，以它为准；
+    因为凌晨下播后投稿会导致 pubdate 落到第二天，甚至跨月。"""
+    d = title_live_date(title)
+    if d:
+        return d
     return datetime.date.fromtimestamp(pubdate) if pubdate else datetime.date.today()
 
 

@@ -1006,17 +1006,27 @@ def bilibili_fallback(cfg, st, log, cookies, progress, only_dates=None):
     done_dates = set(st.get('done_dates', []))
     if only_dates is not None:
         want = set(only_dates)
-        picked = [a for a in archives
-                  if a.get('_live_date') and a['_live_date'].isoformat() in want
-                  and a['_live_date'].isoformat() not in done_dates]
-        # 标题解析不出日期的，尝试用 pubdate 前一日近似兜底（避免漏）
+        # ★ 2026-11-08 事故修复：common.fetch_series 返回的是合集原始 dict，
+        #   **根本没有 _live_date 字段**（只有 fetch_latest.fetch_archives 才补）。
+        #   旧实现因此每期都走「pubdate 近似」分支，而凌晨下播后投稿的回放
+        #   pubdate 是次日 → 11-06 的回放被当成 11-07 的缺失补档，
+        #   塞进 2026-11-07 文件夹并写进 done_dates（Word 里却没有对应小节）。
+        #   补档是精确匹配场景：只接受「标题里明确写出直播日期」且等于缺失日期的期。
         for a in archives:
-            if a in picked or a.get('_live_date'):
-                continue
-            pd = datetime.date.fromtimestamp(a.get('pubdate', 0))
-            if pd.isoformat() in want and pd.isoformat() not in done_dates:
-                a['_live_date'] = pd
-                picked.append(a)
+            t = a.get('title') or ''
+            exact = common.title_live_date(t)
+            a['_date_from_title'] = exact is not None
+            a['_live_date'] = exact or datetime.date.fromtimestamp(a.get('pubdate', 0))
+        picked = [a for a in archives
+                  if a.get('_date_from_title')
+                  and a['_live_date'].isoformat() in want
+                  and a['_live_date'].isoformat() not in done_dates]
+        approx = [a for a in archives
+                  if not a.get('_date_from_title')
+                  and datetime.date.fromtimestamp(a.get('pubdate', 0)).isoformat() in want]
+        if approx:
+            log('B站兜底：%d 期标题无直播日期，按精确匹配原则不采纳（避免 pubdate 误配）'
+                % len(approx), 'WARN')
         log('B站兜底：限定 %d 个缺失日期，匹配到 %d 期' % (len(want), len(picked)))
     else:
         picked = fetch_latest.pick_videos(cfg, st, archives, log)
@@ -1029,8 +1039,8 @@ def bilibili_fallback(cfg, st, log, cookies, progress, only_dates=None):
     ok_dates = []
     log('B站兜底：本次待处理 %d 期' % len(picked))
     for a in picked:
-        # fetch_series 返回的原始 dict 只有 _live_date（datetime.date），
-        # 没有字符串 date 键；补上供后续 log / process_video_source / mark_bilibili_done 使用
+        # 上面已按标题补齐 _live_date（datetime.date）；再补字符串 date 键，
+        # 供后续 log / process_video_source / mark_bilibili_done 使用
         a['date'] = a['_live_date'].isoformat()
         bvid = a['bvid']
         log('=' * 68)
