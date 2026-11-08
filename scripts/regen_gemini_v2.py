@@ -318,7 +318,7 @@ class GeminiRotator:
             pass
 
     def cap_for(self, model):
-        """单模型本轮成功调用上限（子类按 provider 差异化，如魔搭 450/日）。"""
+        """单模型本轮成功调用上限（子类按 provider 差异化，如魔搭 200/日）。"""
         return self.max_per_model
 
     def _extract_text(self, model, r):

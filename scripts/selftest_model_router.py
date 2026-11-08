@@ -7,7 +7,7 @@ selftest_model_router.py —— model_router 混合模型路由器离线回归�
   [A] 降级链顺序：高阶模型 429 → 立即落到下一可用模型
   [B] 退避回头：高阶模型 503 进入短退避，窗口过期后重新成为首选
   [C] 空响应收敛：连续空响应 3 次后该模型退避并换下家，绝不死循环
-  [D] cap 差异化：Gemini 20 / ModelScope 450（cap_for），达上限本轮停用
+  [D] cap 差异化：Gemini 20 / ModelScope 200（cap_for），达上限本轮停用
   [E] 提示词：各 provider 补充指令注入，核心规则一致
   [F] 魔搭请求体：enable_thinking / thinking disabled / max_tokens 覆写正确
   [G] 响应解析：双格式分流（Gemini/OpenAI）、忽略 reasoning_content、坏 JSON 返回空
@@ -133,9 +133,9 @@ def t_c_empty_converge():
 def t_d_caps():
     print('[D] cap 差异化')
     rot = make_rot(['gemini-3.8-flash', 'Qwen/Qwen3.8-27B'],
-                   max_per_model=20, ms_max_per_model=450)
+                   max_per_model=20, ms_max_per_model=200)
     check('D1 Gemini cap=20', rot.cap_for('gemini-3.8-flash') == 20)
-    check('D2 魔搭 cap=450', rot.cap_for('Qwen/Qwen3.8-27B') == 450)
+    check('D2 魔搭 cap=200', rot.cap_for('Qwen/Qwen3.8-27B') == 200)
     rot2 = make_rot(['gemini-3.8-flash', 'Qwen/Qwen3.8-27B'],
                     max_per_model=1, backoff_dead=60)  # 达 cap 本轮停用（真实量级）
 
@@ -230,13 +230,20 @@ def t_h_build_rotator():
         check('H3 混合链首模型=主用 gemini-3.8-flash', rot2.models[0] == 'gemini-3.8-flash')
         check('H4 第 2 位为魔搭备份', is_modelscope(rot2.models[1]))
         # 快照式断言：链上增删模型时必须同步改这里，避免「改了链没验证」
-        check('H5 魔搭 7 模型在链（Step 系 2026-11-04 摘除后）',
-              sum(1 for m in rot2.models if is_modelscope(m)) == 7)
-        check('H6 链长 17', len(rot2.models) == 17, len(rot2.models))
+        check('H4b 第 3 位=Qwen3.8-27B（2026-11-08 提到 397B 之后）',
+              rot2.models[2] == 'Qwen/Qwen3.8-27B')
+        check('H5 魔搭 8 模型在链（2026-11-08 收编 Qwen3.5-35B-A3B）',
+              sum(1 for m in rot2.models if is_modelscope(m)) == 8)
+        check('H6 链长 18', len(rot2.models) == 18, len(rot2.models))
+        check('H6b 快速兜底 Qwen3.5-35B-A3B 在链尾区',
+              'Qwen/Qwen3.5-35B-A3B' in rot2.models[-3:])
         cfg2 = {'summarize': {'modelscope_api_key': 'mskey'}, '_workdir': '.'}
         rot3 = build_rotator(cfg2, log=lambda *_: None)
         check('H7 无 Gemini key → 纯魔搭链', isinstance(rot3, MultiProviderRotator)
               and all(is_modelscope(m) for m in rot3.models))
+        check('H7b 纯魔搭链 8 模型', len(rot3.models) == 8, len(rot3.models))
+        check('H8 MS_MODELS 覆盖链上全部魔搭模型',
+              all(m in MS_MODELS for m in rot2.models if is_modelscope(m)))
     finally:
         if old is not None:
             os.environ['MODELSCOPE_API_KEY'] = old

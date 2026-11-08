@@ -42,7 +42,7 @@
     "_comment_prompt": "总结用的 system prompt 文件路径。留空=用工作目录下的 prompt_original.txt；也可指向 skill 内的 scripts/prompt_template.txt 副本。文件里支持 {streamer}/{audience} 占位符，会自动替换；无占位符则原文不变（兼容旧字面 prompt）。",
     "modelscope_api_key": "",
     "modelscope_enabled": true,
-    "modelscope_max_per_day": 450,
+    "modelscope_max_per_day": 200,
     "modelscope_max_tokens": 8192
   },
   "output": {

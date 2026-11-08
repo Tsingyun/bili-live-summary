@@ -14,8 +14,9 @@ model_router.py —— Gemini + ModelScope(魔搭) 混合模型路由器。
    · Gemini：generativelanguage.googleapis.com，需本地代理（Clash 127.0.0.1:7897），
      免费层 RPM=5、每模型 ~20 次/日。
    · ModelScope：api-inference.modelscope.cn（OpenAI 兼容 /v1/chat/completions），
-     国内直连、显式禁用环境代理（Session.trust_env=False），每日总 2000 次、
-     单模型 500 次（动态限流，超限返回 429，由退避窗口自然处理）。
+     国内直连、显式禁用环境代理（Session.trust_env=False）。免费额度以官方
+     onboarding 为准（2026-11-08 核实：单模型最多 200 次/日；动态限流，
+     超限返回 429，由退避窗口自然处理）。
 4. 每类模型使用「同一套核心文风规则 + provider 专属补充指令」的提示词
    （见 PROVIDER_PROMPT_NOTES），确保不同模型产出的总结文风一致。
 5. 关键参数以实测为准（2026-09-29 用真实 key 逐一验证，勿凭版本号推测改动）：
@@ -36,7 +37,8 @@ from regen_gemini_v2 import GeminiRotator, MODELS as GEMINI_MODELS, PROXY
 MS_BASE_URL = 'https://api-inference.modelscope.cn/v1'
 
 # ---------------------------------------------------------------------------
-# 魔搭模型清单（2026-09-29 实测可用；extra 为请求体附加参数）
+# 魔搭模型清单（2026-09-29 建立，2026-11-08 全量探活 + 真实任务评测复核；
+# extra 为请求体附加参数）
 # ---------------------------------------------------------------------------
 MS_MODELS = {
     'Qwen/Qwen3.5-397B-A17B':          {'extra': {'enable_thinking': False}},
@@ -50,6 +52,9 @@ MS_MODELS = {
     # 带日期版 -1017 实测 200 可用（仍为推理模型，思维链会吞输出预算，故加大 max_tokens）。
     'deepseek-ai/DeepSeek-V4.1-Flash-1017': {'extra': {'thinking': {'type': 'disabled'}},
                                              'max_tokens': 16384},
+    # 2026-11-08 收编：权威提示词 + 3 段真实转写评测 3/3 成功、平均 6.4s、零硬伤；
+    # Qwen 系沿用顶层 enable_thinking=false（实测无思维链泄漏），作链尾快速兜底。
+    'Qwen/Qwen3.5-35B-A3B':           {'extra': {'enable_thinking': False}},
 }
 
 # ---------------------------------------------------------------------------
@@ -58,26 +63,32 @@ MS_MODELS = {
 # ---------------------------------------------------------------------------
 MODELS_MIXED = [
     'gemini-3.8-flash',               # ① 主用：Gemini 最新最强 Flash
-    'Qwen/Qwen3.5-397B-A17B',         # ② 备份1：魔搭最强开源 MoE（397B 总参/17B 激活）
-    'gemini-3.7-flash',               # ③ 上代旗舰 Flash
-    'ZhipuAI/GLM-5.2',                # ④ 备份2：智谱新一代旗舰
-    'gemini-3.6-flash',               # ⑤ 长期主力，实战验证
-    'Qwen/Qwen3.5-122B-A10B',         # ⑥ 备份3：魔搭次旗舰 MoE
-    'gemini-3.5-flash',               # ⑦ 3.x 中端
-    'deepseek-ai/DeepSeek-V4.1-Flash-1017',  # ⑧ 备份4：DeepSeek 新一代 Flash（思维已关）
-    'gemini-3-flash-preview',         # ⑨ Gemini 3 首发 Flash
-    'Qwen/Qwen3.8-27B',               # ⑩ 备份5：Qwen3.8 中杯，速度与质量均衡
+    'Qwen/Qwen3.5-397B-A17B',         # ② 备份1：魔搭最强开源 MoE，文风契约 100% 合规
+    'Qwen/Qwen3.8-27B',               # ③ 备份2：Qwen3.8 中杯，实测段长合规 100%，与 ② 同级
+    'gemini-3.7-flash',               # ④ 上代旗舰 Flash
+    'ZhipuAI/GLM-5.2',                # ⑤ 备份3：智谱新一代旗舰
+    'gemini-3.6-flash',               # ⑥ 长期主力，实战验证
+    'Qwen/Qwen3.5-122B-A10B',         # ⑦ 备份4：魔搭次旗舰 MoE
+    'gemini-3.5-flash',               # ⑧ 3.x 中端
+    'deepseek-ai/DeepSeek-V4.1-Flash-1017',  # ⑨ 备份5：DeepSeek 新一代 Flash（思维已关）
+    'gemini-3-flash-preview',         # ⑩ Gemini 3 首发 Flash
     'gemini-2.5-flash',               # ⑪ 稳定老将
     'Qwen/Qwen3.5-27B',               # ⑫ 备份6：Qwen3.5 中杯
-    # ⑬ 已摘除：stepfun-ai/Step-3.7-Flash（2026-11-04 实测 400 has no provider supported，
-    #    同族 Step-3.5-Flash / Step-5-Preview 同样报错 → 魔搭侧整个 Step 家族无 provider 上线）。
-    #    恢复办法：待其 provider 回归后把该行加回此处并在 MS_MODELS 补 {'extra': {}}。
-    'gemini-3.5-flash-lite',          # ⑭ Lite 档（500 RPD）
-    'Qwen/Qwen3.8-Flash-Next',        # ⑮ 备份8：魔搭最快轻量档
-    'gemini-3.1-flash-lite',          # ⑯ Lite 档，响应最快
+    'gemini-3.5-flash-lite',          # ⑬ Lite 档（500 RPD）
+    'Qwen/Qwen3.8-Flash-Next',        # ⑭ 备份7：魔搭最快轻量档
+    'gemini-3.1-flash-lite',          # ⑮ Lite 档，响应最快
+    'Qwen/Qwen3.5-35B-A3B',           # ⑯ 备份8：链尾快速兜底（实测 6.4s／零硬伤）
     'gemini-flash-latest',            # ⑰ 滚动别名兜底
     'gemini-flash-lite-latest'        # ⑱ 滚动别名，最后一道保险
 ]
+
+# 链变更留档（勿直接删历史教训）：
+# · 2026-11-04 摘除 stepfun-ai/Step-3.7-Flash（400 has no provider supported；
+#   同族 Step-3.5-Flash / Step-5-Preview 同样报错 → Step 家族无 provider 上线）。
+#   恢复办法：provider 回归后加回 MODELS_MIXED 并在 MS_MODELS 补 {'extra': {}}。
+# · 2026-11-08 全量探活 + 真实任务评测后「不收录」：ZhipuAI/GLM-5.3-Flash（长任务
+#   3/3 120s 超时）、moonshotai/Kimi-K3.1-Pro（带长提示词必 429）、
+#   deepseek-ai/DeepSeek-V4-Pro-0813（段落仅 60–90 字，文风契约合规率 9%）。
 
 
 def is_modelscope(model):
@@ -180,7 +191,7 @@ class MultiProviderRotator(GeminiRotator):
 
     def __init__(self, gemini_key, ms_api_key, proxy, models, log=print,
                  gemini_rpm=5, ms_rpm=30, window=60,
-                 max_per_model=20, ms_max_per_model=450,
+                 max_per_model=20, ms_max_per_model=200,
                  backoff_transient=60, backoff_429=300, backoff_dead=3600,
                  ms_max_tokens=8192, ms_timeout=(20, 600)):
         super().__init__(gemini_key, proxy, models, rpm=gemini_rpm, window=window,
@@ -203,7 +214,7 @@ class MultiProviderRotator(GeminiRotator):
 
     # ---- 能力与容量 ----
     def cap_for(self, model):
-        """单模型本轮成功调用上限：Gemini 20（免费层配额紧），魔搭 450（单模型 500/日）。"""
+        """单模型本轮成功调用上限：Gemini 20（免费层配额紧），魔搭 200（单模型 200/日）。"""
         return self.ms_max_per_model if is_modelscope(model) else self.max_per_model
 
     def _provider_of(self, model):
@@ -329,7 +340,7 @@ def build_rotator(cfg, log=print):
         ms_only = [m for m in MODELS_MIXED if is_modelscope(m)]
         log('  [Router] 未配置 Gemini key，使用纯 ModelScope 降级链（%d 模型）' % len(ms_only))
         return MultiProviderRotator('', ms_key, proxy, ms_only, log=log,
-                                    ms_max_per_model=int(s.get('modelscope_max_per_day', 450)),
+                                    ms_max_per_model=int(s.get('modelscope_max_per_day', 200)),
                                     ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)))
 
     log('  [Router] 混合降级链就绪：Gemini %d + ModelScope %d，共 %d 模型'
@@ -337,5 +348,5 @@ def build_rotator(cfg, log=print):
            sum(1 for m in MODELS_MIXED if is_modelscope(m)),
            len(MODELS_MIXED)))
     return MultiProviderRotator(gkey, ms_key, proxy, list(MODELS_MIXED), log=log,
-                                ms_max_per_model=int(s.get('modelscope_max_per_day', 450)),
+                                ms_max_per_model=int(s.get('modelscope_max_per_day', 200)),
                                 ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)))

@@ -159,6 +159,18 @@ prompt_original.txt    # 总结用的 system prompt
 | `cleanup` | `delete_mp3_after_success` | `true`（删 16k 临时音频，不影响中质量 MP3） |
 
 > API Key 在 `summarize.api_key`（仅本机 config，勿提交）。Gemini 免费层每模型每日 20 次硬上限、RPM=5，脚本已内置轮换 + 限流。
+> 魔搭 Key 在 `summarize.modelscope_api_key`（或环境变量 `MODELSCOPE_API_KEY`），国内直连、不走代理。
+
+**模型降级链现状（2026-11-08 全量探活 + 真实任务评测复核）**：`scripts/model_router.py` 的
+`MODELS_MIXED` 共 **18** 个模型（Gemini 10 + 魔搭 8），前三位为
+`gemini-3.8-flash` → `Qwen/Qwen3.5-397B-A17B` → `Qwen/Qwen3.8-27B`。
+`Qwen3.5-397B-A17B` **仍是最优选**（权威提示词 + 3 段真实转写评测，100–180 字段长契约 100% 合规）；
+`Qwen3.8-27B` 是唯一同级的备份，故提到 397B 之后；`Qwen/Qwen3.5-35B-A3B`（平均 6.4s、零硬伤）
+收编在第 16 位作链尾快速兜底。魔搭免费层**单模型最多 200 次/日**，
+`summarize.modelscope_max_per_day` 与代码默认值已统一为 200（旧值 450 来自过时文档）。
+**实测有硬伤、不收录**：`GLM-5.3-Flash`（长任务 3/3 超时）、`Kimi-K3.1-Pro`（长提示词必 429）、
+`DeepSeek-V4-Pro-0813`（段落仅 60–90 字，文风契约合规率 9%）。
+改链后必跑 `selftest_model_router.py`（H5/H6 是链长快照断言，增删模型要同步改）。
 
 ---
 
@@ -334,5 +346,5 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 
 - **加新步骤**：在 `daily_pipeline.process_video_source` 里按顺序追加，保持「转写 → 总结 → MP3 → 压缩」的先后，且每步失败不应误删已完成的产物。
 - **改压缩目标体积/质量**：只动 `config.json` 的 `compress.target_size_gb` / `cq`，无需改代码。
-- **换模型/换 provider**：改 `config.json` 的 `summarize.model`；Gemini 轮换顺序在 `regen_gemini_v2.MODELS`。
+- **换模型/换 provider**：混合降级链在 `scripts/model_router.py` 的 `MODELS_MIXED`（顺序即优先级），魔搭模型的请求体附加参数在 `MS_MODELS`；只有纯 Gemini 回退链才看 `regen_gemini_v2.MODELS`。增删模型后同步 `selftest_model_router.py` 的 H5/H6 快照断言。
 - **加新主播**：见第 9 节，复制整套 config（改 `series` / `streamer` / `audience` / `doc_dir`），`setup.py` 可向导生成；**代码不需要任何改动**。
