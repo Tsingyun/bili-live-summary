@@ -1275,8 +1275,9 @@ def main():
                     help='缺失补档窗口开始（YYYY-MM-DD）；默认 backfill.start_date/since_live_date')
     ap.add_argument('--to', default=None,
                     help='缺失补档窗口结束（YYYY-MM-DD）；默认今天')
-    ap.add_argument('--no-backfill', action='store_true',
-                    help='跳过缺失检查/补档（rec.darkpy.cn → B站），只做本地')
+    ap.add_argument('--backfill', action='store_true',
+                    help='主动回溯/补档过往缺失录播（rec.darkpy.cn → B站）；'
+                         '默认关闭，仅本地优先总结前一日录播。需显式传 --backfill 才开启')
     ap.add_argument('--workdir', default=None,
                     help='工作目录（含 config.json）；不传则按 BILI_WORKDIR / _workdir.json / BILI_LIVE_CONFIG 推断')
     ap.add_argument('--config', default=None, help='直接指定 config.json 路径（优先级最高）')
@@ -1484,7 +1485,7 @@ def main():
                    ', '.join(os.path.basename(p) for p in s['member_files'])))
 
         if args.dry_run:
-            if not args.no_backfill:
+            if args.backfill:
                 log('---- 步骤 3（dry-run）：缺失检查报告 ----')
                 try:
                     backfill.stage(cfg, st, log, {}, cookies=cookies,
@@ -1540,7 +1541,7 @@ def main():
         # ★ 2026-09-18：整段包 try/except。此前这里一旦抛异常（如 B站合集接口风控、
         #   单个日期数据异常），会直接穿透 main 跳过收尾清扫，且日志停在半截、
         #   看不出是"失败"还是"没跑完"。现在失败也会继续走收尾并明确记录。
-        if not args.no_backfill:
+        if args.backfill:
             log('---- 步骤 3：缺失检查/补档（backfill） ----')
             touch('步骤3 缺失检查/补档')
             try:
@@ -1552,7 +1553,7 @@ def main():
             except Exception as e:
                 log.error('缺失检查/补档异常（已完成的部分已写入 state，可重跑续做）：%s' % e)
         else:
-            log('---- 步骤 3：已跳过（--no-backfill） ----')
+            log('---- 步骤 3：缺失检查/补档已跳过（默认关闭，需 --backfill 才开启） ----')
 
         # ---- 步骤 4：产物质量门禁（格式检查 / 异常内容清理 / 热词校验）----
         # 2026-09-24 新增：Word 写完后再自检一遍并就地修复，见 _healthcheck 说明。

@@ -1,6 +1,6 @@
 # bili-live-summary · AI 上手手册（通用版）
 
-> 给 AI / 接手者阅读。读完本文件即可独立运行、排障、扩展这套「直播录播 → 总结 → MP3 → 压缩」全链路，无需再翻聊天记录。
+> 给 AI / 接手者阅读。读完本文件即可独立运行、排障、扩展这套「直播录播 → 总结 → MP3 → 保留原 MP4」全链路，无需再翻聊天记录。
 > 本 skill **完全配置驱动、零主播专有数据**：每个主播用一个独立工作目录 + 一份 config.json 即可运行，不动任何代码。
 
 ---
@@ -12,7 +12,7 @@
 1. **AI 总结的 Word 文档**（放在 `output.doc_dir` 指定目录，按月归档；岁己 = `C:\Users\Tsing\DeskBox\文档`）
 2. **中质量 MP3**（192k / 44.1k，体积不大，音质够文字识别，用户另有他用）
 3. **视频文件**（放到 `本地录播根目录/YYYY-MM-DD/`）
-   - **本地录播** → 压缩后的 HEVC MP4（~5GB，`<原名>_compressed.mp4`）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）
+   - **本地录播** → **原始 MP4 原样保留，不压缩**（用户规则 2026-11-15：`compress.enabled=false`，不再生成 `_compressed.mp4`、不删源）
    - **B站兜底下载的录播** → **不压缩**，跑完流程后**原样保留 MP4**（用户规则 2026-08-29）
 
 来源优先级：**本地录播目录优先；本地没有才去 B站合集兜底**。
@@ -82,11 +82,12 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
 | 3 | **缺失检查 + 三级补档**：对照「实际直播日历」（rec站 ∪ 本地 ∪ B站标题）找缺失日期，按 本地 → rec.darkpy.cn → B站 顺序补 | `backfill.stage` + `darkpy_rec.fetch_and_prepare` + `bilibili_fallback(only_dates=…)` | 补齐的场次也写 Word/state 占位；输出逐日结论 |
 | 4 | **导出中质量 MP3**（192k/44.1k）→ `mp3_export.out_dir`（与 Word 同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`） | `mp3_export.export_for_local` | `文档目录\<原名>.mp3` |
-| 5 | **压缩 HEVC MP4**（~5GB）→ 「录播根目录/YYYY-MM-DD/」日期文件夹（本地录播 + rec站补档都压） | `compress_video.compress_video` | `录播根目录/YYYY-MM-DD/*_compressed.mp4` |
+| 5 | **【已停用，2026-11-15】** 原为压缩 HEVC MP4；现 `compress.enabled=false`，不压缩、不删源，本地原始 MP4 原样保留 | `compress_video.compress_video`（不再调用） | 原始 MP4（本地源在根目录；darkpy/B站源归档到 `YYYY-MM-DD/`） |
 | 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `录播根目录/YYYY-MM-DD/<原名>.mp4` |
 
 > 第 2 步处理完本地新文件后，**始终执行第 3 步**（不再互斥）：第 3 步只处理「本地没有 / 已处理但 Word 也没有 / 文件过小疑似残缺」的日期，已覆盖的日期不会重复处理。
 > **备份优先级（2026-09-05）**：本地 → rec.darkpy.cn（第二备份，更新及时，优先于 B站）→ B站（第三备份）。
+> ★ **用户规则（2026-11-15，最新且优先级最高）**：**取消压缩流程**。工作目录 `config.json` 与 `config.example.json` 的 `compress.enabled` 均为 `false`；所有入口（手动 / 04:00 自动化 / 04:20 计划任务 `run_scheduled.py`）共用同一份工作目录 config.json，改一处即全生效。不再产出 `_compressed.mp4`，也不再删原始 MP4。下方 2026-08/09 的压缩描述均为历史，仅作代码兼容说明。
 > **用户规则（2026-08-29）**：B站兜底录播跑完流程后**留下 MP4、不压缩**（`bilibili.keep_mp4=true`、`compress=false`）。
 > **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
 > **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。
@@ -102,9 +103,9 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
   命名规则：`录制-<UID>-<YYYYMMDD>-<HHMMSS>-<idx>-<标题>.<ext>`
   （自定义命名需在 config.local.name_regex 里提供含 `date`/`time`/`title` 命名组的正则）
 - **flv 通常是录制中的临时格式，且可能在录制过程中被监测到**——脚本用「大小稳定 + 修改时间够老」判定文件已写完，否则整段跳过，避免截半。
-- 处理完成后根目录会留下：中质量 `.mp3`（交付物）+ 各 `YYYY-MM-DD\` 子目录（里面是视频交付物：本地录播 = 压缩后的 `_compressed.mp4`；B站兜底 = 原样保留的 MP4）。
+- 处理完成后根目录会留下：**原始 MP4（2026-11-15 起不压缩、不删除）** + 中质量 `.mp3`（若配置落在根目录）+ 历史遗留的 `YYYY-MM-DD\` 子目录（旧压缩片）。新场次不再往日期子目录写压缩片。
 
-### 视频产物位置（`compress.out_dir_mode = "date_subfolder"`，2026-09-08 起为当前规则）
+### 视频产物位置（**2026-11-15 起：压缩停用，保留原始 MP4**；以下为历史规则，仅供代码兼容参考）
 - **本地录播 & rec站补档**：压缩后输出到 **`录播根目录/YYYY-MM-DD/`** 日期文件夹（源已在同日期目录则直接复用、不重复建层），文件 `<原名>_compressed.mp4`（用户规则 2026-09-08：**不要 MP4/ 文件夹，直接用日期命名文件夹**）。
 - 曾被试用又搁置的模式（代码仍兼容、配置勿再用）：`mp4_folder`（2026-09-05，统一 `根/MP4/`）、`mp4_date_folder`（2026-09-06，`根/MP4/YYYY-MM-DD/`）。
 - 日期从文件名里的 8 位日期 `20260824` 解析（自动跳过 UID 等非法日期串）。
@@ -127,8 +128,8 @@ prompt_original.txt    # 总结用的 system prompt
 |---|---|
 | Word 总结 | `C:\Users\Tsing\DeskBox\文档\岁己直播总结_{year}年{month}月.docx`（同月同一文档，分页追加） |
 | 中质量 MP3 | `mp3_export.out_dir\<原名>.mp3`（岁己 = `C:\Users\Tsing\DeskBox\文档`，与 Word 同目录） |
-| 视频（本地录播） | `本地根目录\MP4\<原名>_compressed.mp4`（压缩后的 HEVC） |
-| 视频（rec站补档） | `本地根目录\MP4\<原名>_compressed.mp4`（压缩后的 HEVC） |
+| 视频（本地录播） | `本地根目录\<原名>.mp4`（**2026-11-15 起原样保留，不压缩**） |
+| 视频（rec站补档） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（原样归档，不压缩） |
 | 视频（B站兜底） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（**不压缩，原样保留**） |
 
 ---
@@ -148,7 +149,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录）。**固定流程「转写→热词→总结」的第 2 步，勿跳过**：权威表在 `WORKDIR/hotwords.md`，改完立刻生效；改完跑 `python scripts/hotwords.py --audit` 查空转/冲突/危险级联 |
 | `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
 | `local_merge` | `enabled/max_gap_sec/allow_overlap_sec/exclude_dates` | 多段**先合并再总结**（禁止逐段总结）；场次判定**只看相邻间隙、不看日期变更**，跨 0 点连续段归属开播那一场；`allow_overlap_sec`(默认60) 容忍重连时的轻微负间隙；`exclude_dates` 显式强制不合并 |
-| `compress` | `enabled/out_dir_mode/replace_original` | `true` / `date_subfolder`(→`录播根目录/YYYY-MM-DD/`，2026-09-08 当前规则) / `true`（本地 & rec站补档压缩后处理原视频） |
+| `compress` | `enabled` | **`false`（2026-11-15 用户规则：取消压缩流程）**；`out_dir_mode/replace_original` 等字段保留兼容但不再生效 |
 | `compress` | `replace_mode` | 已统一为 `delete` = 压缩成功后直接永久删原视频（省空间，不进回收站/不备份/无需确认）；旧版 `recycle` 已废弃 |
 | `compress` | `codec/target_size_gb/cq` | `hevc_nvenc` / `5` / `24` |
 | `bilibili` | `keep_mp4` / `compress` | `true` / `false`（B站兜底录播**保留 MP4、不压缩**，归档到 `根目录/YYYY-MM-DD/`） |
@@ -242,7 +243,7 @@ python scripts/cleanup.py --sweep --aggressive  # 无视保留天数清空临时
    且必须用 `common.force_unlink`（降级删除），裸 `os.remove` 在 D 盘会静默失败。
 3. **ffmpeg / 中文路径用原生 Windows 路径**（PowerShell / 脚本内 `subprocess` 直接传路径），避免 Git Bash 改动中文路径。
 4. **长任务前台跑完再回报**：一期 5 小时录播约 15~25 分钟，别中途打断。
-5. **宣称完成前必须核验文件存在且大小合理**（Word 章节、MP3、压缩 MP4 三者齐全），不轻信日志里的 "OK"。
+5. **宣称完成前必须核验文件存在且大小合理**（Word 章节、MP3、**原始 MP4 保留**；2026-11-15 起不再要求压缩片），不轻信日志里的 "OK"。
 
 ### 7.1 进程被回收 / 睡死 / 断电后怎么续（2026-09-18 事故后加固）
 

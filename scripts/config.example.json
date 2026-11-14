@@ -129,8 +129,9 @@
     "enabled": true
   },
   "compress": {
+    "_comment_20261115": "★ 用户规则(2026-11-15)：压缩流程已停用，enabled 必须为 false；不再生成 _compressed.mp4，也不再删除原始 MP4。以下字段仅保留兼容。",
     "_comment": "总结+导出MP3后，用 NVIDIA NVENC HEVC(H.265) 把原始录播压成更小归档副本（需 NVIDIA 独显）。out_dir_mode=date_subfolder（当前规则，用户2026-09-08：不用 MP4/ 文件夹，直接用日期文件夹）时压缩后 MP4 输出到「根目录/YYYY-MM-DD/」；mp4_folder/mp4_date_folder（2026-09-05/06 曾用，已搁置）；next_to_source 则输出到源文件旁。replace_original=true 才处理原视频（replace_mode 已统一为 delete=压缩成功后直接永久删除原视频，不进回收站/不备份/无需确认；旧版 recycle 已废弃）。target_size_gb 为目标体积软上限，cq 越小越清晰（24 已很清晰）。音频默认 copy 无损复用，audio_mode=aac 则重编码 192k。",
-    "enabled": true,
+    "enabled": false,
     "codec": "hevc_nvenc",
     "target_size_gb": 5,
     "cq": 24,
