@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """install_upload_task.py —— 注册/查看/删除「每日录播自动上传」耐久计划任务。
 
+★ 2026-11-15 用户规则：**自动上传已彻底停用**，`BiliUpload_Daily` 计划任务处于
+  Disabled。本脚本仅作历史兼容；若确需恢复上传，须先由用户明确要求，再 --install
+  并把 config 的 upload.auto_enabled 改回 true（压缩已取消，目前无压缩片可传）。
+
 背景：长任务挂在 agent 会话进程树下会被宿主回收拆掉（2026-09-17/18 事故；
 2026-09-27 凌晨 925 上传再次被杀在 P3 60/268）。本脚本把 auto_upload_daily.py
 注册成 **Windows 计划任务** BiliUpload_Daily——由 Task Scheduler 服务拉起，

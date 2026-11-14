@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """auto_upload_daily.py —— 每日录播自动上传（每天 06:00）
 
+★ 2026-11-15 用户规则：**自动上传彻底停用**。计划任务 BiliUpload_Daily 已 Disabled、
+  WorkBuddy 06:00 自动化已 PAUSED、config 的 upload.auto_enabled=false；本脚本 main()
+  首段硬关，关闭时连扫描/状态写入都不做（--report 仍可只读诊断）。压缩取消后已无
+  *_compressed.mp4 可传。下方描述均为历史，仅作代码兼容参考。
+
 定位
 ----
 把「录播根目录/YYYY-MM-DD/ 里的 *_compressed.mp4 压缩成品」按直播日期自动投稿到
@@ -462,6 +467,12 @@ def main():
     run_date = datetime.date.today().isoformat()
 
     uc = cfg.get('upload') or {}
+
+    # ★ 2026-11-15：自动上传彻底停用 → 关闭时零扫描、零状态写入（--report 仍只读）
+    if not uc.get('auto_enabled', True) and not args.report:
+        log('upload.auto_enabled=false，自动上传已停用，退出（不做扫描/写入）。')
+        return 0
+
     auto = {**DEF_AUTO, **{k: uc[k] for k in DEF_AUTO if uc.get(k) is not None}}
     since = args.since or uc.get('auto_since') or run_date
 
@@ -471,10 +482,6 @@ def main():
 
     if args.report:
         do_report(cfg, log, items, st)
-        return 0
-
-    if not uc.get('auto_enabled', True):
-        log('upload.auto_enabled=false，自动上传未启用，退出。')
         return 0
 
     # 过滤

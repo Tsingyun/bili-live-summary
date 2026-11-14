@@ -177,6 +177,8 @@
     "lookback_days": 45
   },
   "upload": {
+    "_comment_20261115": "★ 用户规则(2026-11-15)：自动上传彻底停用，auto_enabled 必须为 false；计划任务 BiliUpload_Daily 与 WorkBuddy 06:00 自动化均已停用。取消压缩后已无 *_compressed.mp4 可传。",
+    "auto_enabled": false,
     "_comment": "★ 2026-09-26 新增：把压缩后的录播自动投稿到 B站「小号」。默认直接传现有 HEVC 副本（先试传，H.264 转码仅作兜底）。backend=api 复用项目既有的 Netscape cookie 文件（paths.cookies）；backend=biliup 需另行提供 biliup 生成的 cookie.json。enabled=false 时完全不触发上传。",
     "enabled": false,
     "backend": "api",

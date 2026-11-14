@@ -90,6 +90,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 > **备份优先级（2026-09-05）**：本地 → rec.darkpy.cn（第二备份，更新及时，优先于 B站）→ B站（第三备份）。
 > ★ **用户规则（2026-11-15，最新且优先级最高）**：**取消压缩流程**。工作目录 `config.json` 与 `config.example.json` 的 `compress.enabled` 均为 `false`；所有入口（手动 / 04:00 自动化 / 04:20 计划任务 `run_scheduled.py`）共用同一份工作目录 config.json，改一处即全生效。不再产出 `_compressed.mp4`，也不再删原始 MP4。下方 2026-08/09 的压缩描述均为历史，仅作代码兼容说明。
 > ★ **配套代码（2026-11-15）**：`cleanup_originals.run_sweep` 在 `compress.enabled=false` 时首行直接返回；主管线开跑前/收尾两次清扫都不会删任何原始 MP4，杜绝历史遗留 `_compressed.mp4` 触发误删。
+> ★ **用户规则（2026-11-15）：自动上传彻底停用**。`upload.auto_enabled=false`（工作目录 config 与示例配置）；Windows 计划任务 `BiliUpload_Daily` 已 `Disabled`、WorkBuddy 06:00 自动化已 `PAUSED`；`auto_upload_daily.py` 主入口在开关关闭时零扫描零写入直接退出。压缩取消后本就无 `*_compressed.mp4` 可传，cookie 亦失效，下方上传描述均为历史。
 > **用户规则（2026-08-29）**：B站兜底录播跑完流程后**留下 MP4、不压缩**（`bilibili.keep_mp4=true`、`compress=false`）。
 > **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
 > **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。

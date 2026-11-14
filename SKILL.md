@@ -511,7 +511,7 @@ python scripts/terminology.py --check "我这个 iphone 才 8gb" --quote     # �
 | 键 | 管什么 |
 |---|---|
 | `upload.enabled` | 总结管线（`daily_pipeline`）内是否触发上传 |
-| `upload.auto_enabled` | **每日自动上传总开关**（`auto_upload_daily.py`，计划任务 `BiliUpload_Daily` / WorkBuddy 自动化 06:00） |
+| `upload.auto_enabled` | **每日自动上传总开关**——★ 2026-11-15 起用户要求**彻底停用，固定 `false`**；计划任务 `BiliUpload_Daily` 已 `Disabled`、WorkBuddy 06:00 自动化已 `PAUSED`，`auto_upload_daily.py` 主入口硬关（关闭时零扫描零写入） |
 | `upload.auto_since` | 只自动上传 live_date ≥ 该值的录播（防擅自把历史积压传出去） |
 
 ### ★ 正式上传必须走 `auto_upload_daily.py`，别用 `bili_upload.py` 直传

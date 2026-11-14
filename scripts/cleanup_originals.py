@@ -67,8 +67,8 @@ def run_sweep(cfg, log, dry_run=True):
     """
     # ★ 2026-11-15：压缩已取消 → 绝不删任何原始 MP4（含历史遗留压缩片场景）
     if not (cfg.get('compress') or {}).get('enabled', True):
-        print('[cleanup_originals] 压缩已关闭（compress.enabled=false）：'
-              '跳过原始分段清理，源文件一律保留')
+        # 纯 ASCII：计划任务经 VBS 拉起时 stdout 为 ANSI，中文会变乱码
+        print('[cleanup_originals] compress.enabled=false -> skip sweep, keep all originals')
         return
     local_root = (cfg.get('local') or {}).get('root') or ''
     ffprobe = (cfg.get('paths') or {}).get('ffprobe')

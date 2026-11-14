@@ -1609,6 +1609,18 @@ def test_completeness_guard(tmp, verbose=False):
                          lambda *a, **k: None, dry_run=False)
     check('V8 压缩关闭时跳过清扫且不删源', os.path.exists(keep))
 
+    # V9 自动上传彻底停用：开关关闭时 main() 零扫描零写入直接退出
+    import auto_upload_daily as AU
+    cfg_off = {'upload': {'auto_enabled': False},
+               '_dirs': {'logs': tmp, 'root': tmp}}
+    with mock.patch.object(AU.common, 'load_config', lambda *a, **k: cfg_off), \
+         mock.patch.object(AU, 'discover_items',
+                           side_effect=AssertionError('disabled 时不得扫描')), \
+         mock.patch.object(sys, 'argv', ['auto_upload_daily.py']), \
+         contextlib.redirect_stdout(io.StringIO()):
+        rc = AU.main()
+    check('V9 上传关闭时 main 零扫描直接退出', rc == 0)
+
 
 def main():
     ap = argparse.ArgumentParser()
