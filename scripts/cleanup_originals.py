@@ -3,6 +3,10 @@
 """
 cleanup_originals.py —— 删除「已被压缩、但原始录播 FLV 没被删」的文件（一次性补救 + 复用门禁）。
 
+★ 2026-11-15 用户规则：压缩流程已取消（compress.enabled=false），本模块在实际运行中
+  直接跳过（run_sweep 首行卫语句），原始 MP4 一律保留。以下删除逻辑仅作历史兼容，
+  只有显式把 compress.enabled 改回 true 才会重新生效。
+
 根因（daily_pipeline 多段合并场次的 bug）：
   compress_video 只删传入的 src_video；对多段合并场次 src_video 是
   root/merged/<名>_merged.mp4（中间文件），原始 FLV 分段从没被碰过 → 每天堆积。
@@ -61,6 +65,11 @@ def run_sweep(cfg, log, dry_run=True):
     幂等：原文已不在即跳过。可作为 daily_pipeline 的开跑前/收尾清扫步骤调用，
     也可独立 CLI 运行（python cleanup_originals.py [--apply]）。
     """
+    # ★ 2026-11-15：压缩已取消 → 绝不删任何原始 MP4（含历史遗留压缩片场景）
+    if not (cfg.get('compress') or {}).get('enabled', True):
+        print('[cleanup_originals] 压缩已关闭（compress.enabled=false）：'
+              '跳过原始分段清理，源文件一律保留')
+        return
     local_root = (cfg.get('local') or {}).get('root') or ''
     ffprobe = (cfg.get('paths') or {}).get('ffprobe')
     project_root = cfg['_dirs']['root']

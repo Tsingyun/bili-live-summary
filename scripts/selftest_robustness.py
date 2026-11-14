@@ -22,6 +22,7 @@
 退出码 0 = 全部通过；非 0 = 有用例失败。
 """
 import argparse
+import contextlib
 import http.server
 import re
 import io
@@ -1595,6 +1596,18 @@ def test_completeness_guard(tmp, verbose=False):
     with open(gp, 'w', encoding='utf-8') as f:
         json.dump({'date': dt.date.today().isoformat(), 'ok': False}, f)
     check('V7d 失败标记不跳过', RS._guard_done_today(gp) is False)
+
+    # V8 压缩取消后 cleanup_originals 绝不删原始 MP4（含历史压缩片残留场景）
+    import cleanup_originals as CO
+    keep = os.path.join(tmp, 'keep_original.mp4')
+    with open(keep, 'wb') as f:
+        f.write(b'original')
+    with mock.patch.object(CO, 'force_unlink',
+                           side_effect=AssertionError('disabled 时不得删源')):
+        with contextlib.redirect_stdout(io.StringIO()):
+            CO.run_sweep({'compress': {'enabled': False}},
+                         lambda *a, **k: None, dry_run=False)
+    check('V8 压缩关闭时跳过清扫且不删源', os.path.exists(keep))
 
 
 def main():

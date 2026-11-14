@@ -1437,8 +1437,8 @@ def main():
         cu = cleanup.cfg_cleanup(cfg)
         if cu.get('enabled', True) and cu.get('sweep_on_start', True):
             cleanup.sweep(cfg, log, dry_run=args.dry_run)
-        # 开跑前也扫一遍：补删上一轮（被宿主回收/中断）残留的「已压缩原文」
-        # —— 这是"压完却漏删"的根因缺口，见 cleanup_originals.run_sweep
+        # 开跑前也扫一遍；压缩关闭时 run_sweep 会直接跳过（2026-11-15 起不删源）
+        # —— 历史上用于补删「已压缩原文」，见 cleanup_originals.run_sweep
         try:
             cleanup_originals.run_sweep(cfg, log, dry_run=args.dry_run)
         except Exception as e:
@@ -1661,8 +1661,8 @@ def main():
                 cleanup.sweep(cfg, log, dry_run=args.dry_run)
         except Exception as e:
             log('收尾清扫失败（不影响交付物）：%s' % e, 'WARN')
-        # 收尾补扫：本回合（含历史遗留）压出 _compressed 的原始 FLV 一律删掉
-        # —— 漏删必删，杜绝"压完却堆着原始FLV 最后靠手动删"的事故
+        # 收尾补扫；压缩关闭时 run_sweep 直接跳过，不删任何原始 MP4
+        # —— 历史逻辑仅在 compress.enabled=true 时生效
         try:
             cleanup_originals.run_sweep(cfg, log, dry_run=args.dry_run)
         except Exception as e:
