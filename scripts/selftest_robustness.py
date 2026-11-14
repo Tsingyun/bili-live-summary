@@ -1500,6 +1500,103 @@ def test_upload_cookie_path(tmp, v):
         BU.bili_get = old
 
 
+def test_completeness_guard(tmp, verbose=False):
+    """V. 完整性护栏接线/场次匹配/截断判定/隔离回滚 + 日级幂等守卫（全离线）。"""
+    import datetime as dt
+    from unittest import mock
+    import completeness_guard as CG
+    import run_scheduled as RS
+
+    # V1 静态断言：主管线真的 import 且调用了护栏（防再次「只挂在废弃脚本」）
+    pipe_src = open(os.path.join(SCRIPT_DIR, 'daily_pipeline.py'),
+                    encoding='utf-8').read()
+    check('V1 主管线已接入完整性护栏',
+          'import completeness_guard as CG' in pipe_src
+          and 'CG.check_local_completeness' in pipe_src
+          and 'CG.repair_incomplete_session' in pipe_src
+          and '_write_daily_run_guard' in pipe_src)
+    sched_src = open(os.path.join(SCRIPT_DIR, 'run_scheduled.py'),
+                     encoding='utf-8').read()
+    check('V1b 调度层已接入日级幂等守卫',
+          '_guard_done_today(guard_path)' in sched_src)
+
+    # V2 场次时间窗匹配：两场里只挑与本地窗重叠的那一场
+    base = dt.datetime(2026, 11, 14, 20, 0)
+    sess_a = [{'start': base, 'end': base + dt.timedelta(hours=3)},
+              {'start': base + dt.timedelta(hours=3),
+               'end': base + dt.timedelta(hours=3, minutes=10)}]
+    sess_b = [{'start': base + dt.timedelta(hours=4),
+               'end': base + dt.timedelta(hours=6)}]
+    m = CG._match_sessions([sess_a, sess_b],
+                           (base, base + dt.timedelta(hours=3, minutes=10)))
+    check('V2 按时间窗只匹配同场', m == [sess_a], 'matched=%d' % len(m))
+
+    # V3 ffprobe 优先用配置里的绝对路径
+    probe_file = os.path.join(tmp, 'probe.mp4')
+    open(probe_file, 'wb').write(b'x')
+    fake_exe = os.path.join(tmp, 'ffprobe.exe')
+    open(fake_exe, 'wb').write(b'x')
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv[0])
+        return type('R', (), {'stdout': '3600.0\n'})()
+
+    with mock.patch.object(CG.subprocess, 'run', fake_run):
+        d = CG.probe_duration_sec(probe_file, ffprobe=fake_exe)
+    check('V3 ffprobe 优先用配置绝对路径',
+          d == 3600.0 and calls == [fake_exe], str((d, calls)))
+
+    # V4 / V5 截断判定与完整场不误判（离线替身，不访问 rec 站）
+    cfg = {'paths': {'ffprobe': fake_exe},
+           'darkpy': {'enabled': True, 'room_dir': 'x', 'max_gap_sec': 1800},
+           'local_completeness_guard': {'enabled': True, 'cover_ratio': 0.8}}
+    span = (base, base + dt.timedelta(hours=3, minutes=10))
+    with mock.patch.object(CG, '_rec_sessions_for_date',
+                           lambda *a, **k: [sess_a]), \
+         mock.patch.object(CG, 'probe_duration_sec',
+                           lambda p, **k: 3600.0):
+        r1 = CG.check_local_completeness(cfg, dt.date(2026, 11, 14),
+                                         [probe_file], local_span=span)
+    check('V4 覆盖率不足判疑似截断',
+          r1['checked'] and r1['suspect'] and (r1['ratio'] or 1) < 0.8,
+          str(r1))
+    with mock.patch.object(CG, '_rec_sessions_for_date',
+                           lambda *a, **k: [sess_a]), \
+         mock.patch.object(CG, 'probe_duration_sec',
+                           lambda p, **k: 11400.0):
+        r2 = CG.check_local_completeness(cfg, dt.date(2026, 11, 14),
+                                         [probe_file], local_span=span)
+    check('V5 完整场不误判', r2['checked'] and not r2['suspect'], str(r2))
+
+    # V6 补档失败 → 自动回滚残缺源（用户原文件绝不丢）
+    import rec_fetch_date as RF
+    src_file = os.path.join(tmp, 'src.mp4')
+    open(src_file, 'wb').write(b'abc')
+    wd = os.path.join(tmp, 'wd')
+    with mock.patch.object(RF, 'fetch_date', lambda *a, **k: 3):
+        rep = CG.repair_incomplete_session(
+            {'darkpy': {'max_gap_sec': 1800}},
+            lambda m, lv='INFO': None, dt.date(2026, 11, 13),
+            [src_file], workdir=wd)
+    check('V6 补档失败自动回滚残缺源',
+          (not rep['ok']) and rep['rolled_back'] and os.path.exists(src_file),
+          str(rep))
+
+    # V7 日级幂等守卫：今天成功才跳过，隔天失效
+    gp = os.path.join(tmp, 'daily_run_guard.json')
+    check('V7a 无 guard 不跳过', RS._guard_done_today(gp) is False)
+    with open(gp, 'w', encoding='utf-8') as f:
+        json.dump({'date': dt.date.today().isoformat(), 'ok': True}, f)
+    check('V7b 今日成功 guard 跳过', RS._guard_done_today(gp) is True)
+    with open(gp, 'w', encoding='utf-8') as f:
+        json.dump({'date': '2000-01-01', 'ok': True}, f)
+    check('V7c 隔天 guard 自动失效', RS._guard_done_today(gp) is False)
+    with open(gp, 'w', encoding='utf-8') as f:
+        json.dump({'date': dt.date.today().isoformat(), 'ok': False}, f)
+    check('V7d 失败标记不跳过', RS._guard_done_today(gp) is False)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1524,6 +1621,7 @@ def main():
         test_drop_session(tmp, args.verbose)
         test_upload_hard_fail(tmp, args.verbose)
         test_upload_cookie_path(tmp, args.verbose)
+        test_completeness_guard(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

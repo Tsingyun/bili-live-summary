@@ -203,5 +203,10 @@
     "block_hevc": false,
     "max_size_gb_warn": 4,
     "max_duration_hour_warn": 5
+  },
+  "local_completeness_guard": {
+    "_comment": "用户规则 2026-10-07 / 2026-11-15 接入主管线：处理本地录播前先与 rec.darkpy.cn 比对同场时长；覆盖率低于 cover_ratio 判定疑似截断，隔离残缺源（不删）并自动从录播站拉完整版，绝不拿残片出总结。真实事故：11-13 本地 01:08:23、站点 03:00:49 却被当成整场总结。rec站不可达时跳过校验，不阻塞管线。",
+    "enabled": true,
+    "cover_ratio": 0.8
   }
 }

@@ -88,6 +88,17 @@ def tail(path, n=40):
         return ''
 
 
+def _guard_done_today(path):
+    """今天是否已有一轮「计划任务触发、正常完成」的运行。"""
+    try:
+        with open(path, encoding='utf-8') as f:
+            d = json.load(f) or {}
+        return (d.get('date') == datetime.date.today().isoformat()
+                and d.get('ok') is True)
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser(description='耐久执行入口（供 Windows 计划任务调用）')
     ap.add_argument('--workdir', default=None)
@@ -101,6 +112,7 @@ def main():
     logs = os.path.join(workdir, 'logs')
     os.makedirs(logs, exist_ok=True)
     outcome_path = os.path.join(logs, 'scheduled_last_run.json')
+    guard_path = os.path.join(logs, 'daily_run_guard.json')
 
     if args.status:
         if os.path.exists(outcome_path):
@@ -118,11 +130,29 @@ def main():
                                       'at': _now()})
         return 0
 
+    # ---- 日级幂等守卫（2026-11-15）----
+    # 04:20 与 06:20 是两个独立触发器；06:20 的本意只是「04:20 失败时兜底」。
+    # 过去没有「今天已成功」的概念，04:20 正常跑完后 06:20 还会再完整跑一轮
+    # （空转但照样清扫、写 state、烧一遍用量汇报）。现在 daily_pipeline 在正常
+    # 完成时写 daily_run_guard.json，这里读到就跳过；失败/中断不写，兜底语义
+    # 保留；-- --force 可强制重跑。
+    extra = [a for a in args.extra if a != '--']
+    force = '--force' in extra
+    extra = [a for a in extra if a != '--force']
+    if not force and _guard_done_today(guard_path):
+        msg = ('[run_scheduled] 今天已成功跑过一轮（daily_run_guard），本次跳过'
+               '——避免 04:20/06:20 双触发器重复运行；-- --force 可强制')
+        print(msg)
+        _write_outcome(outcome_path, {'skipped': True,
+                                      'reason': 'already_done_today',
+                                      'at': _now()})
+        return 0
+
     log_path = os.path.join(logs, 'run_scheduled_%s.log'
                             % datetime.date.today().isoformat())
     plan = [sys.executable, '-u', PIPELINE, '--workdir', workdir]
-    if args.extra:
-        plan += [a for a in args.extra if a != '--']
+    if extra:
+        plan += extra
 
     attempts, rc, t_start = max(1, args.attempts), 1, time.time()
     for attempt in range(1, attempts + 1):

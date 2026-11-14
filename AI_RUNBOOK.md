@@ -48,13 +48,14 @@
 
 ## 1. 每日怎么跑（唯一入口）
 
-每天由自动化触发（岁己示例：04:00 的 `automation-1786280495470`），跑 **这一条命令**：
+每天由 **Windows 计划任务 `BiliLiveSummary_Daily`** 触发（04:20 主跑 / 06:20 失败兜底，经 `scripts/silent/run_BiliLiveSummary_Daily.vbs` 静默拉起 `run_scheduled.py`）。**2026-11-15 起 04:00 的 WorkBuddy 自动化 `automation-1786280495470` 已永久停用（PAUSED）**，避免双入口同一天重复运行；`run_scheduled.py` 另有「今天已成功则跳过」的日级幂等守卫。手动补跑用下面这两条命令：
 
 ```bat
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" -u "C:\Users\Tsing\.workbuddy\skills\bili-live-summary\scripts\daily_pipeline.py" --workdir "D:\岁己直播自动总结"
 ```
 
-- `daily_pipeline.py` 是 **唯一入口**，内置完整 5 步，不要再拆成 `local_priority.py` / `run_pipeline.py`（那两个已被取代，仅供参考）。
+- `daily_pipeline.py` 是 **唯一管线入口**，内置完整流程，不要再拆成 `local_priority.py` / `run_pipeline.py`（那两个已被取代，仅供参考）。
+- ★ `completeness_guard.py` **已接入主管线**（步骤 1.5）；它曾长期只挂在废弃的 `local_priority.py` 上，导致 11-13 残缺本地版被直接总结。勿再把它摘下来。
 - 脚本自带 **单实例锁**（`.daily_pipeline.lock`）和 **断点续跑**（state 占位 + TXT/SRT 存在性判定）。
 - 退出码：`0`=全部成功、`1`=个别失败（下次自动重试）、`3`=网络未就绪。
 - `--workdir` 可省略（靠 `_workdir.json` 指针 / `BILI_WORKDIR` 推断），但显式写更清晰、免歧义。
@@ -85,13 +86,31 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 | 5 | **【已停用，2026-11-15】** 原为压缩 HEVC MP4；现 `compress.enabled=false`，不压缩、不删源，本地原始 MP4 原样保留 | `compress_video.compress_video`（不再调用） | 原始 MP4（本地源在根目录；darkpy/B站源归档到 `YYYY-MM-DD/`） |
 | 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `录播根目录/YYYY-MM-DD/<原名>.mp4` |
 
-> 第 2 步处理完本地新文件后，**始终执行第 3 步**（不再互斥）：第 3 步只处理「本地没有 / 已处理但 Word 也没有 / 文件过小疑似残缺」的日期，已覆盖的日期不会重复处理。
+> 第 2 步处理完本地新文件后，步骤 3 **默认跳过**（2026-11-14 起补档需显式 `--backfill` 开启）：只有显式开启时才对照实际直播日历补缺失日期，已覆盖的日期不会重复处理。
 > **备份优先级（2026-09-05）**：本地 → rec.darkpy.cn（第二备份，更新及时，优先于 B站）→ B站（第三备份）。
 > ★ **用户规则（2026-11-15，最新且优先级最高）**：**取消压缩流程**。工作目录 `config.json` 与 `config.example.json` 的 `compress.enabled` 均为 `false`；所有入口（手动 / 04:00 自动化 / 04:20 计划任务 `run_scheduled.py`）共用同一份工作目录 config.json，改一处即全生效。不再产出 `_compressed.mp4`，也不再删原始 MP4。下方 2026-08/09 的压缩描述均为历史，仅作代码兼容说明。
 > **用户规则（2026-08-29）**：B站兜底录播跑完流程后**留下 MP4、不压缩**（`bilibili.keep_mp4=true`、`compress=false`）。
 > **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
 > **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。
 > **用户规则（2026-09-08，最新）**：归档 MP3 输出到 `C:\Users\Tsing\DeskBox\文档`（与 Word 总结同目录，`mp3_export.out_dir`），不再放录播根目录。
+
+---
+
+## 2.5 两道防复发护栏（2026-11-15 新增，勿回退）
+
+**① 本地完整性护栏（`local_completeness_guard` / 步骤 1.5）**
+- 触发时机：步骤 1 扫出待处理本地场次之后、步骤 2 转写之前。
+- 判据：拿 `sessions_for_date()` 的 rec 站场次，按**本地会话时间窗**匹配（一晚两场时不会拿总时长当分母），`本地时长 / rec 站同场时长 < cover_ratio(0.8)` → 疑似截断。
+- 动作：残片**移到** `工作目录/quarantine/<日期>/`（保留不删，铁律）→ 调 `rec_fetch_date.fetch_date(no_pipeline=True)` 拉完整版落位并还原 mtime → 重新扫描纳入**本轮**步骤 2。
+- 补档失败：自动回滚残片到原位、阻断该场（不写 `done_dates`、不出残稿）、本轮退出码 1 → 06:20 兜底重跑。
+- rec 站不可达 / ffprobe 失效时**跳过校验、不阻塞**；ffprobe 取不到时长时退化为体积比对。
+- 关掉：`config.local_completeness_guard.enabled=false`（不建议）。
+
+**② 日级幂等守卫（`logs/daily_run_guard.json`）**
+- `daily_pipeline` 仅在 `BLS_TRIGGER=scheduled` 且**正常完成**、且不是 `--dry-run` / `--date` 定向重跑时写当天成功标记。
+- `run_scheduled.py` 启动前读它：今天已成功 → 直接跳过（04:20 跑完，06:20 不再空跑）。失败 / 中断 / 护栏阻断都不写 → 06:20 兜底语义保留。
+- 强制重跑：`run_scheduled.py -- --force`（`--force` 只在调度层消费，不透传给管线）。
+- 04:00 自动化与 04:20 计划任务曾构成双入口（11-14 04:01 自动化跑完整流程、04:20 又跑一轮）；现已停用 04:00，计划任务是**唯一自动入口**。
 
 ---
 
@@ -336,7 +355,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 3. **prompt（可选）**：复制 `scripts/prompt_template.txt` → `工作目录/prompt_original.txt`，把 `{streamer}`/`{audience}` 替换或保留占位符（运行时自动替换）；并在 config 设 `summarize.prompt_path="prompt_original.txt"`。不配则脚本回退到幂等保留字面内容。
 4. **hotwords（可选）**：复制 `scripts/hotwords.md` → `工作目录/hotwords.md` 填术语/歌名纠正规则，config 设 `hotwords.path="hotwords.md"`；不填则 `enabled:false` 或留空用空模板。
 5. **验证**：`daily_pipeline.py --workdir "<新工作目录>" --dry-run` 确认选片正确；`backfill.py --workdir "<新工作目录>"`（不带 --fill）确认缺失检查报告正常。
-6. **挂自动化**：用 `automation_update` 建 recurring 自动化，命令带 `--workdir "<新工作目录>"`。
+6. **挂自动入口**：用 `install_scheduled_task.py --silent`（静默 VBS + Windows 计划任务）挂每日入口；**不要再建 04:00 的 WorkBuddy 自动化**，否则与计划任务构成双入口重复运行。命令一律显式带 `--workdir "<新工作目录>"`。
 7. **skill 级指针（可选）**：若要让不带 `--workdir` 的调用默认指向新主播，在 `scripts/_workdir.json` 改 `workdir` 字段（⚠️ 这会影响不带参数的调用，多主播时更推荐每条命令都显式带 `--workdir`）。
 
 > 验证清单：py_compile 五个脚本全过 → `--dry-run` 选片正确 → 真实跑一场确认 Word/MP3/MP4 三样齐全、state 占位已写。
@@ -345,7 +364,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 
 ## 10. 扩展 / 二次开发注意事项
 
-- **加新步骤**：在 `daily_pipeline.process_video_source` 里按顺序追加，保持「转写 → 总结 → MP3 → 压缩」的先后，且每步失败不应误删已完成的产物。
+- **加新步骤**：在 `daily_pipeline.process_video_source` 里按顺序追加，保持「转写 → 热词 → 总结 → MP3」的先后（压缩已于 2026-11-15 停用），且每步失败不应误删已完成的产物；步骤 1.5 完整性护栏在转写之前，勿移到后面。
 - **改压缩目标体积/质量**：只动 `config.json` 的 `compress.target_size_gb` / `cq`，无需改代码。
 - **换模型/换 provider**：混合降级链在 `scripts/model_router.py` 的 `MODELS_MIXED`（顺序即优先级），魔搭模型的请求体附加参数在 `MS_MODELS`；只有纯 Gemini 回退链才看 `regen_gemini_v2.MODELS`。增删模型后同步 `selftest_model_router.py` 的 H5/H6 快照断言。
 - **加新主播**：见第 9 节，复制整套 config（改 `series` / `streamer` / `audience` / `doc_dir`），`setup.py` 可向导生成；**代码不需要任何改动**。

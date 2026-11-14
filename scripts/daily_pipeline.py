@@ -20,17 +20,18 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
        · B站：仅当 rec站也没有该日时才抓（bilibili_fallback，限定目标日期）。
   4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
      （192k / 44.1k，落在 mp3_export.out_dir；岁己 = C:/Users/Tsing/DeskBox/文档，与 Word 同目录）。
-  5. 压缩归档（本地录播 & rec站补档）：压成约 5GB 的 HEVC(H.265) MP4，
-     输出到「录播根目录/YYYY-MM-DD/」日期文件夹（out_dir_mode=date_subfolder，
-     当前规则，用户 2026-09-08：不用 MP4/ 文件夹，直接用日期命名文件夹）；
-     压缩成功后按 compress.replace_mode 处理原视频（delete=直接永久删除）。
-     B站兜底录播默认不压缩、原样保留 MP4（config.bilibili，见步骤3旧规则）。
+  5. 【2026-11-15 起停用】原为压缩 HEVC MP4 归档；现 config.compress.enabled=false，
+     不生成 *_compressed.mp4、不删原始 MP4，本地录播源原样保留。
+  1.5 本地完整性护栏：处理本地场次前先与 rec.darkpy.cn 比对同场时长/段数，
+     覆盖率 < config.local_completeness_guard.cover_ratio(默认 0.8) 判疑似截断：
+     隔离残缺源（不删）→ 从录播站拉完整版落位 → 重扫纳入本轮；
+     补档失败则阻断该场、本轮退出码 1 交给 06:20 兜底重跑。
 
 最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（mp3_export.out_dir，与 Word 同目录）
-             ③ 压缩后 HEVC MP4（录播根目录/YYYY-MM-DD/；B站兜底=原样保留的 MP4）。
+             ③ 原始视频（不再压缩）。
 
 用法:
-  python daily_pipeline.py              # 正式运行（监测→本地/rec/B站→MP3→压缩）
+  python daily_pipeline.py              # 正式运行（监测→护栏→本地/rec/B站→MP3）
   python daily_pipeline.py --dry-run    # 只打印会处理哪些、跳过哪些，不触碰任何文件
   python daily_pipeline.py --date 2026-09-01   # 只处理指定直播日期（定向补档/重跑）
   python backfill.py --from 2026-09-01 --to 2026-09-30 [--fill]   # 缺失检查/补档
@@ -69,6 +70,7 @@ import usage_report as UR   # 每次运行结束的模型用量汇报落盘（�
 import cleanup
 import bili_upload
 import cleanup_originals  # 压完删原始 FLV 的闭环清扫（run_sweep）
+import completeness_guard as CG  # 本地完整性护栏（2026-11-15 正式接入主管线）
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1266,6 +1268,37 @@ def _save_usage(scope, status):
         pass
 
 
+def _write_daily_run_guard(cfg, scope, had_failure=False):
+    """计划任务触发且本轮正常完成 → 写「今天已跑」标记，供 run_scheduled 去重。
+
+    只认 BLS_TRIGGER=scheduled：手动补跑 / dry-run / 指定 --date 的定向重跑
+    都不算「当天整轮」，不会挡住 04:20 的正式调度。中断 / 异常 / 护栏阻断
+    都不写 → 06:20 兜底重跑的语义保留。纯附加输出，失败静默。
+    """
+    if had_failure or os.environ.get('BLS_TRIGGER') != 'scheduled':
+        return
+    try:
+        args = scope.get('args')
+        if args is not None and (getattr(args, 'dry_run', False)
+                                 or getattr(args, 'date', None)):
+            return
+        wd = (cfg.get('_workdir') or os.path.dirname(
+            os.path.abspath(cfg.get('_config_path') or 'config.json')))
+        logs = os.path.join(wd, 'logs')
+        os.makedirs(logs, exist_ok=True)
+        payload = {
+            'date': datetime.date.today().isoformat(),
+            'ok': True,
+            'trigger': 'scheduled',
+            'at': datetime.datetime.now().isoformat(timespec='seconds'),
+            'processed': list(scope.get('done_sessions') or []),
+        }
+        atomic_write_text(os.path.join(logs, 'daily_run_guard.json'),
+                          json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dry-run', action='store_true')
@@ -1435,54 +1468,112 @@ def main():
                 log.error('当月文档初始化失败（不影响后续，写入时自动兜底）：%s' % e)
 
         # ---- 步骤 1：监测本地根目录 ----
+        # ★ 2026-11-15：扫描/过滤封成闭包，步骤 1.5 完整性护栏自动补档落位后
+        #   要重新扫一次，把「录播站完整版」纳入本轮，而不是等下一轮才处理。
         touch('步骤1 监测本地录播')
-        sessions = scan_root_sessions(cfg, log)
-        if args.date:
-            sessions = [s for s in sessions if s['live_date'].isoformat() == args.date]
 
-        # 占位 key 顺延：同一 live_date 可能已有旧占位（典型是跨午夜尾巴留下的
-        # merged_into 占位），不能让它顶掉当天真正的直播，也不能覆盖旧记录。
-        for s in sessions:
-            s['chain_index'] = _next_free_key(st, s, log)
+        def _collect():
+            _sessions = scan_root_sessions(cfg, log)
+            if args.date:
+                _sessions = [s for s in _sessions
+                             if s['live_date'].isoformat() == args.date]
+            # 占位 key 顺延：同一 live_date 可能已有旧占位（典型是跨午夜尾巴
+            # 留下的 merged_into 占位），不能让它顶掉当天真正的直播。
+            for s in _sessions:
+                s['chain_index'] = _next_free_key(st, s, log)
+            _to, _skip = [], []
+            for s in _sessions:
+                done, reason = already_done_local(cfg, st, s)
+                if done:
+                    _skip.append((s, reason))
+                    continue
+                # 录制中（不稳定）整 chain 跳过
+                unstable = [p for p in s['member_files'] if not is_file_stable(p, log)]
+                if unstable:
+                    _skip.append((s, '录制中（%s 尚未写完），跳过'
+                                  % ', '.join(os.path.basename(p) for p in unstable)))
+                    continue
+                _to.append(s)
+            return _sessions, _to, _skip
 
-        # 过滤已处理 + 跳过录制中文件
-        to_process, skipped = [], []
+        def _report(_sessions, _to, _skip):
+            log('监测本地根目录：发现 %d 个待处理会话，将处理 %d，跳过 %d'
+                % (len(_sessions), len(_to), len(_skip)))
+            for s in _skip:
+                log('  跳过 %s：%s' % (s[0]['live_date'].isoformat(), s[1]))
+            # ★ 2026-10-01：从录播站下载落位的文件 mtime 必然是「刚刚」，会被
+            #   is_file_stable 判成「录制中」→ 整场跳过、本次运行零产出，但退出码
+            #   仍是 0，看起来像正常跑完。这类"静默空转"必须显式告警。
+            if _sessions and not _to:
+                unstable_all = all('录制中' in (r or '') for _, r in _skip)
+                if unstable_all:
+                    log('本次 0 产出：全部 %d 场因「录制中/文件不稳定」被跳过。'
+                        '若这些文件其实是刚下载的成品（mtime 很新），属误判——'
+                        '等 %d 秒后重跑即可；正式拉片请用 rec_fetch_date.py'
+                        '（会自动把 mtime 还原为真实录制收尾时刻）'
+                        % (len(_skip), 125), 'WARN')
+            for s in _to:
+                tag = ('合并 %d 段%s' % (len(s['member_files']),
+                                        '（跨午夜）' if s.get('crosses_midnight') else '')
+                       ) if s['is_merged'] else '单文件'
+                log('  将处理 %s %s [%s] (%s)'
+                    % (s['live_date'].isoformat(), s['clean_title'], tag,
+                       ', '.join(os.path.basename(p) for p in s['member_files'])))
+
+        sessions, to_process, skipped = _collect()
         done_sessions = []          # 本轮成功写进 Word 的场次（模型用量汇报要用）
-        for s in sessions:
-            done, reason = already_done_local(cfg, st, s)
-            if done:
-                skipped.append((s, reason))
-                continue
-            # 录制中（不稳定）整 chain 跳过
-            unstable = [p for p in s['member_files'] if not is_file_stable(p, log)]
-            if unstable:
-                skipped.append((s, '录制中（%s 尚未写完），跳过'
-                                % ', '.join(os.path.basename(p) for p in unstable)))
-                continue
-            to_process.append(s)
+        had_guard_failure = False   # 完整性护栏是否有未修复的截断场次
+        _report(sessions, to_process, skipped)
 
-        log('监测本地根目录：发现 %d 个待处理会话，将处理 %d，跳过 %d'
-            % (len(sessions), len(to_process), len(skipped)))
-        for s in skipped:
-            log('  跳过 %s：%s' % (s[0]['live_date'].isoformat(), s[1]))
-        # ★ 2026-10-01：从录播站下载落位的文件 mtime 必然是「刚刚」，会被
-        #   is_file_stable 判成「录制中」→ 整场跳过、本次运行零产出，但退出码
-        #   仍是 0，看起来像正常跑完。这类"静默空转"必须显式告警。
-        if sessions and not to_process:
-            unstable_all = all('录制中' in (r or '') for _, r in skipped)
-            if unstable_all:
-                log('本次 0 产出：全部 %d 场因「录制中/文件不稳定」被跳过。'
-                    '若这些文件其实是刚下载的成品（mtime 很新），属误判——'
-                    '等 %d 秒后重跑即可；正式拉片请用 rec_fetch_date.py'
-                    '（会自动把 mtime 还原为真实录制收尾时刻）'
-                    % (len(skipped), 125), 'WARN')
-        for s in to_process:
-            tag = ('合并 %d 段%s' % (len(s['member_files']),
-                                    '（跨午夜）' if s.get('crosses_midnight') else '')
-                   ) if s['is_merged'] else '单文件'
-            log('  将处理 %s %s [%s] (%s)'
-                % (s['live_date'].isoformat(), s['clean_title'], tag,
-                   ', '.join(os.path.basename(p) for p in s['member_files'])))
+        # ---- 步骤 1.5：本地录播完整性护栏（用户规则 2026-11-15）----
+        # 事故复盘：config.local_completeness_guard 与 completeness_guard.py
+        # 早在 2026-10-07 就存在，却只被废弃的 local_priority.py 调用，
+        # 主管线从未校验 → 11-13 本地 01:08:23（站点 03:00:49）被当成整场总结。
+        # 现在正式接入：疑似截断 → 隔离残缺源 → 录播站拉完整版 → 重扫纳入本轮；
+        # 补档失败则阻断该场（不写 done_dates、不出残稿），本轮以 1 退出，
+        # 便于计划任务 06:20 兜底重跑。
+        guard_cfg = cfg.get('local_completeness_guard') or {}
+        if bool(guard_cfg.get('enabled', True)) and to_process and not args.dry_run:
+            ratio = float(guard_cfg.get('cover_ratio', CG.DEFAULT_COVER_RATIO))
+            suspects = []
+            for s in to_process:
+                try:
+                    r = CG.check_local_completeness(
+                        cfg, s['live_date'], s['member_files'], log=log,
+                        cover_ratio=ratio,
+                        local_span=(s.get('span_start'), s.get('span_end')))
+                except Exception as e:
+                    log('[完整性护栏] %s 校验异常（不阻塞本轮）：%s'
+                        % (s['live_date'].isoformat(), e), 'WARN')
+                    continue
+                if r.get('checked'):
+                    log('[完整性护栏] %s：%s'
+                        % (s['live_date'].isoformat(), r.get('reason')))
+                if r.get('suspect'):
+                    suspects.append((s, r))
+            if suspects:
+                blocked_dates, repaired_dates = set(), []
+                for s, r in suspects:
+                    ymd = s['live_date'].isoformat()
+                    log('[完整性护栏] %s 疑似截断（%s），改用录播站完整版'
+                        % (ymd, r.get('reason')), 'WARN')
+                    rep = CG.repair_incomplete_session(
+                        cfg, log, s['live_date'], s['member_files'], workdir=wd)
+                    if rep.get('ok'):
+                        repaired_dates.append(ymd)
+                    else:
+                        blocked_dates.add(ymd)
+                        had_guard_failure = True
+                        log('[完整性护栏] %s 修复失败：%s；本场已阻断，'
+                            '绝不拿残片出总结（已回滚=%s）'
+                            % (ymd, rep.get('reason'), rep.get('rolled_back')), 'ERROR')
+                sessions, to_process, skipped = _collect()
+                if blocked_dates:
+                    to_process = [x for x in to_process
+                                  if x['live_date'].isoformat() not in blocked_dates]
+                log('[完整性护栏] 重扫完成：修复 %d 场 / 阻断 %d 场，本轮待处理 %d 场'
+                    % (len(repaired_dates), len(blocked_dates), len(to_process)))
+                _report(sessions, to_process, skipped)
 
         if args.dry_run:
             if args.backfill:
@@ -1586,8 +1677,14 @@ def main():
         except Exception as e:
             log('模型用量汇报失败（不影响交付物）：%s' % e, 'WARN')
         _save_usage(locals(), '正常完成')
+        _write_daily_run_guard(cfg, locals(), had_guard_failure)
 
         log('daily_pipeline 本次完成')
+        if had_guard_failure:
+            # 有未修复的截断场次 → 非零退出，让计划任务 06:20 兜底重跑；
+            # 用量汇报已写、锁由 finally 释放，不写 daily_run_guard。
+            log('本轮存在被完整性护栏阻断的场次，退出码 1（下次自动重跑）', 'ERROR')
+            sys.exit(1)
     except KeyboardInterrupt:
         print('[daily_pipeline] 收到中断信号，已释放锁并退出（产物均为原子写，可从断点续跑）')
         # 被中断也留一份汇报：否则「凌晨跑了一半没产物」时完全看不出烧了多少额度
