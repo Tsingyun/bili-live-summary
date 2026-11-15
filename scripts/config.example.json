@@ -101,7 +101,12 @@
     "ar": 44100,
     "out_dir": "",
     "keep_in_date_subfolder": false,
-    "strip_prefix": []
+    "strip_prefix": [],
+    "_comment_split": "★ 用户规则(2026-11-15)：归档 MP3 超过 500MB 自动切成上下 Part（scripts/mp3_split.py，无损 -c copy，切点优先落在附近静音）。split_over_mb=0 关闭；split_parts=0 自动按阈值算段数（当前 6 小时场次=2 段）；split_delete_original 默认 false，完整原件保留不动。",
+    "split_enabled": true,
+    "split_over_mb": 500,
+    "split_parts": 0,
+    "split_delete_original": false
   },
   "local": {
     "_comment": "步骤1 本地录播监测。root=本地录制根目录（flv/mp4 直接放这，不在日期子目录）；name_regex 留空用默认（录制器命名 录制-UID-YYYYMMDD-HHMMSS-序号-标题.扩展名），自定义须含命名组 date(YYYYMMDD)/time(HHMMSS)/title（用于解析直播日期与标题）。root 留空则完全跳过本地监测、只走 B站兜底。",

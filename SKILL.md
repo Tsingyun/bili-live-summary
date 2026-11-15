@@ -145,6 +145,9 @@ gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
    · **B站**（第三备份，原有功能不变）：仅当 rec站也没有该日时才抓（`bilibili_fallback(only_dates=...)` 限定目标日期）。跑完流程保留原 MP4、不压缩（`bilibili.keep_mp4=true`），归档到「录播根目录/YYYY-MM-DD/」。
    · 结束输出逐日结论（`2026-09-01：本地缺失 → rec.darkpy.cn → 成功`）。
 4. **导出中质量 MP3**：总结完成后，把视频转一份 192k/44.1k 的中质量 MP3（落在 `mp3_export.out_dir`；**用户规则 2026-09-08：与 Word 总结同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`**，文件名直接以日期开头）。
+   ★ **2026-11-15 用户规则**：归档 MP3 超过 500MB 时自动切成 `<原名>_Part1.mp3`（上）/
+   `<原名>_Part2.mp3`（下）—— `scripts/mp3_split.py` 用 `-c copy` 无损切、切点优先落在附近静音，
+   完整原件默认保留；阈值 `mp3_export.split_over_mb`（0=关闭），历史大文件用 `--scan` 补切。
 5. **压缩 HEVC MP4**：把视频压成 ~5GB 的 HEVC(H.265) MP4，按 `compress.out_dir_mode=date_subfolder` 输出到「录播根目录/YYYY-MM-DD/」日期文件夹（**当前规则**，用户 2026-09-08：不要 MP4/ 文件夹，直接用日期命名文件夹）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）。**B站兜底录播跳过本步骤，原样保留 MP4。**
 
 **最终每场交付物三样**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 中质量 MP3（`mp3_export.out_dir`，与 Word 同目录）③ 视频——**本地录播 / rec站补档**=压缩后的 HEVC MP4（「录播根目录/YYYY-MM-DD/」日期文件夹）；**B站兜底**=原样保留的 MP4（同样落在日期文件夹）。

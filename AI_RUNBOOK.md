@@ -153,6 +153,19 @@ prompt_original.txt    # 总结用的 system prompt
 | 视频（rec站补档） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（原样归档，不压缩） |
 | 视频（B站兜底） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（**不压缩，原样保留**） |
 
+### 大 MP3 自动切成上下 Part（★ 用户规则 2026-11-15）
+
+归档 MP3 生成后若超过 **500 MB**（`mp3_export.split_over_mb`，1 MB = 1048576 B），
+`mp3_export.py` 自动调用 `scripts/mp3_split.py` 切成 `<原名>_Part1.mp3`（上）/
+`<原名>_Part2.mp3`（下）：
+
+- **无损**：`-c copy` 按时间切，不重编码；切点先在中点 ±90s 内找静音，找不到就精确等分；
+- 段数 `n = max(2, ceil(大小 / 阈值))`，保证每段都不超阈值（6 小时场次天然是 2 段）；
+- **完整原件默认保留**（`split_delete_original=false`），parts 与原件并存互不冲突；
+- 原子写 `<part>.part`（显式 `-f mp3`）+ 总时长校验 + 幂等，切分失败不影响总结主流程；
+- 历史大文件补切：`python scripts/mp3_split.py --config "<工作目录>\config.json" --scan`
+  （或 `--file <mp3>`），先加 `--dry-run` 可只看切点不落盘。
+
 ---
 
 ## 4. 配置速查（`config.json` 关键项）

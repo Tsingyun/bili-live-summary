@@ -14,6 +14,10 @@ mp3_export.py —— 总结后把录播视频转成中质量 MP3 归档（按 co
 文件名取源视频去扩展名后的名字，再剥掉 strip_prefix 列表里的前缀（如
 '录制-25788785-' / '25788785-'），使输出文件以日期开头。
 keep_in_date_subfolder=false 时直接放 out_dir 根（不按日期分子文件夹）。
+
+★ 用户规则（2026-11-15）：归档 MP3 超过 500MB 时自动切成上下 Part。
+切分由 mp3_split.py 完成（无损 -c copy）；本模块在「新生成」与「幂等跳过」
+两条返回路径之前都会调 _maybe_split()，保证补跑也能补切历史大文件。
 """
 import os
 import re
@@ -78,6 +82,7 @@ def export_mp3(cfg, log, src_video, default_stem=None):
                 ok = True
         if ok:
             log('[mp3_export] 归档 MP3 已存在且完整，跳过：%s' % os.path.basename(out))
+            _maybe_split(cfg, log, out)
             return out
         log('[mp3_export] 已有 MP3 时长不足，重新转码：%s' % os.path.basename(out), 'WARN')
         try:
@@ -139,9 +144,23 @@ def export_mp3(cfg, log, src_video, default_stem=None):
     if os.path.exists(out) and os.path.getsize(out) > 10240:
         sz = os.path.getsize(out) // 1024 // 1024
         log('[mp3_export] 完成（%d MB）：%s' % (sz, os.path.basename(out)))
+        _maybe_split(cfg, log, out)
         return out
     log.error('[mp3_export] 转换后文件异常（可能秒退未真正转写）')
     return None
+
+
+def _maybe_split(cfg, log, out):
+    """★ 用户规则 2026-11-15：归档 MP3 超过阈值自动切成上下 Part。
+
+    切分异常一律吞掉，绝不影响 MP3 归档 / 总结主流程（与压缩同级的旁路能力）。
+    """
+    try:
+        import mp3_split
+        return mp3_split.maybe_split(cfg, log, out)
+    except Exception as e:
+        log('[mp3_export] 自动切分异常（不影响归档）：%s' % e, 'WARN')
+        return None
 
 
 def _safe_unlink(path):

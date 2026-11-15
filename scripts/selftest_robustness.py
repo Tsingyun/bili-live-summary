@@ -1622,6 +1622,102 @@ def test_completeness_guard(tmp, verbose=False):
     check('V9 上传关闭时 main 零扫描直接退出', rc == 0)
 
 
+
+def test_mp3_split(tmp, v):
+    """W. 归档 MP3 超阈值自动切上下 Part（2026-11-15 用户规则，真实 ffmpeg 离线验证）。"""
+    import shutil as _sh
+    ffmpeg = _sh.which('ffmpeg') or r'D:\ffmpeg\bin\ffmpeg.exe'
+    ffprobe = _sh.which('ffprobe') or r'D:\ffmpeg\bin\ffprobe.exe'
+    if not (os.path.exists(ffmpeg) and os.path.exists(ffprobe)):
+        print('\n[W] 跳过：本机没有 ffmpeg/ffprobe')
+        return
+    import common
+    import re as _re
+    import mp3_split as MS
+    print('\n[W] 大 MP3 自动切上下 Part')
+
+    # W1 静态接线断言：主管线两条返回路径都得调切分，且切分用无损 copy + 显式 -f mp3
+    me_src = open(os.path.join(SCRIPT_DIR, 'mp3_export.py'), encoding='utf-8').read()
+    check('W1 mp3_export 两条返回路径都接了 _maybe_split',
+          len(_re.findall(r'^\s+_maybe_split\(cfg, log, out\)\s*$', me_src, _re.M)) == 2
+          and 'def _maybe_split' in me_src)
+    ms_src = open(os.path.join(SCRIPT_DIR, 'mp3_split.py'), encoding='utf-8').read()
+    check('W1b 切分用 -c copy 且临时名显式 -f mp3',
+          "'-c', 'copy', '-f', 'mp3', tmp" in ms_src
+          and 'split_delete_original' in ms_src)
+
+    # 造 4s 192k CBR MP3
+    wav = os.path.join(tmp, 'w_src.wav')
+    mp3 = os.path.join(tmp, 'w_big.mp3')
+    r = subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+                        '-ar', '44100', '-ac', '2', wav],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if not (os.path.exists(wav) and os.path.getsize(wav) > 1000):
+        print('  ⏭  跳过：测试音频生成失败 %s' % ((r.stderr or b'')[-200:]))
+        return
+    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-i', wav, '-c:a', 'libmp3lame', '-b:a', '192k', '-f', 'mp3', mp3],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    log = _SilentLog()
+    cfg = {'paths': {'ffmpeg': ffmpeg, 'ffprobe': ffprobe},
+           '_dirs': {'root': tmp},
+           'mp3_export': {'enabled': True, 'out_dir': tmp}}
+    dur = common.probe_duration(ffprobe, mp3) or 0
+    check('W2 测试素材可读（4s）', 3.0 <= dur <= 5.0, 'got=%.2f' % dur)
+
+    # W3 未超阈值不切
+    r = MS.split_mp3(cfg, log, mp3, threshold_mb=500)
+    check('W3 未超阈值时返回 None 且不产 part', r is None
+          and not os.path.exists(os.path.join(tmp, 'w_big_Part1.mp3')))
+
+    # W4 极小阈值 + 指定 2 段 → 真的切出上下两个 part
+    r = MS.split_mp3(cfg, log, mp3, threshold_mb=0.0001, parts=2)
+    p1 = os.path.join(tmp, 'w_big_Part1.mp3')
+    p2 = os.path.join(tmp, 'w_big_Part2.mp3')
+    check('W4 切出 _Part1 / _Part2 两个文件',
+          r == [p1, p2] and os.path.exists(p1) and os.path.exists(p2),
+          'r=%s' % r)
+    d1 = common.probe_duration(ffprobe, p1) or 0
+    d2 = common.probe_duration(ffprobe, p2) or 0
+    check('W5 两段时长之和与源一致（无损覆盖全时长）',
+          d1 > 0 and d2 > 0 and abs(d1 + d2 - dur) <= 1.0,
+          '%.2f + %.2f vs %.2f' % (d1, d2, dur))
+    check('W6 完整原件默认保留', os.path.exists(mp3))
+    check('W7 不留 .part 残留',
+          not any(os.path.exists(x + '.part') for x in (p1, p2)))
+
+    # W8 幂等：再切一次不重写文件
+    m1 = os.path.getmtime(p1)
+    r2 = MS.split_mp3(cfg, log, mp3, threshold_mb=0.0001, parts=2)
+    check('W8 幂等：parts 已完整时不重写',
+          r2 == [p1, p2] and os.path.getmtime(p1) == m1)
+
+    # W9 开关关闭时 maybe_split 不动作
+    cfg_off = dict(cfg)
+    cfg_off['mp3_export'] = dict(cfg['mp3_export'], split_enabled=False)
+    mp3b = os.path.join(tmp, 'w_off.mp3')
+    _sh.copyfile(mp3, mp3b)
+    check('W9 split_enabled=false 时 maybe_split 不产 part',
+          MS.maybe_split(cfg_off, log, mp3b) is None
+          and not os.path.exists(os.path.join(tmp, 'w_off_Part1.mp3')))
+
+    # W10 端到端：export_mp3 真的生成归档后会自动切（验证 _maybe_split 接线跑得通）
+    import mp3_export as ME
+    cfg_e = {'paths': {'ffmpeg': ffmpeg, 'ffprobe': ffprobe},
+             '_dirs': {'root': tmp},
+             'mp3_export': {'enabled': True, 'out_dir': os.path.join(tmp, 'auto'),
+                            'bitrate': '192k', 'ar': 44100,
+                            'split_enabled': True, 'split_over_mb': 0.0001,
+                            'split_parts': 2, 'split_delete_original': False}}
+    out_e = ME.export_mp3(cfg_e, _SilentLog(), wav)
+    stem_e = os.path.splitext(out_e)[0] if out_e else ''
+    check('W10 export_mp3 生成归档后自动切出上下 Part',
+          bool(out_e) and os.path.exists(stem_e + '_Part1.mp3')
+          and os.path.exists(stem_e + '_Part2.mp3'),
+          'out=%s' % out_e)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1647,6 +1743,7 @@ def main():
         test_upload_hard_fail(tmp, args.verbose)
         test_upload_cookie_path(tmp, args.verbose)
         test_completeness_guard(tmp, args.verbose)
+        test_mp3_split(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)
