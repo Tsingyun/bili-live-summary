@@ -95,10 +95,12 @@
     "sweep_on_finish": true
   },
   "mp3_export": {
-    "_comment": "总结之后，把该场录播视频转成中质量 MP3 留档（默认 192k/44.1k，供文字识别/其他用途）。out_dir 为输出根目录（用户规则 2026-09-08：建议与 Word 总结同目录，如 C:\\Users\\Tsing\\DeskBox\\文档；早期曾放录播根目录）；strip_prefix 用于去掉录制器文件名前缀，使输出文件名直接以日期开头。",
+    "_comment": "总结之后导出归档 MP3。★ 用户规则(2026-11-15)：归档 MP3 只用于送千问做音频识别，音质全面降低 = 默认 16kHz / 单声道 / 64kbps；保守场景可把 bitrate 调成 96k，勿降到 8kHz。out_dir 建议与 Word 总结同目录（用户规则 2026-09-08）；strip_prefix 去掉录制器前缀，使输出文件名以日期开头。",
     "enabled": true,
-    "bitrate": "192k",
-    "ar": 44100,
+    "bitrate": "64k",
+    "ar": 16000,
+    "channels": 1,
+    "_comment_asr": "★ 2026-11-15 用户规则：只满足普通转录需求即可。整场 6h11m 由 510MB 降到约 170MB（-67%），基本不会再触发 >500MB 切 Part（规则保留兜底）；唱歌听感会变闷，收听版请另行单独导出。补跑时若采样率/声道数不符，mp3_export 会按新规格重导。",
     "out_dir": "",
     "keep_in_date_subfolder": false,
     "strip_prefix": [],

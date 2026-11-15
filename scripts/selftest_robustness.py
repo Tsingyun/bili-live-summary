@@ -1718,6 +1718,105 @@ def test_mp3_split(tmp, v):
           'out=%s' % out_e)
 
 
+def test_mp3_asr_grade(tmp, v):
+    """X. 归档 MP3 降为识别专用规格 16k/单声道/64k（2026-11-15 用户规则）。"""
+    import shutil as _sh
+    import json as _json
+    ffmpeg = _sh.which('ffmpeg') or r'D:\ffmpeg\bin\ffmpeg.exe'
+    ffprobe = _sh.which('ffprobe') or r'D:\ffmpeg\bin\ffprobe.exe'
+    if not (os.path.exists(ffmpeg) and os.path.exists(ffprobe)):
+        print('\n[X] 跳过：本机没有 ffmpeg/ffprobe')
+        return
+    import mp3_export as ME
+    print('\n[X] 归档 MP3 = 识别专用低码率规格')
+
+    me = open(os.path.join(SCRIPT_DIR, 'mp3_export.py'), encoding='utf-8').read()
+    check('X1 默认规格为 16k / 单声道 / 64k',
+          "mcfg.get('bitrate', '64k')" in me
+          and "mcfg.get('ar', 16000)" in me
+          and "mcfg.get('channels', 1)" in me)
+    check('X2 ffmpeg 命令显式下混 -ac 且规格门禁已接线',
+          "'-ac', str(channels)" in me
+          and 'def _spec_matches' in me
+          and '_spec_matches(cfg, cfg[' in me)
+    ex = _json.load(open(os.path.join(SCRIPT_DIR, 'config.example.json'), encoding='utf-8'))
+    m = ex.get('mp3_export', {})
+    check('X3 示例配置同步为 64k / 16000 / 1',
+          str(m.get('bitrate')) == '64k' and int(m.get('ar', 0)) == 16000
+          and int(m.get('channels', 0)) == 1)
+
+    # 造 4s / 44.1kHz / 立体声源
+    wav = os.path.join(tmp, 'x_src.wav')
+    subprocess.run([ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+                    '-ar', '44100', '-ac', '2', wav],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+    if not (os.path.exists(wav) and os.path.getsize(wav) > 1000):
+        print('  ⏭  跳过：测试音频生成失败')
+        return
+
+    def probe(p):
+        r = subprocess.run([ffprobe, '-v', 'error', '-select_streams', 'a:0',
+                            '-show_entries', 'stream=sample_rate,channels,bit_rate',
+                            '-of', 'json', p], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        return (_json.loads(r.stdout.decode('utf-8', 'replace')) or {}).get('streams', [{}])[0]
+
+    cfg = {'paths': {'ffmpeg': ffmpeg, 'ffprobe': ffprobe},
+           '_dirs': {'root': tmp},
+           'mp3_export': {'enabled': True, 'out_dir': os.path.join(tmp, 'x_low')}}
+    out = ME.export_mp3(cfg, _SilentLog(), wav)
+    check('X4 默认配置导出成功', bool(out) and os.path.exists(out or ''), 'out=%s' % out)
+    if not out:
+        return
+    st = probe(out)
+    sr, ch, br = int(st.get('sample_rate') or 0), int(st.get('channels') or 0), int(st.get('bit_rate') or 0)
+    check('X5 产物确为 16kHz / 单声道 / 64kbps',
+          sr == 16000 and ch == 1 and 56000 <= br <= 80000,
+          'sr=%s ch=%s br=%s' % (sr, ch, br))
+    import common
+    dur = common.probe_duration(ffprobe, out) or 0
+    check('X6 降规格后时长不丢失（4s）', 3.8 <= dur <= 4.3, 'dur=%.2f' % dur)
+
+    # 旧规格对照（同一源，显式 192k/44.1k/立体声）
+    cfg_hi = dict(cfg)
+    cfg_hi['mp3_export'] = dict(cfg['mp3_export'], out_dir=os.path.join(tmp, 'x_hi'),
+                                bitrate='192k', ar=44100, channels=2)
+    out_hi = ME.export_mp3(cfg_hi, _SilentLog(), wav)
+    sz_low, sz_hi = os.path.getsize(out), (os.path.getsize(out_hi) if out_hi else 0)
+    check('X7 体积显著小于旧 192k/44.1k/立体声',
+          bool(out_hi) and sz_low < sz_hi * 0.6,
+          'low=%d hi=%d' % (sz_low, sz_hi))
+
+    # 码率可配置覆盖
+    cfg_96 = dict(cfg)
+    cfg_96['mp3_export'] = dict(cfg['mp3_export'], out_dir=os.path.join(tmp, 'x_96'), bitrate='96k')
+    out_96 = ME.export_mp3(cfg_96, _SilentLog(), wav)
+    st96 = probe(out_96) if out_96 else {}
+    br96 = int(st96.get('bit_rate') or 0)
+    check('X8 bitrate 可配置（96k 生效）', bool(out_96) and 88000 <= br96 <= 112000,
+          'br=%s' % br96)
+
+    # 幂等：同规格第二次调用不重写
+    m1 = os.path.getmtime(out)
+    out2 = ME.export_mp3(cfg, _SilentLog(), wav)
+    check('X9 同规格补跑幂等跳过', out2 == out and os.path.getmtime(out) == m1)
+
+    # 规格门禁：把旧规格文件放到目标位置，再补跑应自动重导成 16k/单声道
+    import shutil
+    gate_dir = os.path.join(tmp, 'x_gate')
+    os.makedirs(gate_dir, exist_ok=True)
+    gate = os.path.join(gate_dir, os.path.basename(out))
+    shutil.copyfile(out_hi, gate)
+    cfg_g = dict(cfg)
+    cfg_g['mp3_export'] = dict(cfg['mp3_export'], out_dir=gate_dir)
+    ME.export_mp3(cfg_g, _SilentLog(), wav)
+    stg = probe(gate)
+    check('X10 旧规格文件补跑时自动重导为新规格',
+          int(stg.get('sample_rate') or 0) == 16000 and int(stg.get('channels') or 0) == 1,
+          'sr=%s ch=%s' % (stg.get('sample_rate'), stg.get('channels')))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1744,6 +1843,7 @@ def main():
         test_upload_cookie_path(tmp, args.verbose)
         test_completeness_guard(tmp, args.verbose)
         test_mp3_split(tmp, args.verbose)
+        test_mp3_asr_grade(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

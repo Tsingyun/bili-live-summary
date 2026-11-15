@@ -18,8 +18,9 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
        · rec.darkpy.cn：FLV 分段下载 → 按段结束时间归组 → concat 无损合并（不重编码）
          → 同一总结流程（backfill.py / darkpy_rec.py）；
        · B站：仅当 rec站也没有该日时才抓（bilibili_fallback，限定目标日期）。
-  4. 总结完成之后 → 把视频（MP4/FLV）转一份中质量音质的 MP3
-     （192k / 44.1k，落在 mp3_export.out_dir；岁己 = C:/Users/Tsing/DeskBox/文档，与 Word 同目录）。
+  4. 总结完成之后 → 把视频（MP4/FLV）转一份「识别专用」低码率 MP3
+     （2026-11-15 用户规则：16 kHz / 单声道 / 64 kbps，供千问音频识别；
+      落在 mp3_export.out_dir；岁己 = C:/Users/Tsing/DeskBox/文档，与 Word 同目录）。
   5. 【2026-11-15 起停用】原为压缩 HEVC MP4 归档；现 config.compress.enabled=false，
      不生成 *_compressed.mp4、不删原始 MP4，本地录播源原样保留。
   1.5 本地完整性护栏：处理本地场次前先与 rec.darkpy.cn 比对同场时长/段数，
@@ -27,7 +28,7 @@ daily_pipeline.py —— 任意 B站主播直播录播 每日主编排（通用 
      隔离残缺源（不删）→ 从录播站拉完整版落位 → 重扫纳入本轮；
      补档失败则阻断该场、本轮退出码 1 交给 06:20 兜底重跑。
 
-最终每场成品：① AI 总结的 Word 文档  ② 中质量 MP3（mp3_export.out_dir，与 Word 同目录）
+最终每场成品：① AI 总结的 Word 文档  ② 识别专用低码率 MP3（16k/单声道/64k，mp3_export.out_dir，与 Word 同目录）
              ③ 原始视频（不再压缩）。
 
 用法:

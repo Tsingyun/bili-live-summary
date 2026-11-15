@@ -10,7 +10,7 @@
 把**某位 B站主播**的每日直播录播，自动变成 **3 个成品文件**（具体主播由工作目录的 config 决定）：
 
 1. **AI 总结的 Word 文档**（放在 `output.doc_dir` 指定目录，按月归档；岁己 = `C:\Users\Tsing\DeskBox\文档`）
-2. **中质量 MP3**（192k / 44.1k，体积不大，音质够文字识别，用户另有他用）
+2. **识别专用低码率 MP3**（**16 kHz / 单声道 / 64 kbps**，送千问做音频识别；用户规则 2026-11-15，整场约 170MB）
 3. **视频文件**（放到 `本地录播根目录/YYYY-MM-DD/`）
    - **本地录播** → **原始 MP4 原样保留，不压缩**（用户规则 2026-11-15：`compress.enabled=false`，不再生成 `_compressed.mp4`、不删源）
    - **B站兜底下载的录播** → **不压缩**，跑完流程后**原样保留 MP4**（用户规则 2026-08-29）
@@ -82,7 +82,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 | 1 | **监测本地根目录**（`config.local.root`）的新录播（flv/mp4，直接放根目录） | `scan_root_sessions` | 待处理 session 列表；录制中/已处理的自动跳过 |
 | 2 | **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word；写 `LOCAL-*` 占位 | `process_video_source` + `regen_gemini_v2.process_session` | Word 章节 + state 占位 |
 | 3 | **缺失检查 + 三级补档**：对照「实际直播日历」（rec站 ∪ 本地 ∪ B站标题）找缺失日期，按 本地 → rec.darkpy.cn → B站 顺序补 | `backfill.stage` + `darkpy_rec.fetch_and_prepare` + `bilibili_fallback(only_dates=…)` | 补齐的场次也写 Word/state 占位；输出逐日结论 |
-| 4 | **导出中质量 MP3**（192k/44.1k）→ `mp3_export.out_dir`（与 Word 同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`） | `mp3_export.export_for_local` | `文档目录\<原名>.mp3` |
+| 4 | **导出识别专用 MP3**（16k/单声道/64k）→ `mp3_export.out_dir`（与 Word 同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`） | `mp3_export.export_for_local` | `文档目录\<原名>.mp3` |
 | 5 | **【已停用，2026-11-15】** 原为压缩 HEVC MP4；现 `compress.enabled=false`，不压缩、不删源，本地原始 MP4 原样保留 | `compress_video.compress_video`（不再调用） | 原始 MP4（本地源在根目录；darkpy/B站源归档到 `YYYY-MM-DD/`） |
 | 5b | **B站录播归档**（不压缩）→ 把下载 MP4 原样挪到日期子目录 | `_archive_bilibili_mp4` | `录播根目录/YYYY-MM-DD/<原名>.mp4` |
 
@@ -95,6 +95,7 @@ python daily_pipeline.py --workdir "D:\岁己直播自动总结" --date 2026-08-
 > **用户规则（2026-09-05）**：rec站补档的场次与本地录播同等压缩归档，不保留原始大文件。
 > **用户规则（2026-09-08，最新）**：压缩后的 MP4 **不用 MP4/ 文件夹**，统一 `out_dir_mode=date_subfolder` 直接输出到「录播根目录/YYYY-MM-DD/」日期文件夹（mp4_folder / mp4_date_folder 模式搁置）。
 > **用户规则（2026-09-08，最新）**：归档 MP3 输出到 `C:\Users\Tsing\DeskBox\文档`（与 Word 总结同目录，`mp3_export.out_dir`），不再放录播根目录。
+> ★ **用户规则（2026-11-15，音质最新且优先级最高）**：归档 MP3 **只用于送千问做音频识别**，「音质可以全面降低，满足普通的转录需求就可以」→ `mp3_export.bitrate=64k / ar=16000 / channels=1`；下方 2026-08/09 的「中质量 / 192k」描述均为历史。
 
 ---
 
@@ -148,10 +149,29 @@ prompt_original.txt    # 总结用的 system prompt
 | 交付物 | 位置 |
 |---|---|
 | Word 总结 | `C:\Users\Tsing\DeskBox\文档\岁己直播总结_{year}年{month}月.docx`（同月同一文档，分页追加） |
-| 中质量 MP3 | `mp3_export.out_dir\<原名>.mp3`（岁己 = `C:\Users\Tsing\DeskBox\文档`，与 Word 同目录） |
+| 识别专用 MP3（16k/单声道/64k） | `mp3_export.out_dir\<原名>.mp3`（岁己 = `C:\Users\Tsing\DeskBox\文档`，与 Word 同目录） |
 | 视频（本地录播） | `本地根目录\<原名>.mp4`（**2026-11-15 起原样保留，不压缩**） |
 | 视频（rec站补档） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（原样归档，不压缩） |
 | 视频（B站兜底） | `本地根目录\YYYY-MM-DD\<原名>.mp4`（**不压缩，原样保留**） |
+
+### 归档 MP3 音质规格（★ 用户规则 2026-11-15）
+
+归档 MP3 **只用于送千问做音频识别**，不用于收听。用户要求「音质可以全面降低，满足普通的转录需求就可以」，
+因此 `mp3_export` 默认导出 **16 kHz / 单声道 / 64 kbps**（`config.mp3_export.bitrate / ar / channels`）：
+
+- 阿里云百炼 `qwen3-asr-flash` / `qwen3-asr-flash-filetrans` 输入端统一重采样到 16 kHz，
+  44.1 kHz 多出的 8–22 kHz 全被丢掉；录播 L/R 是单声道复制，`-ac 1` 零信息损失；
+- 人声可懂度集中在 8 kHz 以下（基频 85–255 Hz、共振峰 300–3400 Hz、摩擦音 4–8 kHz），
+  16 kHz 按 Nyquist 刚好完整覆盖；**别降到 8 kHz**（丢 4–8 kHz，词错率明显上升）；
+- 64 kbps 足够干净语音；耳语 / ASMR / 多人重叠等保守场景把 `bitrate` 调到 `96k`；
+- 实测（11-14 新衣回 6h11m）：旧规格 510.0 MB → 新规格约 170 MB（−67%），
+  **基本不会再触发 500 MB 切 Part**，但切分规则保留兜底；
+- 唱歌 / 音乐听感会明显发闷，需要收听版请另行单独导出，别改这个识别专用产物；
+- **幂等规格门禁**：补跑时若已有 MP3 的采样率/声道数不符合当前配置，`mp3_export` 会按新规格
+  重导（旧文件在新 `.part` 校验通过前不删，靠 `os.replace` 覆盖），历史高码率归档也能自动降级。
+
+> 千问入参限制仍需遵守：`qwen3-asr-flash` 单次 ≤10 MB 且 ≤5 分钟（Base64 会膨胀 1/3），
+> 长音频须切 ≤5 分钟片或走 `qwen3-asr-flash-filetrans`（≤2 GB / ≤12 小时，只收公网 URL）。
 
 ### 大 MP3 自动切成上下 Part（★ 用户规则 2026-11-15）
 
@@ -181,7 +201,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `output` | `doc_dir` / `doc_name_pattern` | `C:\Users\Tsing\DeskBox\文档` / `岁己直播总结_{year}年{month}月.docx` |
 | `transcribe` | `chunk_hours_threshold` | `2`（>2h 音频先切块再转写，规避 FunASR VAD 截断） |
 | `hotwords` | `enabled` / `path` | `true` / `hotwords.md`（相对工作目录）。**固定流程「转写→热词→总结」的第 2 步，勿跳过**：权威表在 `WORKDIR/hotwords.md`，改完立刻生效；改完跑 `python scripts/hotwords.py --audit` 查空转/冲突/危险级联 |
-| `mp3_export` | `enabled/bitrate/ar/out_dir` | `true` / `192k` / `44100`；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
+| `mp3_export` | `enabled/bitrate/ar/channels/out_dir` | `true` / **`64k`** / **`16000`** / **`1`**（2026-11-15 识别专用规格）；`out_dir` = 与 Word 同目录（岁己 `C:\Users\Tsing\DeskBox\文档`，用户规则 2026-09-08） |
 | `local_merge` | `enabled/max_gap_sec/allow_overlap_sec/exclude_dates` | 多段**先合并再总结**（禁止逐段总结）；场次判定**只看相邻间隙、不看日期变更**，跨 0 点连续段归属开播那一场；`allow_overlap_sec`(默认60) 容忍重连时的轻微负间隙；`exclude_dates` 显式强制不合并 |
 | `compress` | `enabled` | **`false`（2026-11-15 用户规则：取消压缩流程）**；`out_dir_mode/replace_original` 等字段保留兼容但不再生效 |
 | `compress` | `replace_mode` | 已统一为 `delete` = 压缩成功后直接永久删原视频（省空间，不进回收站/不备份/无需确认）；旧版 `recycle` 已废弃 |
@@ -191,7 +211,7 @@ prompt_original.txt    # 总结用的 system prompt
 | `darkpy` | `max_gap_sec/min_session_sec/work_dir` | 段归组间隙 `1800` / 不完整阈值 `600`s / `D:\岁己直播自动总结\_darkpy` |
 | `backfill` | `enabled/start_date/end_date` | 缺失补档窗口：`true` / 空(→since_live_date) / 空(→今天) |
 | `live_calendar` | `sources/danmakus_api` | 实际直播日历：`["darkpy","local","bilibili"]` / 空(跳过 danmakus) |
-| `cleanup` | `delete_mp3_after_success` | `true`（删 16k 临时音频，不影响中质量 MP3） |
+| `cleanup` | `delete_mp3_after_success` | `true`（删 16k 临时音频，不影响归档 MP3） |
 
 > API Key 在 `summarize.api_key`（仅本机 config，勿提交）。Gemini 免费层每模型每日 20 次硬上限、RPM=5，脚本已内置轮换 + 限流。
 > 魔搭 Key 在 `summarize.modelscope_api_key`（或环境变量 `MODELSCOPE_API_KEY`），国内直连、不走代理。
@@ -334,7 +354,7 @@ agent 回合结束 → 宿主运行时 `lifecycle:dispose` → 整棵进程树�
 | `scripts/hotwords.py` | 转写后热词替换（**固定流程「转写→热词→总结」第 2 步**）：路径相对工作目录解析、保护词占位防误伤、长词优先、原子写回；`--audit` 审计空转/冲突/危险级联 |
 | `scripts/regen_gemini_v2.py` | Gemini 切块总结 + 写 Word（`process_session`，带模型轮换/限流/续跑） |
 | `scripts/summarize_gemini.py` | Word 排版底层（粗体总结、斜体金句、章节元数据、话题分隔线） |
-| `scripts/mp3_export.py` | 中质量 MP3 导出 |
+| `scripts/mp3_export.py` | 识别专用低码率 MP3 导出（16k/单声道/64k，含幂等规格门禁） |
 | `scripts/compress_video.py` | HEVC 压缩（本地录播 & rec站补档；`out_dir_mode` 当前用 `date_subfolder`→根/YYYY-MM-DD/；兼容 `mp4_folder`/`mp4_date_folder`(已搁置)、`next_to_source`；`replace_mode` 决定原视频处理方式） |
 | `scripts/daily_pipeline._archive_bilibili_mp4` | B站录播 MP4 归档（不压缩，原样挪到 `根目录/YYYY-MM-DD/`） |
 | `scripts/darkpy_rec.py` | **rec.darkpy.cn 第二备份客户端**：`fetch_index`(列表,10min缓存) → `sessions_for_date`(全局归组,跨午夜归前场) → `download_one`(Range断点续传) → `merge_flvs`(concat copy 无损优先) → `fetch_and_prepare`(一站式) |

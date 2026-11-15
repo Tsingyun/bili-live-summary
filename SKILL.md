@@ -144,13 +144,13 @@ gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
    · **rec.darkpy.cn**（第二备份，`darkpy_rec.py`）：FLV 分段**断点续传下载** → 按段结束时间归组（跨午夜尾巴归前一场）→ ffmpeg `concat demuxer -c copy` **无损合并**（编码不一致才回退重编码）→ 完整性校验 → **同一总结流程**（转写→热词→总结→Word→MP3→压缩）。
    · **B站**（第三备份，原有功能不变）：仅当 rec站也没有该日时才抓（`bilibili_fallback(only_dates=...)` 限定目标日期）。跑完流程保留原 MP4、不压缩（`bilibili.keep_mp4=true`），归档到「录播根目录/YYYY-MM-DD/」。
    · 结束输出逐日结论（`2026-09-01：本地缺失 → rec.darkpy.cn → 成功`）。
-4. **导出中质量 MP3**：总结完成后，把视频转一份 192k/44.1k 的中质量 MP3（落在 `mp3_export.out_dir`；**用户规则 2026-09-08：与 Word 总结同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`**，文件名直接以日期开头）。
+4. **导出识别专用低码率 MP3**：总结完成后，把视频转一份 **16 kHz / 单声道 / 64 kbps** 的 MP3（落在 `mp3_export.out_dir`；**用户规则 2026-09-08：与 Word 总结同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`**，文件名直接以日期开头）。★ **2026-11-15 用户规则**：这份 MP3 只用于送千问做音频识别，「音质可以全面降低，满足普通的转录需求就可以」；ASR 服务端统一重采样到 16 kHz，双声道是单声道复制，故 `-ac 1 -ar 16000 -b:a 64k` 零有效信息损失、体积约降 67%。保守场景可把 `bitrate` 调 `96k`，勿降到 8 kHz；唱歌听感会变闷，收听版请另导。补跑时若已有 MP3 规格不符会自动重导。
    ★ **2026-11-15 用户规则**：归档 MP3 超过 500MB 时自动切成 `<原名>_Part1.mp3`（上）/
    `<原名>_Part2.mp3`（下）—— `scripts/mp3_split.py` 用 `-c copy` 无损切、切点优先落在附近静音，
    完整原件默认保留；阈值 `mp3_export.split_over_mb`（0=关闭），历史大文件用 `--scan` 补切。
 5. **压缩 HEVC MP4**：把视频压成 ~5GB 的 HEVC(H.265) MP4，按 `compress.out_dir_mode=date_subfolder` 输出到「录播根目录/YYYY-MM-DD/」日期文件夹（**当前规则**，用户 2026-09-08：不要 MP4/ 文件夹，直接用日期命名文件夹）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）。**B站兜底录播跳过本步骤，原样保留 MP4。**
 
-**最终每场交付物三样**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 中质量 MP3（`mp3_export.out_dir`，与 Word 同目录）③ 视频——**本地录播 / rec站补档**=压缩后的 HEVC MP4（「录播根目录/YYYY-MM-DD/」日期文件夹）；**B站兜底**=原样保留的 MP4（同样落在日期文件夹）。
+**最终每场交付物三样**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 识别专用低码率 MP3（16k/单声道/64k，`mp3_export.out_dir`，与 Word 同目录）③ 视频——**本地录播 / rec站补档**=压缩后的 HEVC MP4（「录播根目录/YYYY-MM-DD/」日期文件夹）；**B站兜底**=原样保留的 MP4（同样落在日期文件夹）。
 
 落地实现（已生效）：`daily_pipeline.py` 内置「根目录监测 + 本地总结 + 缺失补档(rec→B站) + MP3 + 压缩」+ 单实例锁 + 断点续跑（state 占位与 TXT/SRT 存在性判定）。手动运行：`python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览不处理。
 
