@@ -349,6 +349,45 @@ python scripts/install_scheduled_task.py --remove    # 删除
 - 定位是**安全网**：自动化那一次跑成了，计划任务到点会看到存活锁而空转退出；被杀了则由它补完。
 - ⚠️ 任务为「只使用交互方式」（需用户已登录），与自动化同处一个登录会话，符合预期。
 
+#### 5.1 为什么必须这样：agent 终端里的进程活不过一次工具调用（2026-11-16 实证）
+
+用 `run_in_background` 或任何 `Popen` 从终端起的长任务，**都跑在一个 Job Object 里**，
+那次工具调用一结束（或被中断）就整棵进程树回收。实测对照（启动 60s 心跳假任务，
+父进程 `os._exit(0)` 后立刻查）：
+
+| 创建标志 | 父进程存活期间 | 父进程退出后 |
+|---|---|---|
+| `DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP \| CREATE_NO_WINDOW` | 正常跑完 | **整树被杀，文件都没建** |
+| 上一行再加 `CREATE_BREAKAWAY_FROM_JOB` | 正常跑完 | **同样被杀**（job 未开 breakaway） |
+| `CREATE_NO_WINDOW \| CREATE_NEW_PROCESS_GROUP` | 正常跑完 | **被杀** |
+| `0`（默认） | 正常跑完 | **被杀** |
+
+结论：**没有"从会话里 detach"这种可能**，`Start-Process` 被安全策略拦也是同一原因。
+唯一出路是计划任务；`TempDetachTest` 验证过，用 `Start-ScheduledTask` 起的进程在
+后续全新会话里仍持续写心跳。
+
+#### 5.2 手动补跑：也走计划任务（别在会话里直接跑）
+
+```bash
+# ① 写请求描述（用 Write 工具落盘，别用 heredoc）
+#    WORKDIR/logs/pending_run.json
+#    {"argv": ["--date", "2026-11-15"], "note": "补跑 11-15"}
+#    可选字段：script（默认 daily_pipeline.py）、with_config（默认 true）、env、config
+# ② 触发后立刻返回
+#    PowerShell: Start-ScheduledTask -TaskName "BiliLiveSummary_Pending"
+# ③ 看结果
+#    WORKDIR/logs/pending_<时间戳>_<脚本>.log   本次输出
+#    WORKDIR/logs/pending_run.done.json         rc / 起止 / 耗时 / 完整命令
+#    WORKDIR/logs/pending_runner.log            包装器自身日志（pythonw 下 stdout 兜底）
+#    pending_run.json -> pending_run.json.consumed（防止同一请求重复执行）
+```
+
+- 任务 `BiliLiveSummary_Pending`：无触发器、纯手动、`MultipleInstances=IgnoreNew`、
+  `ExecutionTimeLimit=72h`，Action 用 `pythonw.exe`（无控制台窗口；`wscript.exe` 被
+  安全策略列 LOLBin 拦死，注册不了）。
+- `run_pending.py` 在 `pythonw` 下 `sys.stdout is None`，已内置重定向兜底，否则 `print` 直接崩。
+- 单实例锁仍生效：补跑与 04:20/06:20 定时器撞车时，后到者看到存活锁即退出。
+
 ### 6. 回归自测（改完必跑）
 
 ```bash
