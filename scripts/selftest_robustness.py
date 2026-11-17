@@ -1952,18 +1952,27 @@ def test_merged_deliverable(tmp, v):
     if not (ffmpeg and os.path.isfile(ffmpeg)):
         check('AA6-8 需要 ffmpeg', False, '找不到 ffmpeg')
         return
-    src = r'D:/录播/25788785-岁己SUI/录制-25788785-20261116-222114-312-陪你这个猪过周一【新衣活动中】.flv'
-    if not os.path.isfile(src):
-        check('AA6-8 需要 11-16 源样本', False, '找不到源 FLV')
-        return
     d = os.path.join(tmp, 'aa')
     os.makedirs(d, exist_ok=True)
+    # 完全自包含：用 ffmpeg 合成 60s 测试源，不依赖任何外部录播文件
+    # （源 FLV 被合法合并删除后，依赖外部样本的自检会误报失败）。
+    seed = os.path.join(d, 'seed.mp4')
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-f', 'lavfi',
+                    '-i', 'testsrc2=size=640x480:rate=30:duration=60',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=60',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-b:v', '2M',
+                    '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
+                    '-shortest', seed],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     good = os.path.join(d, 'good.mp4')
-    subprocess.run([ffmpeg, '-y', '-v', 'error', '-ss', '60', '-t', '12',
-                    '-i', src, '-c', 'copy', good], check=True)
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-i', seed, '-c', 'copy', good],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 截断件取源前 15s（=源 25%，低于 95% 门禁）但体积仍 >1MB，
+    # 确保它被拒的原因是"时长不足"而非"过小"，断言才对准校验逻辑本身。
     short = os.path.join(d, 'short.mp4')
-    subprocess.run([ffmpeg, '-y', '-v', 'error', '-ss', '60', '-t', '4',
-                    '-i', src, '-c', 'copy', short], check=True)
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-ss', '0', '-t', '15',
+                    '-i', seed, '-c', 'copy', short],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     broken = os.path.join(d, 'broken.mp4')
     with open(broken, 'wb') as f:
         f.write(b'\x00' * 1500000)
