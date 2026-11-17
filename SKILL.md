@@ -202,8 +202,8 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 ```
 
 **清理范围（白名单，只删中间产物）**：workdir 下的 `tmp/`（下载碎片、ASR 切块、一次性脚本）、
-`MP3/`（16k 单声道转写临时音频）、`logs/`、`backups/`、`__pycache__`、超期的 `TXT/`、`SRT/`，
-以及根目录的 `*.bak` 和孤儿 `.lock`/`.heartbeat`。
+`MP3/`（16k 单声道转写临时音频）、`logs/`、`backups/`、`__pycache__`、超期的 `TXT/`、`SRT/`、
+`merged/` 下**该场已完成总结**的 `_merged.mp4`，以及根目录的 `*.bak` 和孤儿 `.lock`/`.heartbeat`。
 
 **绝不碰（黑名单）**：录播根目录（`local.root`）里的任何文件——压缩成品 MP4、源视频；
 `mp3_export.out_dir` 的归档 MP3（用户规则 2026-09-08 起与 Word 同目录）；`doc_dir` 的 Word 总结；`config.json` / `state.json` / `hotwords.md`。
@@ -222,6 +222,31 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 | `orphan_lock_hours` | 2 | 孤儿锁文件存活超过该小时数则清（防死锁卡住下次运行） |
 | `disk_guard_gb` | 40 | D 盘剩余低于此值时，开跑前先强制清扫并告警 |
 | `sweep_on_start` / `sweep_on_finish` | true | 开跑前 / 结束后是否自动清扫 |
+| `merged_days` | 0 | `merged/*_merged.mp4` 保留天数：**0 = 总结完立刻释放**，N = 保留 N 天，-1 = 永久 |
+| `purge_merged_after_session` | true | 单场成功收尾时是否顺手释放该场合并产物 |
+
+### 合并产物（merged/）按需释放（2026-11-17 用户规则「总结完及时清理」）
+
+`merged/<首段名>_merged.mp4` 单场 **15~25GB**，它只是「重跑免重编」的缓存，**不是成品**。
+一旦该场的 `TXT`/`SRT` 已落盘、Word 小节与归档 MP3 已产出，它除了占盘没有用途；
+真要重跑，`merge` 会按源片段重新生成（约 4 分钟）。
+
+- 触发点：`daily_pipeline.process_video_source()` 收尾处 `cleanup.after_session(..., final=True)`。
+  **只有这一处传 `final=True`**——转写完成后（line ~863）与总结失败路径（~881）必须保持 `False`，
+  因为归档 MP3 还要从合并产物里导出、失败重跑也要复用它。
+- 保守条件（任一不满足即跳过）：① 路径在 `<workdir>/merged/` 下且以 `_merged.mp4` 结尾；
+  ② 该场日期已在 `state.done_dates`（或成功路径显式 `assume_done=True`）；
+  ③ mtime 老于 `MERGED_MIN_AGE_SEC=600`（防误删正在合并/正被 ffmpeg 读的文件）。
+- 批量清扫（`--sweep`）只清 **done_dates 里**的场次；未完成场次一律留着。
+
+> ⚠️ **踩过的坑（2026-11-17，务必别回退）**：本机「删除」会被软删进回收站，
+> `DeleteFileW` **返回成功但空间不释放**。实证：merged/ 两个合并产物 34.86GB 显示删除成功，
+> 可用空间却仍是 92.1GB 一点没变——文件实际躺在 `D:\$RECYCLE.BIN`（`$R9Y41X2.mp4` 14.30GB +
+> `$RJG3N7G.mp4` 20.56GB），`truncate(0)` 后立刻变 127.0GB。
+> 因此凡 **≥64MB** 的缓存文件删除前都先走 `cleanup.release_then_unlink()`：`truncate(0)` 让 NTFS
+> 立刻回收簇，再 `force_unlink`；回收站里即便留条目也是 0 字节。
+> 清理大件后**一定要核对 `shutil.disk_usage()` 的实际可用空间**，别看「删除成功」的日志就收工。
+
 
 > ⚠️ **踩过的坑（2026-09-01）**：自动化环境下，对 D 盘（用户数据盘）调用 `os.remove`
 > 会被安全删除 hook 拦截，且 hook 自身抛 `AttributeError: 'NoneType' object has no
@@ -246,11 +271,11 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - **合并失败 = 整场跳过且不写完成标记（下次自动重试），绝不退化成逐段分别总结**——那会给一场直播产出多份残缺总结。
 - **合并产物先写 `.part.mp4`，校验时长达标（≥各分段之和 95%）后原子改名**；复用已有产物时同样校验时长——
   只看"文件存在 + 体积 >1MB"会把上次被杀留下的半截合并视频当成已完成，直接送去转写，结果一场直播只总结一半。
-- 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在且完整则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频。
+- 合并产物落在 `<project_root>/merged/`，文件名沿用首段 basename 加 `_merged`；幂等（已存在且完整则跳过）。`local_merge.keep_merged=false` 时总结完成后删除该中间视频；**默认由 `cleanup.merged_days=0` 在成功收尾时自动释放**（见「合并产物按需释放」），`keep_merged` 只作为老开关保留。
 - 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限，默认 600) / `allow_overlap_sec`(允许的负间隙，默认 60，容忍录制器重连时几秒回退/重叠) / `keep_merged`(是否保留合并视频) / `exclude_dates`(日期列表，**显式强制不合并**，优先级高于 `max_gap_sec`，用于确认是「多场独立直播」而非断流重连的日期)。
 - **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
 - ⚠️ **临界风险**：若某日期多文件真实间隙只比 `max_gap_sec` 略大（如 609s vs 600s），ffprobe 时长精度波动可能让间隙跌破阈值而被误合并。对确认是独立多场的日期务必加入 `exclude_dates`（如 `"exclude_dates": ["2026-08-22"]`），不依赖阈值侥幸。
-- 复用：因合并视频已留档（`keep_merged=true`），重跑不会重复合并；已写占位(`LOCAL-*`)的场次仍会被跳过。
+- 复用：`merged/` 里的合并视频在「该场已完成」后会被清理释放（`cleanup.merged_days=0`，单场 15~25GB）；需要重跑时按源片段重新合并（~4 分钟），已写占位(`LOCAL-*`)的场次仍会被跳过。
 - **外部依赖（显式声明）**：合并与时长探测强依赖 `paths.ffmpeg` / `paths.ffprobe`。
   缺失时日志会明确报「外部工具缺失」并说明后果——**ffprobe 缺失降级用 mtime；ffmpeg 缺失则该场跳过（不崩溃、不逐段总结）**，请检查 `config.paths` 后重跑。
 - ⚠️ **占位 key 冲突（2026-09-14 修）**：同一 `live_date` 可能残留旧占位（典型是跨午夜尾巴留下的 `merged_into` 占位）。
@@ -393,7 +418,7 @@ python scripts/install_scheduled_task.py --remove    # 删除
 ```bash
 # ⚠️ 必须用 bili-archive venv 的 python（基础解释器没装 requests/python-docx，会假失败 6 项）
 "C:\Users\Tsing\.workbuddy\binaries\python\envs\bili-archive\Scripts\python.exe" scripts/selftest_robustness.py
-# 85 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、
+# 276 项：Range 忽略/截断/续传、原子写、锁判活、docx 回退与占用退化、压缩门禁、清理器锁保护、
 #        ffmpeg .part 输出、热词替换、金句格式/异常内容过滤/文档体检、小号上传模块纯逻辑（[L]）
 ```
 离线运行（本地 mock HTTP + ffmpeg 生成小视频），不需要外网与 Gemini 配额。
@@ -745,7 +770,7 @@ python daily_pipeline.py --date 2026-10-05
 - `daily_pipeline.py --workdir "<工作目录>" --date 2026-09-01` 定向处理某直播日期（本地没有自动走 rec → B站补档）
 - `backfill.py --workdir "<工作目录>" --from YYYY-MM-DD --to YYYY-MM-DD` 缺失检查报告；加 `--fill` 实际补档
 - `cleanup.py --report` / `--sweep [--dry-run]` 清理中间文件，详见「自动清理」
-- `selftest_robustness.py` 健壮性回归自测（离线，85 项），详见「健壮性加固」第 6 节
+- `selftest_robustness.py` 健壮性回归自测（离线，276 项），详见「健壮性加固」第 6 节
 - `docx_healthcheck.py` Word 成品体检与修复（格式/异常内容/热词），详见「健壮性加固」第 7 节；已接入每日流程收尾
 - `hotwords.py --audit` 审计当前生效的热词表（空转 / 冲突 / 危险级联）；`hotwords.py --text "..."` 演示单条替换
 - `install_scheduled_task.py --install/--query/--run/--remove` 耐久执行计划任务；`run_scheduled.py --status` 看上次结果

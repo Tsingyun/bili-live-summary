@@ -1817,6 +1817,105 @@ def test_mp3_asr_grade(tmp, v):
           'sr=%s ch=%s' % (stg.get('sample_rate'), stg.get('channels')))
 
 
+def test_merged_cache(tmp, v):
+    """Z. 合并产物缓存清理（2026-11-17 用户规则「总结完及时清理」）。
+
+    背景：merged/*_merged.mp4 单场 15~25GB。删它有两个坑，全靠本组守住：
+      ① 未完成场次被误删 → 重跑要重编、且归档 MP3 没得导；
+      ② 本机删除被软删进回收站 → 「删除成功」但空间一点不释放
+         （实证：34.86GB 删完可用空间仍是 92.1GB）。
+    """
+    import common
+    import cleanup as CL
+    import json
+    print('\n[Z] 合并产物缓存清理')
+
+    # Z1 静态接线：成功收尾才放行，转写后/失败路径必须不带 final
+    dp = open(os.path.join(SCRIPT_DIR, 'daily_pipeline.py'), encoding='utf-8').read()
+    check('Z1 daily_pipeline 只有成功收尾那一处传 final=True',
+          len(__import__('re').findall(r'after_session\([^)]*final=True', dp)) == 1)
+    cu_src = open(os.path.join(SCRIPT_DIR, 'cleanup.py'), encoding='utf-8').read()
+    check('Z1b after_session 有 final 开关且默认 False',
+          'final=False' in cu_src and 'final=False)' in cu_src)
+    check('Z1c 大文件删除走「先清零后删」',
+          'def release_then_unlink' in cu_src and 'f.truncate(0)' in cu_src)
+
+    root = os.path.join(tmp, 'zc')
+    md = os.path.join(root, 'merged')
+    os.makedirs(md, exist_ok=True)
+    log = _SilentLog()
+    cfg = {'_dirs': {'root': root},
+           'cleanup': {'enabled': True, 'merged_days': 0,
+                       'purge_merged_after_session': True}}
+    # state.json：只把 2026-11-16 标为已完成
+    with open(os.path.join(root, 'state.json'), 'w', encoding='utf-8') as f:
+        json.dump({'done_dates': ['2026-11-16']}, f, ensure_ascii=False)
+
+    def mk(name, mb=1, age=7200):
+        p = os.path.join(md, name)
+        with open(p, 'wb') as f:
+            f.write(b'\0' * (mb << 20))
+        t = time.time() - age
+        os.utime(p, (t, t))
+        return p
+
+    # Z2 已完成场次（in done_dates）→ 批量清理会删
+    p_done = mk('录制-1-20261116-201712-329-A_merged.mp4')
+    p_todo = mk('录制-1-20261130-201712-329-B_merged.mp4')
+    freed, deleted = CL.purge_merged_cache(cfg, log)
+    check('Z2 已完成场次的合并产物被释放',
+          not os.path.exists(p_done) and freed >= (1 << 20), 'freed=%s' % freed)
+    check('Z3 未完成场次一律保留（重跑要复用）',
+          os.path.exists(p_todo) and os.path.basename(p_todo) not in [os.path.basename(x) for x in deleted])
+
+    # Z4 单场收尾：assume_done=False 且不在 done_dates → 不删
+    check('Z4 失败/中途路径（assume_done=False）不删未完成场次',
+          CL.purge_merged_session(cfg, log, p_todo, assume_done=False) == 0 and os.path.exists(p_todo))
+
+    # Z5 刚合并完（mtime 太新）→ 不删，避免误伤正在被 ffmpeg 读的文件
+    p_new = mk('录制-1-20261116-120000-000-C_merged.mp4', age=60)
+    check('Z5 mtime < 600s 的一律跳过',
+          CL.purge_merged_session(cfg, log, p_new, assume_done=True) == 0 and os.path.exists(p_new))
+    os.utime(p_new, (time.time() - 7200,) * 2)
+
+    # Z6 成功收尾（assume_done=True）→ 删
+    check('Z6 成功收尾放行删除',
+          CL.purge_merged_session(cfg, log, p_new, assume_done=True) > 0 and not os.path.exists(p_new))
+
+    # Z7 非 merged 目录的路径（源 flv / 归档 MP3）一律不碰
+    p_out = os.path.join(tmp, 'z_outside_merged.mp4')
+    open(p_out, 'wb').write(b'\0' * 4096)
+    check('Z7 merged 目录之外的路径一律不碰',
+          CL.purge_merged_session(cfg, log, p_out, assume_done=True) == 0 and os.path.exists(p_out))
+
+    # Z8 merged_days 生效：-1 永久保留 / 2 天保留期内不删
+    cfg_keep = {'_dirs': {'root': root},
+                'cleanup': {'enabled': True, 'merged_days': -1, 'purge_merged_after_session': True}}
+    check('Z8 merged_days=-1 永久保留',
+          CL.purge_merged_session(cfg_keep, log, p_todo, assume_done=True) == 0 and os.path.exists(p_todo))
+    cfg_2d = {'_dirs': {'root': root},
+              'cleanup': {'enabled': True, 'merged_days': 2, 'purge_merged_after_session': True}}
+    check('Z9 merged_days=2 时 1 天前的文件仍在保留期内',
+          CL.purge_merged_session(cfg_2d, log, p_todo, assume_done=True) == 0 and os.path.exists(p_todo))
+
+    # Z10 release_then_unlink：大文件先清零，删除后不留实体
+    p_big = mk('z_big.bin', mb=2, age=60)
+    ok = CL.release_then_unlink(p_big, log, min_mb=1)
+    check('Z10 release_then_unlink 清零后删除成功',
+          ok and not os.path.exists(p_big))
+
+    # Z11 配置落地：生产 config 与 example 都带新键
+    for label, p in [('生产 config', r'D:/岁己直播自动总结/config.json'),
+                     ('example', os.path.join(SCRIPT_DIR, 'config.example.json'))]:
+        try:
+            c = json.load(open(p, encoding='utf-8'))
+            cu = c.get('cleanup') or {}
+            check('Z11 %s 有 merged_days/purge_merged_after_session 两键' % label,
+                  'merged_days' in cu and 'purge_merged_after_session' in cu)
+        except Exception as e:
+            check('Z11 %s 可读' % label, False, str(e))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1843,6 +1942,7 @@ def main():
         test_upload_cookie_path(tmp, args.verbose)
         test_completeness_guard(tmp, args.verbose)
         test_mp3_split(tmp, args.verbose)
+        test_merged_cache(tmp, args.verbose)
         test_mp3_asr_grade(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

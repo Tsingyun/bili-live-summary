@@ -920,8 +920,10 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         _log_err(log, '[compress] 压缩归档异常（不影响总结成品，源文件保留）：%s' % e)
 
     # 收尾兜底：16k 音频 / ASR 切块 / B站已归档副本（正常在转写后已删，这里再确认一次）
+    # final=True：走到这里说明 Word 小节与归档 MP3 都已落盘（或已尝试导出），
+    # 合并产物（15~25GB）已完成使命 → 按 cleanup.merged_days 立即释放。
     try:
-        cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
+        cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind, final=True)
     except Exception as e:
         log('收尾清理异常（不影响交付物）：%s' % e, 'WARN')
 

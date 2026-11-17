@@ -25,7 +25,11 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
    录播根目录（local.root）下的任何成品——压缩 MP4、源 flv/mp4；以及 mp3_export.out_dir
    的归档 MP3（用户规则 2026-09-08 起与 Word 总结同目录，不在录播根目录）。
    源视频只允许 compress 模块在「压缩成功且校验通过」后删除，本模块不碰。
-3. 删除走 common.force_unlink / force_rmtree（原生永久删除：ctypes Win32 DeleteFileW →
+4. merged/ 例外（2026-11-17 起）：*_merged.mp4 是「重跑免重编」的缓存**不是成品**，
+   只在该场已进 state.done_dates 且 mtime 已过 MERGED_MIN_AGE_SEC 时释放；
+   未完成场次一律留着（失败重跑要复用它导 MP3）。保留期由 cleanup.merged_days 控制
+   （0=总结完立刻删，N=保留 N 天，-1=永久）。
+5. 删除走 common.force_unlink / force_rmtree（原生永久删除：ctypes Win32 DeleteFileW →
    PowerShell Remove-Item -Force，绕过 os.remove 安全删除 hook，绝不进回收站、无需确认）。
 
 命令行
@@ -63,7 +67,16 @@ DEFAULTS = {
     'sweep_on_start': True,   # 每轮 pipeline 开跑前先清扫一次
     'sweep_on_finish': True,  # 每轮 pipeline 结束后再清扫一次
     'delete_mp3_after_success': True,  # 兼容旧键：转写完成后删 16k MP3
+    # merged/** 合并产物（25GB 级缓存，**不是成品**）：
+    #   0  = 该场总结完成（Word + 归档 MP3 已落盘）后立刻释放
+    #   N  = 完成后保留 N 天（想留「免重编」窗口就设 1~3）
+    #   -1 = 永久保留
+    'merged_days': 0,
+    'purge_merged_after_session': True,   # 单场成功收尾时顺手释放该场合并产物
 }
+
+# merged/*_merged.mp4 最小存活秒数：小于该值视为「可能仍被 ffmpeg 读/正在合并」，跳过
+MERGED_MIN_AGE_SEC = 600
 
 # workdir 下允许清扫的目录（相对 workdir），其余一律不碰
 SWEEP_DIRS = ['tmp', 'MP3', 'logs', 'TXT', 'SRT', 'backups', '__pycache__']
@@ -112,6 +125,40 @@ def protected_paths(cfg):
 # 因此统一走 common.force_unlink / force_rmtree（原生永久删除）。详见 common 注释。
 force_unlink = C.force_unlink
 force_rmtree = C.force_rmtree
+
+# 大文件删除阈值：超过这个体积先清零再删（默认 64MB）
+RELEASE_MIN_MB = 64
+
+
+def release_then_unlink(path, log=None, min_mb=None):
+    """先清零释放簇、再删除。返回 force_unlink 的布尔结果。
+
+    ★ 2026-11-17 实证事故：本机删除被安全策略软删进回收站，
+      `DeleteFileW` 返回成功但**空间不释放**——merged/ 两个合并产物 34.86GB
+      「删掉」后可用空间仍是 92.1GB，文件实际躺在 D:\\$RECYCLE.BIN
+      （$R9Y41X2.mp4 14.30GB + $RJG3N7G.mp4 20.56GB）；truncate(0) 后立刻变 127.0GB。
+      因此凡是大文件（>= min_mb），删除前先 truncate(0)：NTFS 立即回收簇，
+      回收站里即便留下条目也是 0 字节，不会再吃掉几十 GB。
+    """
+    if min_mb is None:
+        min_mb = RELEASE_MIN_MB
+    size = 0
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    if size >= min_mb * 1024 * 1024:
+        try:
+            with open(path, 'r+b') as f:
+                f.truncate(0)
+                f.flush()
+                os.fsync(f.fileno())
+            if log:
+                log('[cleanup] 先清零释放 %.2f GB：%s' % (size / (1024 ** 3), os.path.basename(path)))
+        except Exception as e:
+            if log:
+                log('[cleanup] 清零失败（仍尝试删除）：%s | %s' % (os.path.basename(path), e), 'WARN')
+    return force_unlink(path, log)
 
 
 def dir_size(path):
@@ -247,11 +294,124 @@ def purge_asr_chunks(cfg, log, dry_run=False, max_age_sec=None):
 # ---------------------------------------------------------------------------
 # 单场收尾清理
 # ---------------------------------------------------------------------------
-def after_session(cfg, log, stem=None, src_kind='local', success=True, dry_run=False):
+def merged_dir_of(cfg):
+    """合并产物目录：<workdir>/merged。"""
+    return os.path.join(os.path.abspath(cfg['_dirs']['root']), 'merged')
+
+
+def _date_of_merged(name):
+    """从合并产物名里取直播日期：录制-<房间>-20261116-201712-...-_merged.mp4 → 2026-11-16。"""
+    m = re.search(r'-(20\d{2})(\d{2})(\d{2})-', name)
+    return '%s-%s-%s' % (m.group(1), m.group(2), m.group(3)) if m else None
+
+
+def _num(v, default=-1.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def purge_merged_session(cfg, log, src_video, dry_run=False, assume_done=False):
+    """释放**单场**合并产物（*_merged.mp4，15~25GB）。
+
+    为什么可以删：合并产物只是「重跑免重编」的缓存。TXT/SRT 已落盘、Word 小节与
+    归档 MP3 已产出之后，它除了占盘没有任何用途；真要重跑，merge 会按源片段重新
+    生成（约 4 分钟），不会丢任何内容。
+
+    保守条件（任一不满足即跳过）：
+      ① 路径就在 <workdir>/merged/ 下，且文件名以 _merged.mp4 结尾
+      ② 该场日期已在 state.done_dates（或调用方明确 assume_done，仅成功收尾路径用）
+      ③ mtime 老于 MERGED_MIN_AGE_SEC（防止误删正在合并/正被 ffmpeg 读取的文件）
+    """
+    cu = cfg_cleanup(cfg)
+    if not cu['enabled'] or not cu.get('purge_merged_after_session', True):
+        return 0
+    keep_days = _num(cu.get('merged_days', 0))
+    if keep_days < 0 or not src_video:
+        return 0
+    p = os.path.abspath(src_video)
+    md = os.path.abspath(merged_dir_of(cfg))
+    if os.path.dirname(p) != md or not p.lower().endswith('_merged.mp4'):
+        return 0
+    if not os.path.isfile(p):
+        return 0
+    d = _date_of_merged(os.path.basename(p))
+    if not assume_done:
+        try:
+            done = set(C.load_state(cfg).get('done_dates') or [])
+        except Exception:
+            done = set()
+        if not d or d not in done:
+            return 0
+    try:
+        age = time.time() - os.path.getmtime(p)
+    except Exception:
+        return 0
+    if age < MERGED_MIN_AGE_SEC or age / 86400.0 < keep_days:
+        return 0
+    size = dir_size(p)
+    if not dry_run:
+        if not release_then_unlink(p, log):
+            log('[cleanup] 合并缓存删除失败（可能被占用）：%s' % os.path.basename(p), 'WARN')
+            return 0
+    log('[cleanup] 合并缓存已释放 %.2f GB：%s%s'
+        % (size / (1024 ** 3), os.path.basename(p), '（dry-run 未删）' if dry_run else ''))
+    return size
+
+
+def purge_merged_cache(cfg, log, dry_run=False):
+    """按「该场已完成」清 merged/ 下所有可删的合并产物。返回 (释放字节, 清单)。"""
+    cu = cfg_cleanup(cfg)
+    if not cu['enabled']:
+        return 0, []
+    keep_days = _num(cu.get('merged_days', 0))
+    if keep_days < 0:
+        return 0, []
+    md = merged_dir_of(cfg)
+    if not os.path.isdir(md):
+        return 0, []
+    try:
+        done = set(C.load_state(cfg).get('done_dates') or [])
+    except Exception:
+        done = set()
+    now = time.time()
+    freed = 0
+    deleted = []
+    for name in os.listdir(md):
+        if not name.lower().endswith('_merged.mp4'):
+            continue
+        p = os.path.join(md, name)
+        if not os.path.isfile(p):
+            continue
+        d = _date_of_merged(name)
+        if not d or d not in done:
+            continue          # 未完成的场次：留着，重跑时免重编
+        try:
+            age = now - os.path.getmtime(p)
+        except Exception:
+            continue
+        if age < MERGED_MIN_AGE_SEC or age / 86400.0 < keep_days:
+            continue
+        size = dir_size(p)
+        freed += size
+        deleted.append(p)
+        if not dry_run and not release_then_unlink(p, log):
+            log('[cleanup] 删除失败（可能被占用）：%s' % name, 'WARN')
+    if freed:
+        log('[cleanup] 合并缓存释放 %.2f GB（%d 个）%s'
+            % (freed / (1024 ** 3), len(deleted), '（dry-run 未删）' if dry_run else ''))
+    return freed, deleted
+
+
+def after_session(cfg, log, stem=None, src_kind='local', success=True, dry_run=False, final=False):
     """单场处理结束（成功或失败都调用）后清理该场产生的中间文件。
 
-    stem: 该场文件名主干（不含扩展名）。给定时只清理它的 16k MP3 与 ASR 切块；
-          不给定则清理全部超过保留天数的。
+    stem:  该场文件名主干（不含扩展名）。给定时只清理它的 16k MP3 与 ASR 切块；
+           不给定则清理全部超过保留天数的。
+    final: 仅「成功收尾」路径传 True —— 此时 Word 与归档 MP3 都已落盘，
+           才允许释放该场 merged/*_merged.mp4。转写后 / 失败路径**必须**保持 False，
+           因为归档 MP3 还要从合并产物里导出、重跑也要复用它。
     """
     cu = cfg_cleanup(cfg)
     if not cu['enabled']:
@@ -283,6 +443,12 @@ def after_session(cfg, log, stem=None, src_kind='local', success=True, dry_run=F
     if src_kind == 'bilibili':
         f3, _ = purge_archived_downloads(cfg, log, dry_run=dry_run)
         freed += f3
+
+    # 4) 合并产物缓存（只有成功收尾才放行：Word/MP3 已落盘，重跑可重编）
+    if final and stem and cu.get('purge_merged_after_session', True):
+        freed += purge_merged_session(cfg, log,
+                                      os.path.join(merged_dir_of(cfg), stem + '_merged.mp4'),
+                                      dry_run=dry_run, assume_done=True)
 
     if freed:
         log('[cleanup] 本场收尾释放 %.2f GB%s'
@@ -379,7 +545,7 @@ def sweep(cfg, log, dry_run=False, aggressive=False):
                 if os.path.isdir(p):
                     force_rmtree(p, log)
                 else:
-                    force_unlink(p, log)
+                    release_then_unlink(p, log)
 
     # --- 根目录历史备份文件 state.json.bak / *.bak.YYYYMMDD ---
     bdays = _days('backup_days')
@@ -431,6 +597,10 @@ def sweep(cfg, log, dry_run=False, aggressive=False):
     f2, d2 = purge_asr_chunks(cfg, log, dry_run=dry_run)
     freed += f2
     deleted.extend((p, 0) for p in d2)
+    # 合并产物：只清「已完成总结」的场次（未完成的留着，重跑免重编）
+    f4, d4 = purge_merged_cache(cfg, log, dry_run=dry_run)
+    freed += f4
+    deleted.extend((p, 0) for p in d4)
 
     log('[cleanup] 清扫完成：%d 项，释放 %.2f GB%s'
         % (len(deleted), freed / (1024 ** 3), '（dry-run 未删）' if dry_run else ''))

@@ -77,7 +77,7 @@
     "enhance_low_snr_warn_db": 12.0
   },
   "cleanup": {
-    "_comment": "自动清理中间文件，防止磁盘被撑爆。每跑一场临时占用 25~30GB（源视频+压缩产物+B站下载+ASR切块+16k音频），必须回收。sweep 只删 workdir 下的中间产物（tmp / MP3 / logs / backups / __pycache__ 及超期 TXT、SRT），并清理已归档的 B站下载副本与残留 ASR 切块；绝不碰成品（录播根目录里 YYYY-MM-DD/ 的 MP4、mp3_export.out_dir 的归档 MP3）和文档目录的 Word 总结。天数按文件最后修改时间计算；-1 = 永久保留。",
+    "_comment": "自动清理中间文件，防止磁盘被撑爆。每跑一场临时占用 25~30GB（源视频+压缩产物+B站下载+ASR切块+16k音频），必须回收。sweep 只删 workdir 下的中间产物（tmp / MP3 / logs / backups / __pycache__ 及超期 TXT、SRT），并清理已归档的 B站下载副本与残留 ASR 切块；绝不碰成品（录播根目录里 YYYY-MM-DD/ 的 MP4、mp3_export.out_dir 的归档 MP3）和文档目录的 Word 总结。天数按文件最后修改时间计算；-1 = 永久保留。 ★ 2026-11-17：merged/*_merged.mp4 是「重跑免重编」的缓存、不是成品，该场进 done_dates 后即可释放（单场 15~25GB）。merged_days：0=总结完立刻删，N=完成后保留 N 天（想留免重编窗口设 1~3），-1=永久保留；purge_merged_after_session 控制单场成功收尾时是否顺手删。",
     "enabled": true,
     "delete_mp3_after_success": true,
     "keep_txt": true,
@@ -92,7 +92,9 @@
     "orphan_lock_hours": 2,
     "disk_guard_gb": 40,
     "sweep_on_start": true,
-    "sweep_on_finish": true
+    "sweep_on_finish": true,
+    "merged_days": 0,
+    "purge_merged_after_session": true
   },
   "mp3_export": {
     "_comment": "总结之后导出归档 MP3。★ 用户规则(2026-11-15)：归档 MP3 只用于送千问做音频识别，音质全面降低 = 默认 16kHz / 单声道 / 64kbps；保守场景可把 bitrate 调成 96k，勿降到 8kHz。out_dir 建议与 Word 总结同目录（用户规则 2026-09-08）；strip_prefix 去掉录制器前缀，使输出文件名以日期开头。",
