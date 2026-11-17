@@ -25,10 +25,9 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
    录播根目录（local.root）下的任何成品——压缩 MP4、源 flv/mp4；以及 mp3_export.out_dir
    的归档 MP3（用户规则 2026-09-08 起与 Word 总结同目录，不在录播根目录）。
    源视频只允许 compress 模块在「压缩成功且校验通过」后删除，本模块不碰。
-4. merged/ 例外（2026-11-17 起）：*_merged.mp4 是「重跑免重编」的缓存**不是成品**，
-   只在该场已进 state.done_dates 且 mtime 已过 MERGED_MIN_AGE_SEC 时释放；
-   未完成场次一律留着（失败重跑要复用它导 MP3）。保留期由 cleanup.merged_days 控制
-   （0=总结完立刻删，N=保留 N 天，-1=永久）。
+4. 合并产物例外（2026-11-17 用户规则修正）：*_merged.mp4 是**交付件**（整场可播放 MP4），
+   默认永久保留，任何清扫都不碰；源 FLV 分段只在合并产物通过「时长 + 首尾解码」校验后
+   由 purge_source_members 清零删除。
 5. 删除走 common.force_unlink / force_rmtree（原生永久删除：ctypes Win32 DeleteFileW →
    PowerShell Remove-Item -Force，绕过 os.remove 安全删除 hook，绝不进回收站、无需确认）。
 
@@ -45,6 +44,7 @@ import sys
 import time
 import shutil
 import argparse
+import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as C  # noqa: E402
@@ -67,12 +67,11 @@ DEFAULTS = {
     'sweep_on_start': True,   # 每轮 pipeline 开跑前先清扫一次
     'sweep_on_finish': True,  # 每轮 pipeline 结束后再清扫一次
     'delete_mp3_after_success': True,  # 兼容旧键：转写完成后删 16k MP3
-    # merged/** 合并产物（25GB 级缓存，**不是成品**）：
-    #   0  = 该场总结完成（Word + 归档 MP3 已落盘）后立刻释放
-    #   N  = 完成后保留 N 天（想留「免重编」窗口就设 1~3）
-    #   -1 = 永久保留
-    'merged_days': 0,
-    'purge_merged_after_session': True,   # 单场成功收尾时顺手释放该场合并产物
+    # merged/** 合并产物：2026-11-17 用户规则修正——它是**交付件**（可正常播放的
+    #   整场 MP4），不是缓存，一律保留。保留旧键只为兼容历史配置，默认不再删。
+    #   0/N = 完成 N 天后释放（仅显式配置才会删）；-1 = 永久保留（默认）
+    'merged_days': -1,
+    'purge_merged_after_session': False,  # 默认不删合并产物
 }
 
 # merged/*_merged.mp4 最小存活秒数：小于该值视为「可能仍被 ffmpeg 读/正在合并」，跳过
@@ -453,6 +452,142 @@ def after_session(cfg, log, stem=None, src_kind='local', success=True, dry_run=F
     if freed:
         log('[cleanup] 本场收尾释放 %.2f GB%s'
             % (freed / (1024 ** 3), '（dry-run 未删）' if dry_run else ''))
+    return freed
+
+
+# ---------------------------------------------------------------------------
+# 合并产物校验 + 源分段释放（2026-11-17 用户规则）
+# ---------------------------------------------------------------------------
+def verify_merged_playable(cfg, log, merged_path, member_files):
+    """校验合并 MP4 是「大小正常、可正常播放」的交付件。
+
+    三道门禁（任一不过即判失败，源 FLV 一律保留）：
+      ① 文件存在且 > 1MB；
+      ② ffprobe 时长 >= 各源分段之和的 95%（防止半截/PTS 异常放大）；
+      ③ ffmpeg 对开头 3 秒与结尾 3 秒各解码一次，返回码必须为 0
+         （能读出时长不等于能解码；这一步才证明「可正常播放」）。
+
+    返回 (ok: bool, reason: str, got: float, expected: float)。
+    """
+    if not merged_path or not os.path.isfile(merged_path):
+        return False, '合并产物不存在', 0.0, 0.0
+    try:
+        size = os.path.getsize(merged_path)
+    except Exception:
+        return False, '取不到合并产物大小', 0.0, 0.0
+    if size <= 1024 * 1024:
+        return False, '合并产物过小（%d B）' % size, 0.0, 0.0
+
+    paths = cfg.get('paths') or {}
+    ffprobe, ffmpeg = paths.get('ffprobe'), paths.get('ffmpeg')
+    expected = 0.0
+    if ffprobe:
+        try:
+            for p in (member_files or []):
+                if p and os.path.isfile(p):
+                    expected += C.probe_duration(ffprobe, p) or 0.0
+        except Exception:
+            expected = 0.0
+        try:
+            got = C.probe_duration(ffprobe, merged_path) or 0.0
+        except Exception:
+            got = 0.0
+        if got <= 0:
+            return False, 'ffprobe 读不到时长', got, expected
+        if expected > 0 and got < expected * 0.95:
+            return False, '时长不足（%.0fs / 期望 %.0fs）' % (got, expected), got, expected
+    else:
+        got = 0.0
+
+    if ffmpeg:
+        probes = (['-ss', '0', '-t', '3'], ['-sseof', '-3'])
+        for args in probes:
+            try:
+                cp = subprocess.run([ffmpeg, '-v', 'error'] + args +
+                                    ['-i', merged_path, '-f', 'null', '-'],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    timeout=180)
+                if cp.returncode != 0:
+                    err = (cp.stderr or b'').decode('utf-8', 'replace')[-300:]
+                    return False, '解码失败（%s）：%s' % (' '.join(args), err), got, expected
+            except subprocess.TimeoutExpired:
+                return False, '解码超时（%s）' % ' '.join(args), got, expected
+            except Exception as e:
+                return False, '解码异常（%s）：%s' % (' '.join(args), e), got, expected
+    return True, 'OK', got, expected
+
+
+def purge_source_members(cfg, log, merged_path, member_files, date_iso, dry_run=False):
+    """合并 MP4 校验通过后，清零删除该场的源 FLV 分段。返回释放字节数。
+
+    安全条件（任一不满足即整体不删）：
+      · cleanup/local_merge 两个开关都放行；
+      · date_iso 已在 state.done_dates（Word 小节与归档 MP3 已落盘）；
+      · merged_path 就在 local.root 下且以 _merged.mp4 结尾，并通过 verify；
+      · 每个源都在 local.root 或其直接子目录下，且不是 _merged/_compressed/.part。
+    删除走 release_then_unlink（大文件先 truncate(0)），否则本机软删进回收站不释放空间。
+    """
+    lm = cfg.get('local_merge') or {}
+    if not lm.get('delete_sources_after_verify', True):
+        return 0
+    cu = cfg_cleanup(cfg)
+    if not cu.get('enabled', True):
+        return 0
+    root = (cfg.get('local') or {}).get('root') or ''
+    if not root:
+        if log:
+            log('[source] 未配置 local.root，保留源 FLV 不删', 'WARN')
+        return 0
+    root = os.path.abspath(root)
+    mp = os.path.abspath(merged_path or '')
+    if os.path.dirname(mp) != root or not mp.lower().endswith('_merged.mp4'):
+        if log:
+            log('[source] 合并产物不在录播根目录（%s），保留源 FLV 不删' % mp, 'WARN')
+        return 0
+    try:
+        done = set(C.load_state(cfg).get('done_dates') or [])
+    except Exception:
+        done = set()
+    if date_iso not in done:
+        if log:
+            log('[source] %s 尚未写入 done_dates，保留源 FLV 不删' % date_iso, 'WARN')
+        return 0
+
+    ok, reason, got, exp = verify_merged_playable(cfg, log, mp, member_files)
+    if not ok:
+        if log:
+            log('[source] 合并产物校验未通过（%s），保留全部源 FLV' % reason, 'WARN')
+        return 0
+    if log:
+        log('[source] 合并产物校验通过：%.0fs / 期望 %.0fs，大小 %.2f GB'
+            % (got, exp, os.path.getsize(mp) / (1024 ** 3)))
+
+    freed = 0
+    for p in list(member_files or []):
+        if not p or not os.path.isfile(p):
+            continue
+        ap = os.path.abspath(p)
+        parent = os.path.dirname(ap)
+        if parent != root and os.path.dirname(parent) != root:
+            if log:
+                log('[source] 源不在录播根目录，跳过：%s' % ap, 'WARN')
+            continue
+        low = os.path.basename(ap).lower()
+        if low.endswith('_merged.mp4') or low.endswith('_compressed.mp4') or '.part' in low:
+            continue
+        sz = os.path.getsize(ap)
+        if dry_run:
+            if log:
+                log('[source] dry-run 将删除源分段 %.2f GB：%s' % (sz / (1024 ** 3), os.path.basename(ap)))
+            freed += sz
+            continue
+        if release_then_unlink(ap, log):
+            freed += sz
+            if log:
+                log('[source] 已删除源分段 %.2f GB：%s' % (sz / (1024 ** 3), os.path.basename(ap)))
+        else:
+            if log:
+                log('[source] 源分段删除失败（保留）：%s' % os.path.basename(ap), 'WARN')
     return freed
 
 

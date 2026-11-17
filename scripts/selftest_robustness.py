@@ -1916,6 +1916,74 @@ def test_merged_cache(tmp, v):
             check('Z11 %s 可读' % label, False, str(e))
 
 
+def test_merged_deliverable(tmp, v):
+    """AA. 合并 MP4 是交付件（2026-11-17 用户规则修正）。
+
+    用户澄清：取消的是**压缩**，不是合并。整场 FLV 必须无损合并成一个
+    「大小正常、可正常播放」的 MP4 留在录播根目录，校验通过后才能删源 FLV。
+    本组锁住：配置默认、输出落位、校验门禁、删源前必须 done_dates。
+    """
+    import common
+    import cleanup as CL
+    import json
+    print('\n[AA] 合并 MP4 交付件 + 校验后删源')
+
+    cfg = common.load_config(r'D:/岁己直播自动总结/config.json')
+    cu_src = open(os.path.join(SCRIPT_DIR, 'cleanup.py'), encoding='utf-8').read()
+    dp_src = open(os.path.join(SCRIPT_DIR, 'daily_pipeline.py'), encoding='utf-8').read()
+
+    # AA1 默认配置：不删合并产物
+    check('AA1 默认 merged_days=-1（永久保留合并 MP4）',
+          CL.DEFAULTS.get('merged_days') == -1)
+    check('AA2 默认 purge_merged_after_session=false',
+          CL.DEFAULTS.get('purge_merged_after_session') is False)
+
+    # AA3 合并产物落录播根目录（不是 workdir/merged）
+    check('AA3 prepare_session 输出优先录播根目录',
+          "lm.get('merge_output', 'recording_root')" in dp_src
+          and 'merged_dir = local_root' in dp_src)
+    check('AA4 新函数接线：主循环 mark_local_done 后删源',
+          'cleanup.purge_source_members(' in dp_src)
+    check('AA5 verify_merged_playable 校验首尾解码',
+          'sseof' in cu_src and "'-ss', '0', '-t', '3'" in cu_src)
+
+    # AA6-8 用真实 ffmpeg 造样本，验证三档门禁
+    ffmpeg = cfg['paths']['ffmpeg']
+    if not (ffmpeg and os.path.isfile(ffmpeg)):
+        check('AA6-8 需要 ffmpeg', False, '找不到 ffmpeg')
+        return
+    src = r'D:/录播/25788785-岁己SUI/录制-25788785-20261116-222114-312-陪你这个猪过周一【新衣活动中】.flv'
+    if not os.path.isfile(src):
+        check('AA6-8 需要 11-16 源样本', False, '找不到源 FLV')
+        return
+    d = os.path.join(tmp, 'aa')
+    os.makedirs(d, exist_ok=True)
+    good = os.path.join(d, 'good.mp4')
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-ss', '60', '-t', '12',
+                    '-i', src, '-c', 'copy', good], check=True)
+    short = os.path.join(d, 'short.mp4')
+    subprocess.run([ffmpeg, '-y', '-v', 'error', '-ss', '60', '-t', '4',
+                    '-i', src, '-c', 'copy', short], check=True)
+    broken = os.path.join(d, 'broken.mp4')
+    with open(broken, 'wb') as f:
+        f.write(b'\x00' * 1500000)
+
+    log = common.Logger(cfg, 'selftest_aa')
+    ok, why, got, exp = CL.verify_merged_playable(cfg, log, good, [good])
+    check('AA6 完整样本通过校验', ok, why)
+    ok2, why2, _, _ = CL.verify_merged_playable(cfg, log, short, [good])
+    check('AA7 时长不足的截断件被拒', not ok2 and '时长不足' in why2, why2)
+    ok3, why3, _, _ = CL.verify_merged_playable(cfg, log, broken, [good])
+    check('AA8 损坏文件被拒', not ok3, why3)
+
+    # AA9 非录播根目录的合并产物一律不删（保护其他项目）
+    c2 = dict(cfg)
+    c2['local'] = dict(cfg['local'], root=os.path.join(d, 'root'))
+    os.makedirs(c2['local']['root'], exist_ok=True)
+    freed = CL.purge_source_members(c2, log, good, [good], '2026-11-16')
+    check('AA9 合并产物不在 local.root 时删源整体跳过', freed == 0, str(freed))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('-v', '--verbose', action='store_true')
@@ -1944,6 +2012,7 @@ def main():
         test_mp3_split(tmp, args.verbose)
         test_merged_cache(tmp, args.verbose)
         test_mp3_asr_grade(tmp, args.verbose)
+        test_merged_deliverable(tmp, args.verbose)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n' + '=' * 60)

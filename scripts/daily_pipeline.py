@@ -564,7 +564,15 @@ def prepare_session(cfg, log, session):
     if not session['is_merged']:
         session['merged_src'] = session['member_files'][0]
         return session['merged_src']
-    merged_dir = os.path.join(cfg['_dirs']['root'], 'merged')
+    # ★ 2026-11-17 用户规则修正：合并 MP4 是**交付件**，不是缓存。
+    #   默认落在录播根目录（跟源 FLV 一起），保留 _merged.mp4 后缀——扫描器
+   #   的 core.endswith('_merged') 排除规则保证它不会被当成新录播重复处理。
+    local_root = (cfg.get('local') or {}).get('root') or ''
+    lm = cfg.get('local_merge') or {}
+    if lm.get('merge_output', 'recording_root') == 'recording_root' and local_root:
+        merged_dir = local_root
+    else:
+        merged_dir = os.path.join(cfg['_dirs']['root'], 'merged')
     os.makedirs(merged_dir, exist_ok=True)
     first_base = re.sub(r'\.\w+$', '', os.path.basename(session['member_files'][0]))
     out_path = os.path.join(merged_dir, first_base + '_merged.mp4')
@@ -920,8 +928,8 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         _log_err(log, '[compress] 压缩归档异常（不影响总结成品，源文件保留）：%s' % e)
 
     # 收尾兜底：16k 音频 / ASR 切块 / B站已归档副本（正常在转写后已删，这里再确认一次）
-    # final=True：走到这里说明 Word 小节与归档 MP3 都已落盘（或已尝试导出），
-    # 合并产物（15~25GB）已完成使命 → 按 cleanup.merged_days 立即释放。
+    # final=True：仅表示「成功收尾」。合并 MP4 是交付件，任何情况下都不在这里删除；
+    # 源 FLV 的删除由主循环在 mark_local_done 之后统一做（此时 state 已落盘）。
     try:
         cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind, final=True)
     except Exception as e:
@@ -1623,6 +1631,16 @@ def main():
                     if ok:
                         mark_local_done(st, cfg, s, fname)
                         done_sessions.append(s['live_date'].isoformat())
+                        # ★ 2026-11-17：合并 MP4 保留为交付件；源 FLV 在通过
+                        #   「时长>=95% + 首尾可解码」校验后清零删除，省双份空间。
+                        try:
+                            if src and src.lower().endswith('_merged.mp4'):
+                                cleanup.purge_source_members(
+                                    cfg, log, src, s['member_files'],
+                                    s['live_date'].isoformat(),
+                                    dry_run=args.dry_run)
+                        except Exception as e:
+                            log('删除源分段异常（合并 MP4 已保留，可手工清理）：%s' % e, 'WARN')
                 except KeyboardInterrupt:
                     raise                      # 优雅退出信号：交给外层 finally 收尾
                 except Exception as ex:

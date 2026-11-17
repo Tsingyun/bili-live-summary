@@ -93,8 +93,8 @@
     "disk_guard_gb": 40,
     "sweep_on_start": true,
     "sweep_on_finish": true,
-    "merged_days": 0,
-    "purge_merged_after_session": true
+    "merged_days": -1,
+    "purge_merged_after_session": false
   },
   "mp3_export": {
     "_comment": "总结之后导出归档 MP3。★ 用户规则(2026-11-15)：归档 MP3 只用于送千问做音频识别，音质全面降低 = 默认 16kHz / 单声道 / 64kbps；保守场景可把 bitrate 调成 96k，勿降到 8kHz。out_dir 建议与 Word 总结同目录（用户规则 2026-09-08）；strip_prefix 去掉录制器前缀，使输出文件名以日期开头。",
@@ -131,6 +131,8 @@
     "ultrashort_sec": 300,
     "absorb_window_sec": 600,
     "keep_merged": true,
+    "merge_output": "recording_root",
+    "delete_sources_after_verify": true,
     "exclude_dates": []
   },
   "topic_separator": {
