@@ -204,6 +204,22 @@ def main():
         _missing_key = not api_key
     if _missing_key:
         print('[!] 未填写 API Key，请在 config.json 的 summarize.api_key 填写')
+
+    # 自动安装「子进程不弹控制台黑框」补丁（幂等；pythonw 启动的管线调用 ffmpeg 等
+    # 控制台程序会弹黑框，2026-11-19 用户反馈影响工作/游戏）。失败不阻断配置。
+    try:
+        import subprocess as _sp
+        _installer = os.path.join(SCRIPT_DIR, 'install_no_window.py')
+        if os.path.isfile(_installer) and py and os.path.isfile(py):
+            print('\n* 安装子进程免弹窗补丁 ...')
+            _r = _sp.run([py, _installer, '--python', py],
+                         capture_output=True, text=True)
+            for _ln in ((_r.stdout or '') + (_r.stderr or '')).splitlines():
+                if _ln.strip():
+                    print('  ' + _ln)
+    except Exception as _e:
+        print('[!] 免弹窗补丁安装跳过（不影响主流程）：%s' % _e)
+
     print('\n下一步：')
     print(f'  试运行：  "{py or "python"}" "{os.path.join(SCRIPT_DIR, "daily_pipeline.py")}" --dry-run')
     print(f'  正式运行："{py or "python"}" "{os.path.join(SCRIPT_DIR, "daily_pipeline.py")}"')

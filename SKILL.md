@@ -419,6 +419,23 @@ python scripts/install_scheduled_task.py --remove    # 删除
 - `run_pending.py` 在 `pythonw` 下 `sys.stdout is None`，已内置重定向兜底，否则 `print` 直接崩。
 - 单实例锁仍生效：补跑与 04:20/06:20 定时器撞车时，后到者看到存活锁即退出。
 
+#### 5.3 子进程免弹黑框（2026-11-19，别回退）
+
+计划任务用 `pythonw.exe`（无控制台）启动，但管线调用的 ffmpeg / ffprobe / aria2c /
+powershell 是**控制台子系统程序**：Windows 会给每个这样的子进程弹一个 conhost 黑框，
+一晚几十个，严重影响用户工作和游戏。
+
+- **根治**：专用 venv 的 `Lib/site-packages/sitecustomize.py` 给所有 `subprocess.Popen`
+  追加 `creationflags |= CREATE_NO_WINDOW`（0x08000000），run/call/check_output 全走 Popen 故全覆盖。
+  在进程加载用户代码前生效，任何用该 venv 的新进程自动免疫。
+- **安装/检查/回滚**：`scripts/install_no_window.py`（幂等）；`setup.py` 向导末尾会自动安装。
+  - 检查：`python scripts/install_no_window.py --check`
+  - 回滚：`python scripts/install_no_window.py --uninstall`
+- 只加 flag，不改命令/参数/IO，**不杀任何进程**；对已运行进程无效（需重启该进程才生效），
+  但管线各阶段是新进程，所以在任务跑到一半时安装，下一阶段立即生效。
+- 第三方已存在 sitecustomize 时不覆盖，报人工合并。
+- 一次性应急隐藏已弹窗口（不杀进程）：工作目录 `_hide_task_consoles_*.py`（ctypes ShowWindow，只隐藏任务链 conhost）。
+
 ### 6. 回归自测（改完必跑）
 
 ```bash
