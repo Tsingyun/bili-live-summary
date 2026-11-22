@@ -139,7 +139,8 @@ def touch_heartbeat(cfg):
 # 轮换语义：失败（429/404/5xx/空响应）模型进入退避窗口并降级，但窗口过期后按优先级
 # 重扫、更高阶模型重新成为首选被回头重试；每模型成功 20 次也主动停用本轮。
 MODELS = [
-    'gemini-3.8-flash',        # ① 最新最强 Flash，总结质量与推理最佳，1M 上下文
+    'gemini-4-hydrogen',       # ① 2026-11-12 GA：3.8-flash 继任者，免费层，快 2.5x/幻觉-80%（须 low thinking）
+    'gemini-3.8-flash',        # ② 上代主力，总结质量与推理最佳，1M 上下文
     'gemini-3.7-flash',        # ② 上代旗舰 Flash，总结稳定，1M 上下文（响应略慢）
     'gemini-3.6-flash',        # ③ 长期主力，总结质量经实战验证，1M 上下文
     'gemini-3.5-flash',        # ④ 3.x 中端，质量与速度均衡，1M 上下文
@@ -209,7 +210,11 @@ class GeminiRotator:
       RPM≤5/60s。"""
 
     def __init__(self, api_key, proxy, models, rpm=5, window=60, max_per_model=20, log=print,
-                 backoff_transient=60, backoff_429=300, backoff_dead=3600):
+                 backoff_transient=60, backoff_429=300, backoff_dead=3600,
+                 thinking_level=None):
+        # thinkingConfig 下发档位（读 config.summarize.thinking_level）；
+        # Gemini 4 默认 high thinking 会抽 2000+ 思考 token 吃光输出预算，必须显式 low。
+        self.thinking_level = thinking_level
         self.api_key = api_key
         self.proxies = {'http': proxy, 'https': proxy} if proxy else None
         self.models = models
@@ -244,10 +249,16 @@ class GeminiRotator:
     def _post(self, model, system_prompt, user_content):
         url = (f'https://generativelanguage.googleapis.com/v1beta/models/{model}'
                f':generateContent?key={self.api_key}')
+        gen_cfg = {'temperature': 0.3, 'maxOutputTokens': 8192}
+        # ★ 2026-11-22：Gemini 4 系列默认 high thinking，实测抽 2045 思考 token 后
+        # 输出预算耗尽 → 正文 0 字 MAX_TOKENS。仅对这些新模型显式下发 low 档，
+        # 老模型（3.x）不带此字段，保持原有行为零风险。
+        if model.startswith('gemini-4-') and self.thinking_level:
+            gen_cfg['thinkingConfig'] = {'thinkingLevel': self.thinking_level}
         payload = {
             'systemInstruction': {'parts': [{'text': system_prompt}]},
             'contents': [{'role': 'user', 'parts': [{'text': user_content}]}],
-            'generationConfig': {'temperature': 0.3, 'maxOutputTokens': 8192},
+            'generationConfig': gen_cfg,
         }
         headers = {'Content-Type': 'application/json'}
         # timeout=(连接, 读取)：连接阶段 20s 快速失败，避免代理不通时白等 5 分钟；

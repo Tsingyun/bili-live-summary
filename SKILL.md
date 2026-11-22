@@ -69,7 +69,7 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 - **bilibili**：B站兜底录播的处置（用户规则 2026-08-29）。`keep_mp4`（默认 `true`）= 跑完流程后**保留 B站录播的 MP4**，原样归档到「录播根目录/YYYY-MM-DD/」；`compress`（默认 `false`）= **不压缩**这类 MP4
 - **latest_mode.mode**：「最新录播」判定（见下）
 - **summarize**：`provider` / `model` / `api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
-  **首选 `provider:"google"`、`model:"gemini-3.8-flash"`**（见下「大模型调用约定」），勿默认用 `zhipu/glm`。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
+  **首选 `provider:"google"`、`model:"gemini-4-hydrogen"`（2026-11-22 升级）**（见下「大模型调用约定」），勿默认用 `zhipu/glm`。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
 - **output**：`doc_dir`、`doc_name_pattern`（支持 `{streamer}`/`{year}`/`{month}`）、`font`
 - **paths**：`project_root` / `python` / `ffmpeg` / `ffprobe` / `aria2c` / `cookies`
 - **transcribe / cleanup**：推理参数与产物清理
@@ -90,7 +90,7 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 ```json
 "summarize": {
   "provider": "google",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-4-hydrogen",
   "api_key": "<Google AI Studio / Gemini API Key>",
   "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
   "proxy": "http://127.0.0.1:7897",
@@ -104,12 +104,14 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 
 ### 模型轮换顺序（GeminiRotator）
 旁路重建 / 重跑脚本（`regen_gemini_v2.py`、`run_812.py`）使用 `GeminiRotator` 按下列顺序轮换，
-**首选 `gemini-3.8-flash`**（用户规则 2026-09-14：最新版 Flash 固定首位，其余按综合能力降序，
-权重 ① 文本总结 ② 推理 ③ 长上下文 ④ 响应速度），
+**首选 `gemini-4-hydrogen`**（2026-11-22 实测升级：Gemini 4 系列 11 月 GA，Hydrogen 为
+3.8-flash 继任者且唯一有免费层——Carbon/Neon/Argon 均无免费层、不收录；官方称比 3.8-flash
+快 2.5x / 幻觉 -80%。★ 该模型默认 high thinking 会抽 2000+ 思考 token 吃光输出预算，
+`regen_gemini_v2._post` 已对 `gemini-4-*` 强制下发 `thinkingConfig.low`，勿摘），
 遇 429（每日配额耗尽）/404（模型不可用）自动顺切下一档；每模型成功调用达 20 次也主动切下一档：
 
 ```
-gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
+gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
 → gemini-3-flash-preview → gemini-2.5-flash
 → gemini-3.5-flash-lite → gemini-3.1-flash-lite
 → gemini-flash-latest → gemini-flash-lite-latest
@@ -124,7 +126,12 @@ gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash → gemini-3.5-flash
 > 已排除"当日用完"，故不收录。末尾两个 `*-latest` 为滚动别名，作永不失效兜底。
 
 `MODELS` 常量定义在 `regen_gemini_v2.py`，`run_812.py` 直接复用 `R.MODELS`，两处同步生效。
-`config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-3.8-flash`。
+`config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-4-hydrogen`。
+
+> **2026-11-22 实测补充**：`GET /v1beta/models` 确认 Gemini 4 四款（carbon/neon/hydrogen/argon）均已 GA
+> 且支持 generateContent。**仅 Hydrogen 有免费层**；Carbon/Neon/Argon 需付费，免费 key 调用会失败，
+> 故不进链。新模型上线初期高峰实测 503/超时较频繁，属暂时性高需求——退避机制（503→60s）会
+> 自动降级到 3.8-flash，不影响出活，勿因偶发 503 摘掉 hydrogen。
 
 > 补充（2026-09-14 核对）：`daily_pipeline.py` 同样走 `R.GeminiRotator(R.MODELS, rpm=5,
 > max_per_model=20)`，**有自动轮换兜底**（此前本段称其"单模型、无兜底"，与代码不符已更正）。

@@ -62,7 +62,8 @@ MS_MODELS = {
 # 主用 = gemini-3.8-flash；任一 provider 整体故障时，另一 provider 仍能接管。
 # ---------------------------------------------------------------------------
 MODELS_MIXED = [
-    'gemini-3.8-flash',               # ① 主用：Gemini 最新最强 Flash
+    'gemini-4-hydrogen',              # ① 主用：3.8-flash 继任者（免费层/须 low thinking）
+    'gemini-3.8-flash',               # ② 上代主力：Gemini 最强 Flash
     'Qwen/Qwen3.5-397B-A17B',         # ② 备份1：魔搭最强开源 MoE，文风契约 100% 合规
     'Qwen/Qwen3.8-27B',               # ③ 备份2：Qwen3.8 中杯，实测段长合规 100%，与 ② 同级
     'gemini-3.7-flash',               # ④ 上代旗舰 Flash
@@ -193,11 +194,12 @@ class MultiProviderRotator(GeminiRotator):
                  gemini_rpm=5, ms_rpm=30, window=60,
                  max_per_model=20, ms_max_per_model=200,
                  backoff_transient=60, backoff_429=300, backoff_dead=3600,
-                 ms_max_tokens=8192, ms_timeout=(20, 600)):
+                 ms_max_tokens=8192, ms_timeout=(20, 600), thinking_level=None):
         super().__init__(gemini_key, proxy, models, rpm=gemini_rpm, window=window,
                          max_per_model=max_per_model, log=log,
                          backoff_transient=backoff_transient,
-                         backoff_429=backoff_429, backoff_dead=backoff_dead)
+                         backoff_429=backoff_429, backoff_dead=backoff_dead,
+                         thinking_level=thinking_level)
         self.ms_api_key = ms_api_key
         self.ms_rpm = ms_rpm
         self.ms_max_per_model = ms_max_per_model
@@ -334,14 +336,16 @@ def build_rotator(cfg, log=print):
     if not ms_key:
         log('  [Router] 未配置 ModelScope key，使用纯 Gemini 降级链（%d 模型）' % len(GEMINI_MODELS))
         return GeminiRotator(gkey, proxy, list(GEMINI_MODELS),
-                             rpm=5, window=60, max_per_model=20, log=log)
+                             rpm=5, window=60, max_per_model=20, log=log,
+                             thinking_level=s.get('thinking_level'))
 
     if not gkey:
         ms_only = [m for m in MODELS_MIXED if is_modelscope(m)]
         log('  [Router] 未配置 Gemini key，使用纯 ModelScope 降级链（%d 模型）' % len(ms_only))
         return MultiProviderRotator('', ms_key, proxy, ms_only, log=log,
                                     ms_max_per_model=int(s.get('modelscope_max_per_day', 200)),
-                                    ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)))
+                                    ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)),
+                                    thinking_level=s.get('thinking_level'))
 
     log('  [Router] 混合降级链就绪：Gemini %d + ModelScope %d，共 %d 模型'
         % (sum(1 for m in MODELS_MIXED if not is_modelscope(m)),
@@ -349,4 +353,5 @@ def build_rotator(cfg, log=print):
            len(MODELS_MIXED)))
     return MultiProviderRotator(gkey, ms_key, proxy, list(MODELS_MIXED), log=log,
                                 ms_max_per_model=int(s.get('modelscope_max_per_day', 200)),
-                                ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)))
+                                ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)),
+                                thinking_level=s.get('thinking_level'))

@@ -227,14 +227,17 @@ def t_h_build_rotator():
         cfg['summarize']['modelscope_api_key'] = 'mskey'
         rot2 = build_rotator(cfg, log=lambda *_: None)
         check('H2 有 MS key → MultiProviderRotator', isinstance(rot2, MultiProviderRotator))
-        check('H3 混合链首模型=主用 gemini-3.8-flash', rot2.models[0] == 'gemini-3.8-flash')
-        check('H4 第 2 位为魔搭备份', is_modelscope(rot2.models[1]))
+        check('H3 混合链首模型=主用 gemini-4-hydrogen（2026-11-22 升级）',
+              rot2.models[0] == 'gemini-4-hydrogen')
+        check('H4 第 2 位=gemini-3.8-flash 上代主力（2026-11-22 hydrogen 加入后顺延）',
+              rot2.models[1] == 'gemini-3.8-flash')
         # 快照式断言：链上增删模型时必须同步改这里，避免「改了链没验证」
-        check('H4b 第 3 位=Qwen3.8-27B（2026-11-08 提到 397B 之后）',
-              rot2.models[2] == 'Qwen/Qwen3.8-27B')
+        check('H4b 第 3 位=魔搭最强 Qwen3.5-397B（hydrogen 加入后顺延）',
+              is_modelscope(rot2.models[2]) and '397B' in rot2.models[2])
         check('H5 魔搭 8 模型在链（2026-11-08 收编 Qwen3.5-35B-A3B）',
               sum(1 for m in rot2.models if is_modelscope(m)) == 8)
-        check('H6 链长 18', len(rot2.models) == 18, len(rot2.models))
+        check('H6 链长 19（2026-11-22 加 gemini-4-hydrogen）',
+              len(rot2.models) == 19, len(rot2.models))
         check('H6b 快速兜底 Qwen3.5-35B-A3B 在链尾区',
               'Qwen/Qwen3.5-35B-A3B' in rot2.models[-3:])
         cfg2 = {'summarize': {'modelscope_api_key': 'mskey'}, '_workdir': '.'}
