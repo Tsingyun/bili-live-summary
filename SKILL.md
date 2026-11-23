@@ -179,6 +179,22 @@ gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash
 - 用户明确要求"本地优先"——本地有源时，rec 站只用于时长比对与完整性护栏，**不是默认取源**。
 - 完整性护栏（cover_ratio 0.8）与 5 分钟规则一致：本地差异 <5 分钟时覆盖率 ≈99%，护栏会判"完整"不下载，符合预期。
 
+**★ 确定性取源判定脚本 `scripts/source_decider.py`（2026-11-24 固化，定时任务必用）**
+
+上面的判断不要靠临场推理——直接跑脚本，它把用户规则写死：
+```
+python scripts/source_decider.py --config <cfg> --date YYYY-MM-DD --json
+# 退出码：0=LOCAL  2=DOWNLOAD  3=UNKNOWN
+```
+三条 DOWNLOAD 判据（任一命中即下录播站完整版，--no-pipeline 落位后再跑管线）：
+1. `no_local_source` —— 本地该日期无任何源片段（排除 `_merged`/`_compressed`）；
+2. `local_too_short` —— 本地合并时长 < rec 站同场跨度 − 5 分钟（`--max-diff-min` 可配）；
+3. `local_low_quality` —— 本地平均码率 < rec 站同场平均码率 × 0.6（`--quality-ratio` 可配）。这是用户 2026-11-24 新增规则：**本地只有低画质版本也要下完整版**。
+
+否则 LOCAL（用本地合并）；本地无源且 rec 站也查不到 → UNKNOWN（停播/站点不可达，不空跑）。`--self-test` 自带假数据回归。rec 站不可达但本地有源 → 判 LOCAL 不阻塞。
+
+**★ 自动入口（2026-11-24 切换）**：每日总结改由 **WorkBuddy 定时任务 `automation-1786280495470`（每日 04:00）** 驱动；Windows 计划任务 `BiliLiveSummary_Daily` / `BiliLiveSummary_Pending` 已全部 Disabled，**不要再启用**。定时任务会先跑 source_decider，再按 action 走下载或本地管线，长流程在同一回合阻塞跑完（会话结束会触发 Job Object 回收，导致半途而废）。
+
 ### 缺失录播自动检查 + 三级备份补档（2026-09-05 新增）
 
 **目标**：不漏任何一场直播。即使本地录制器没录上、或换机器没录，只要 rec.darkpy.cn 或 B站
