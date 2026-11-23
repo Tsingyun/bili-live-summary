@@ -193,7 +193,14 @@ python scripts/source_decider.py --config <cfg> --date YYYY-MM-DD --json
 
 否则 LOCAL（用本地合并）；本地无源且 rec 站也查不到 → UNKNOWN（停播/站点不可达，不空跑）。`--self-test` 自带假数据回归。rec 站不可达但本地有源 → 判 LOCAL 不阻塞。
 
-**★ 自动入口（2026-11-24 切换）**：每日总结改由 **WorkBuddy 定时任务 `automation-1786280495470`（每日 04:00）** 驱动；Windows 计划任务 `BiliLiveSummary_Daily` / `BiliLiveSummary_Pending` 已全部 Disabled，**不要再启用**。定时任务会先跑 source_decider，再按 action 走下载或本地管线，长流程在同一回合阻塞跑完（会话结束会触发 Job Object 回收，导致半途而废）。
+**★ 自动入口（2026-11-24 定稿，回退 WorkBuddy 定时任务）**：每日总结由 **Windows 计划任务 `BiliLiveSummary_Daily`（04:20 + 06:20 兜底）** 驱动，手动补跑走 `BiliLiveSummary_Pending`；WorkBuddy 定时任务 `automation-1786280495470` 已 **PAUSED，不要再启用**。理由：会话内长流程会被 Job Object 回收，计划任务由 Task Scheduler 服务拉起、不受会话生命周期影响，更可靠；且计划任务经 silent vbs（WindowStyle 0）+ venv `sitecustomize.py`（CREATE_NO_WINDOW）双重保证**零命令行弹窗**。
+
+**★ 取源规则已接进计划任务入口 `scripts/run_scheduled.py`（2026-11-24）**：不再只在 WorkBuddy prompt 里靠 agent 临场执行。`run_scheduled.py` 在跑 `daily_pipeline` 前新增「步骤 0 实时取源决策」：
+- 调 `source_decider.decide()` 判定目标日期（默认昨天，可用 `-- --date YYYY-MM-DD` 指定）；
+- `DOWNLOAD` → 本地有残缺/低画质源先 `completeness_guard.repair_incomplete_session()` 隔离（**绝不删**）再下完整版，本地无源则直接 `rec_fetch_date.fetch_date(no_pipeline=True)` 落位；落位成功后才跑管线，三层判据真正生效；
+- `UNKNOWN`（停播）→ 不下载、不空跑，正常退出；
+- `FAILED`（补档失败）→ 阻断本轮、不写日级守卫 → 06:20 兜底自动重试。
+- 验证用：`python run_scheduled.py --source-only [-- --date YYYY-MM-DD]` 只打印决策、不下载不跑管线。
 
 ### 缺失录播自动检查 + 三级备份补档（2026-09-05 新增）
 

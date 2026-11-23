@@ -99,12 +99,94 @@ def _guard_done_today(path):
         return False
 
 
+def _resolve_target_date(extra):
+    """目标直播日期：优先 extra 里的 --date，否则默认昨天（跨午夜归开播日）。"""
+    for i, a in enumerate(extra):
+        if a == '--date' and i + 1 < len(extra):
+            return extra[i + 1]
+    return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+
+def _make_plog(lf):
+    """构造同时写日志文件 + stdout 的 logger（供决策器/护栏复用）。"""
+    def plog(m, lv='INFO'):
+        line = '[%s] %s' % (lv, m)
+        try:
+            lf.write(line + '\n')
+            lf.flush()
+        except Exception:
+            pass
+        print(line)
+    return plog
+
+
+def _load_cfg(workdir):
+    import common
+    cfg_path = os.path.join(workdir, 'config.json')
+    cfg = common.load_config(cfg_path)
+    cfg['_workdir'] = workdir
+    cfg['_config_path'] = cfg_path
+    return cfg
+
+
+def _source_only(workdir, extra):
+    """只做实时取源决策并打印，供自测验证（不下载、不跑管线、不写结果）。"""
+    cfg = _load_cfg(workdir)
+    ymd = _resolve_target_date(extra)
+    import source_decider as SD
+    d = SD.decide(cfg, ymd)
+    print('[source_only] 目标日期 %s' % ymd)
+    print('[source_only] 决策 %s  (%s)' % (d['action'], d['reason']))
+    print('[source_only] 依据 %s' % d['detail'])
+    print(json.dumps(d, ensure_ascii=False, indent=2))
+
+
+def _preflight_source(cfg, workdir, ymd, log):
+    """实时取源决策 + 必要时下完整版落位。返回 decision dict（action 可能是 FAILED）。"""
+    import source_decider as SD
+    decision = SD.decide(cfg, ymd, log=log)
+    log('[取源] %s → %s（%s）' % (ymd, decision['action'], decision['detail']))
+    if decision['action'] != 'DOWNLOAD':
+        return decision
+
+    fnames = (decision.get('evidence') or {}).get('local_files') or []
+    root = (cfg.get('local') or {}).get('root')
+    paths = [os.path.join(root, f) for f in fnames] if root else []
+    paths = [p for p in paths if os.path.exists(p)]
+
+    if paths:
+        # 本地残缺/低画质 → 隔离（绝不删）→ 下完整版 → 失败自动回滚
+        import completeness_guard as CG
+        lv = datetime.date.fromisoformat(ymd)
+        rep = CG.repair_incomplete_session(cfg, log, lv, paths, workdir=workdir)
+        decision['repair'] = rep
+        if not rep.get('ok'):
+            decision['action'] = 'FAILED'
+            decision['detail'] = rep.get('reason') or '隔离重拉失败'
+    else:
+        # 本地无源 → 直接下完整版落位
+        import rec_fetch_date as RF
+        gap = int((cfg.get('darkpy') or {}).get('max_gap_sec', 1800))
+        try:
+            rc = RF.fetch_date(cfg, log, ymd, gap, 0, no_pipeline=True)
+            decision['fetch_rc'] = rc
+            if rc != 0:
+                decision['action'] = 'FAILED'
+                decision['detail'] = '录播站下载落位失败 rc=%s' % rc
+        except Exception as e:
+            decision['action'] = 'FAILED'
+            decision['detail'] = '录播站下载异常：%s' % e
+    return decision
+
+
 def main():
     ap = argparse.ArgumentParser(description='耐久执行入口（供 Windows 计划任务调用）')
     ap.add_argument('--workdir', default=None)
     ap.add_argument('--attempts', type=int, default=2, help='最多尝试次数（幂等，重跑即续做）')
     ap.add_argument('--max-minutes', type=int, default=240, help='单次最长执行时间（分钟）')
     ap.add_argument('--status', action='store_true', help='只打印上次运行结果')
+    ap.add_argument('--source-only', action='store_true',
+                    help='只做取源决策并打印（不下载/不跑管线/不写结果），用于自测验证')
     ap.add_argument('extra', nargs='*', help="透传给 daily_pipeline 的参数（放在 -- 之后）")
     args = ap.parse_args()
 
@@ -139,6 +221,11 @@ def main():
     extra = [a for a in args.extra if a != '--']
     force = '--force' in extra
     extra = [a for a in extra if a != '--force']
+
+    if args.source_only:
+        _source_only(workdir, extra)
+        return 0
+
     if not force and _guard_done_today(guard_path):
         msg = ('[run_scheduled] 今天已成功跑过一轮（daily_run_guard），本次跳过'
                '——避免 04:20/06:20 双触发器重复运行；-- --force 可强制')
@@ -153,6 +240,39 @@ def main():
     plan = [sys.executable, '-u', PIPELINE, '--workdir', workdir]
     if extra:
         plan += extra
+
+    # ---- 步骤 0：实时取源决策（用户规则 2026-11-24）----
+    # 本地无源 / 缺>5 分钟 / 只有低画质 → 立即下完整版（隔离残缺源，绝不删）
+    # 再合并总结。决策器每次实时扫描，绝不沿用旧观察。
+    # 下载只做一次（幂等），放在重试循环外；失败不写日级守卫 → 06:20 兜底重跑。
+    ymd = _resolve_target_date(extra)
+    try:
+        with open(log_path, 'a', encoding='utf-8', errors='replace') as lf:
+            plog = _make_plog(lf)
+            plog('[run_scheduled] 步骤0 取源决策，目标日期 %s' % ymd)
+            cfg = _load_cfg(workdir)
+            decision = _preflight_source(cfg, workdir, ymd, plog)
+    except Exception as e:
+        print('[run_scheduled] 取源决策异常：%s' % e)
+        decision = {'action': 'FAILED', 'reason': 'preflight_exception',
+                    'detail': str(e)}
+
+    if decision.get('action') == 'UNKNOWN':
+        # 本地无源且 rec 站无场次（可能停播）：不下载、不空跑管线
+        print('[run_scheduled] %s' % decision.get('detail'))
+        _write_outcome(outcome_path, {'skipped': True, 'reason': 'no_session',
+                                      'date': ymd, 'decision': decision,
+                                      'at': _now()})
+        return 0
+
+    if decision.get('action') == 'FAILED':
+        # 补档失败：阻断本轮（不写日级守卫），让 06:20 兜底重试
+        print('[run_scheduled] 取源补档失败，阻断本轮：%s' % decision.get('detail'))
+        _write_outcome(outcome_path, {'ok': False, 'reason': 'source_refetch_failed',
+                                      'date': ymd, 'decision': decision,
+                                      'errors_tail': tail(os.path.join(logs, 'errors.log'), 20),
+                                      'at': _now()})
+        return 1
 
     attempts, rc, t_start = max(1, args.attempts), 1, time.time()
     for attempt in range(1, attempts + 1):
