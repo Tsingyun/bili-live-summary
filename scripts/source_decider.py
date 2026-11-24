@@ -118,6 +118,24 @@ def probe_local(cfg, files, log=_lognoop):
             'resolution': resolution, 'n': len(files)}
 
 
+def _size_to_bytes(f):
+    """把 rec 站文件条目体积换算成字节，兼容 size_gb 数值与 '639.2MB' 带单位字符串。"""
+    sg = f.get('size_gb')
+    if sg not in (None, ''):
+        try:
+            return float(sg) * 1024 ** 3
+        except (TypeError, ValueError):
+            pass
+    s = str(f.get('size') or '').strip().upper().replace(',', '')
+    m = re.match(r'^([\d.]+)\s*(GB|MB|KB|B)?$', s)
+    if m:
+        num = float(m.group(1))
+        unit = m.group(2) or 'MB'
+        return num * {'GB': 1024 ** 3, 'MB': 1024 ** 2,
+                      'KB': 1024, 'B': 1}[unit]
+    return 0.0
+
+
 def rec_span_and_bytes(cfg, ymd, log=_lognoop):
     """查 rec 站该日期场次：合计跨度（秒）+ 合计体积（字节）。不可达返回 None。"""
     try:
@@ -141,7 +159,7 @@ def rec_span_and_bytes(cfg, ymd, log=_lognoop):
                 key = f.get('name')
                 if key and key not in used:
                     used.add(key)
-                    nbytes += int(float(f.get('size') or 0) * 1024 * 1024) if 'MB' in str(f.get('size', '')) else int(float(f.get('size_gb') or 0) * 1024 ** 3)
+                    nbytes += _size_to_bytes(f)
         return {'span': span, 'bytes': nbytes, 'n_sessions': len(sessions)}
     except Exception as e:
         log('  [decider] rec 站查询异常：%s' % e, 'WARN')
