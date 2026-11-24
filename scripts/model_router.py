@@ -114,6 +114,11 @@ def provider_of(model):
     return 'modelscope' if is_modelscope(model) else 'gemini'
 
 
+# 2026-11-25 用户规则：Gemini 调用频繁失败，放弃 Gemini，生产链直接从 Qwen 起步。
+# MODELS_MIXED 保留为 use_gemini=true 时的兼容/回退链，不再是生产默认。
+MODELS_MS_ONLY = [m for m in MODELS_MIXED if is_modelscope(m)]
+
+
 # ---------------------------------------------------------------------------
 # 提示词：每个模型的提示词 = 「主系统指令（prompt_original.txt，权威文风规范）」
 #   + 「该 provider 的补充输出指令」。
@@ -315,8 +320,9 @@ class MultiProviderRotator(GeminiRotator):
 
 def build_rotator(cfg, log=print):
     """按配置构造总结用的模型路由器（daily_pipeline 唯一入口）。
-    · 配置了 ModelScope key（env MODELSCOPE_API_KEY 或 config.summarize.modelscope_api_key）
-      → 返回混合链 MODELS_MIXED。
+    · summarize.use_gemini=false（2026-11-25 生产默认）→ 只返回魔搭链 MODELS_MS_ONLY，
+      链首 Qwen3.5-397B，不再发起任何 Gemini 请求。
+    · use_gemini=true 且配置了 ModelScope key → 返回历史混合链 MODELS_MIXED（仅兼容/回退）。
     · 未配置 → 自动退化为纯 GeminiRotator（与旧行为完全一致）。
     · Gemini 与 ModelScope 都没有 key → 抛错（调用方按原有失败路径处理）。
     本函数永不因「部分配置缺失」而失败：缺什么就退化为只用另一条链。
@@ -324,14 +330,25 @@ def build_rotator(cfg, log=print):
     s = cfg.get('summarize') or {}
     proxy = s.get('proxy') or PROXY
     ms_key = get_ms_api_key(cfg) if s.get('modelscope_enabled', True) else ''
+    use_gemini = s.get('use_gemini', True)
     try:
-        gkey = R.get_api_key(cfg)
+        gkey = R.get_api_key(cfg) if use_gemini else ''
     except RuntimeError:
         gkey = ''
     if not gkey and not ms_key:
         raise RuntimeError('缺少模型 API Key：请配置 Gemini（GEMINI_API_KEY / '
                            'config.summarize.api_key）或 ModelScope（MODELSCOPE_API_KEY / '
                            'config.summarize.modelscope_api_key）至少其一')
+
+    # ★ 2026-11-25：生产默认不走 Gemini。显式 use_gemini=false 时即使 config 里
+    #   留着 Gemini key 也不用，避免任何请求打到 generativelanguage.googleapis.com。
+    if not use_gemini:
+        log('  [Router] Qwen/魔搭专用降级链就绪：%d 模型（Gemini 已停用）'
+            % len(MODELS_MS_ONLY))
+        return MultiProviderRotator('', ms_key, proxy, list(MODELS_MS_ONLY), log=log,
+                                    ms_max_per_model=int(s.get('modelscope_max_per_day', 200)),
+                                    ms_max_tokens=int(s.get('modelscope_max_tokens', 8192)),
+                                    thinking_level=s.get('thinking_level'))
 
     if not ms_key:
         log('  [Router] 未配置 ModelScope key，使用纯 Gemini 降级链（%d 模型）' % len(GEMINI_MODELS))

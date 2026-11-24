@@ -137,6 +137,105 @@ def _apply_mtime(path, end_dt, log, min_age=DEFAULT_MIN_AGE_SEC):
 
 
 # --------------------------------------------------------------------------- 主流程
+def _download_session(cfg, log, work, session):
+    """按 session 原序下载全部分段，返回 (flv_paths, 0/3)。
+
+    ★ 2026-11-25 P0-1：原逐段串行下载一场 7 段耗时约 47 分钟，是整套流程最大
+    瓶颈之一。改为受控并行（darkpy.parallel_downloads，默认 3 路）：
+      · download_one 自带的断点续传 / Range 校验 / 重试是按「文件名 + .part」独立的，
+        各段路径互不重叠，并发不改变任何落位与完整性语义；
+      · 返回列表严格按 session 顺序，后续 concat 合并依赖该顺序；
+      · 任一段失败立即返回 rc=3，已下完的分片保留，便于下次断点续传。
+    """
+    npar = max(1, min(int((cfg.get("darkpy") or {}).get("parallel_downloads", 3)),
+                      len(session) or 1))
+    log("分段下载并发度：%d（darkpy.parallel_downloads 可调；1=旧串行）" % npar)
+    _thread_log = log
+
+    def _one(f):
+        dest = os.path.join(work, f["name"])
+        t0 = time.time()
+        got = D.download_one(cfg, _thread_log, f["name"], dest,
+                             expect_bytes=int(f.get("size_gb", 0) * 1024 ** 3))
+        return f["name"], got, time.time() - t0
+
+    def _validate(f, got, sec):
+        if not got:
+            log("下载失败：%s" % f["name"], "ERROR")
+            return None
+        real = os.path.getsize(got)
+        exp = _bytes_of(f.get("size"))
+        ok_size = (exp == 0) or (real >= exp * 0.90)
+        log("  %s %s  本地 %.2f GB / 列表 %.2f GB  (%.0fs)"
+            % ("✓" if ok_size else "✗", f["name"], real / 1024.0 ** 3,
+               exp / 1024.0 ** 3, sec))
+        if not ok_size:
+            log("  文件大小明显偏小，可能存在截断，终止", "ERROR")
+            return None
+        return got
+
+    flv_paths = []
+    if npar <= 1:
+        for f in session:
+            _name, got, sec = _one(f)
+            ok = _validate(f, got, sec)
+            if not ok:
+                return [], 3
+            flv_paths.append(ok)
+        return flv_paths, 0
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _log_lock = threading.Lock()
+
+    class _SyncLog:
+        """并行下载日志串行化，避免两段的日志行交错写坏同一行。"""
+
+        def __call__(self, msg, level='INFO'):
+            with _log_lock:
+                return log(msg, level)
+
+        def error(self, msg):
+            with _log_lock:
+                return log.error(msg)
+
+        def info(self, msg):
+            with _log_lock:
+                return log.info(msg)
+
+        def warning(self, msg):
+            with _log_lock:
+                return log.warning(msg)
+
+        warn = warning
+
+        def debug(self, msg):
+            with _log_lock:
+                return log.debug(msg)
+
+    _thread_log = _SyncLog()
+    got_map = {}
+    t_all = time.time()
+    with ThreadPoolExecutor(max_workers=npar) as pool:
+        futures = [pool.submit(_one, f) for f in session]
+        for fu in as_completed(futures):
+            try:
+                name, got, sec = fu.result()
+            except Exception as e:
+                log("并行下载线程异常：%s" % e, "ERROR")
+                return [], 3
+            got_map[name] = (got, sec)
+    log("并行下载完成：%d 段 / %.0fs" % (len(session), time.time() - t_all))
+    for f in session:
+        got, sec = got_map.get(f["name"], (None, 0))
+        ok = _validate(f, got, sec)
+        if not ok:
+            return [], 3
+        flv_paths.append(ok)
+    return flv_paths, 0
+
+
 def fetch_date(cfg, log, ymd, gap, session_idx, dry_run=False,
                keep_intermediate=False, no_pipeline=False,
                pipeline_timeout=6 * 3600, min_age=DEFAULT_MIN_AGE_SEC):
@@ -186,26 +285,10 @@ def fetch_date(cfg, log, ymd, gap, session_idx, dry_run=False,
         log("--dry-run：不下不载，到此为止")
         return 0
 
-    # ---- ③ 逐段下载 ----
-    flv_paths = []
-    for f in session:
-        dest = os.path.join(work, f["name"])
-        t0 = time.time()
-        got = D.download_one(cfg, log, f["name"], dest,
-                            expect_bytes=int(f.get("size_gb", 0) * 1024 ** 3))
-        if not got:
-            log("下载失败：%s" % f["name"], "ERROR")
-            return 3
-        real = os.path.getsize(got)
-        exp = _bytes_of(f.get("size"))
-        ok_size = (exp == 0) or (real >= exp * 0.90)
-        log("  %s %s  本地 %.2f GB / 列表 %.2f GB  (%.0fs)"
-            % ("✓" if ok_size else "✗", f["name"], real / 1024.0 ** 3,
-               exp / 1024.0 ** 3, time.time() - t0))
-        if not ok_size:
-            log("  文件大小明显偏小，可能存在截断，终止", "ERROR")
-            return 3
-        flv_paths.append(got)
+    # ---- ③ 分段下载（受控并行；flv_paths 保持 session 原序）----
+    flv_paths, rc = _download_session(cfg, log, work, session)
+    if rc:
+        return rc
 
     # ---- ④ 逐段可打开性 ----
     seg_durs = []

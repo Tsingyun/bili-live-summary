@@ -90,6 +90,12 @@ def is_meaningful(t):
 
 def load_model(cfg, log):
     torch = init_torch(log)
+    # ★ 2026-11-25 P0-2：固定 CPU 线程数，避免 PyTorch 按机器核数自起线程
+    #   造成不同场次间推理速度大幅波动（与 ncpu 配置保持一致）。
+    try:
+        torch.set_num_threads(max(1, int(cfg['transcribe'].get('ncpu', 4))))
+    except Exception:
+        pass
     want = cfg['transcribe'].get('device', 'auto')
     if want == 'cpu':
         device = 'cpu'
@@ -218,15 +224,22 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
         wav, sr = sf.read(audio_path, dtype='float32')
         out = []
         kind = getattr(model, '_asr_kind', 'sensevoice')
-        for (s_ms, e_ms) in raw:
-            s = int(s_ms / 1000.0 * sr)
-            e = int(e_ms / 1000.0 * sr)
-            if e <= s:
-                continue
-            slice_w = wav[s:e]
+
+        def _emit(s_ms, e_ms, txt):
+            if not txt:
+                return
+            events = TAG_RE.findall(txt) if kind != 'nano' else ()
+            ct = clean_text(txt)
+            if not is_meaningful(ct) or is_junk(ct, events):
+                return
+            st = s_ms / 1000.0 + offset_sec
+            en = e_ms / 1000.0 + offset_sec
+            out.append((st, max(en, st + 0.5), ct))
+
+        def _one_text(slice_w):
+            """旧逐段调用：SenseVoice 路径 + 批量失败时的安全兜底。"""
             try:
                 if kind == 'nano':
-                    # Nano：language="中文" + itn=True；原生不带 <|...|> 标签，无需剥离
                     r = model.generate(input=slice_w, cache={}, language='中文',
                                        itn=True, batch_size=1)
                 else:
@@ -235,15 +248,12 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
                                        ncpu=cfg['transcribe'].get('ncpu', 4),
                                        merge_vad=True, merge_length_s=15)
                 # ★ 2026-10-27：Nano 对个别切片（极短/边界段）会返回空列表而非异常，
-                #   直接 r[0] 会 IndexError 被外层 except 吞掉 → 该段静默丢失。判空后跳过，
-                #   既不再崩溃，也避免误吞真实失败（这类切片多为无语音静音段，丢弃无害）。
+                #   判空后跳过，避免静默丢失的异常被误当成真实失败。
                 if not r:
-                    continue
+                    return ''
                 if kind == 'nano':
-                    raw_text = r[0].get('text', '') or ''
-                else:
-                    raw_text = _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '')
-                txt = raw_text.strip()
+                    return (r[0].get('text', '') or '').strip()
+                return _re.sub(r'<\|[^|]+\|>', '', r[0].get('text', '') or '').strip()
             except Exception as e:
                 # 逐段 ASR 异常不再静默吞掉：前 3 次打印，便于排查（曾因 Nano 未带
                 # vad_model 导致 generate(numpy) 全段失败、整场 0 句却无报错）
@@ -253,16 +263,71 @@ def _vad_fallback(model, audio_path, cfg, offset_sec, log):
                         _vad_fallback._errs += 1
                     except Exception:
                         pass
+                return ''
+
+        def _batch_texts(items):
+            """Nano 批量：一次 generate(list) → FunASR 内部按 batch_size_s 动态组批。
+
+            结果按输入顺序一一对应（inference_with_vad 的 results_ret_list 按 sample
+            顺序 append，空语音也会返回一个 text='' 的占位），可直接 zip 回原时间段。
+            返回数量不符或抛异常时无条件回退逐段，绝不丢段。
+            """
+            try:
+                rr = model.generate(input=[it[2] for it in items], cache={},
+                                    language='中文', itn=True,
+                                    batch_size_s=batch_sec,
+                                    batch_size_threshold_s=60,
+                                    disable_pbar=True)
+                if rr is None or len(rr) != len(items):
+                    raise ValueError('批量返回数量 %s != 输入 %d'
+                                     % (len(rr) if rr is not None else 'None', len(items)))
+                return [((x or {}).get('text', '') or '').strip() for x in rr]
+            except Exception as e:
+                if log:
+                    try:
+                        log(f'  批量 ASR 失败，回退逐段：{type(e).__name__}: {e}', 'WARN')
+                    except Exception:
+                        pass
+                return [_one_text(it[2]) for it in items]
+
+        # ★ 2026-11-25 P0-2：实测同样约 4000 个 VAD 段，耗时 3043s(6.8x) 与
+        #   1637s(13.6x) 相差近 2 倍，根因是逐段 generate 的固定开销被段数放大。
+        #   把若干段打包成一次 generate(list)，由 FunASR 内部动态组批摊薄固定开销，
+        #   既提速也把耗时从「随段数波动」压回「随音频时长稳定增长」。
+        batch_sec = float(cfg['transcribe'].get('asr_batch_size_s', 120) or 0)
+        use_batch = kind == 'nano' and batch_sec > 0
+        items, cur_sec, nbatch = [], 0.0, 0
+        t_batch = time.time()
+        for (s_ms, e_ms) in raw:
+            s = int(s_ms / 1000.0 * sr)
+            e = int(e_ms / 1000.0 * sr)
+            if e <= s:
                 continue
-            if not txt:
+            seg_sec = (e - s) / float(sr)
+            item = (s_ms, e_ms, wav[s:e])
+            if not use_batch:
+                _emit(s_ms, e_ms, _one_text(item[2]))
                 continue
-            events = TAG_RE.findall(txt) if kind != 'nano' else ()
-            ct = clean_text(txt)
-            if not is_meaningful(ct) or is_junk(ct, events):
-                continue
-            st = s_ms / 1000.0 + offset_sec
-            en = e_ms / 1000.0 + offset_sec
-            out.append((st, max(en, st + 0.5), ct))
+            # 按累计音频秒数打批；单批最多 64 段、目标 batch_sec 秒，控制显存峰值
+            if items and (cur_sec + seg_sec > batch_sec or len(items) >= 64):
+                for (a, b, _w), txt in zip(items, _batch_texts(items)):
+                    _emit(a, b, txt)
+                nbatch += 1
+                items, cur_sec = [], 0.0
+            items.append(item)
+            cur_sec += seg_sec
+        if items:
+            texts = _batch_texts(items) if use_batch else [_one_text(it[2]) for it in items]
+            for (a, b, _w), txt in zip(items, texts):
+                _emit(a, b, txt)
+            if use_batch:
+                nbatch += 1
+        if use_batch and log:
+            try:
+                log(f'  ASR 批量推理：{len(raw)} 段 → {nbatch} 批'
+                    f'（目标 {batch_sec:.0f}s/批），耗时 {time.time() - t_batch:.0f}s')
+            except Exception:
+                pass
         if log:
             try:
                 log(f'VAD 回退产出 {len(out)} 句')

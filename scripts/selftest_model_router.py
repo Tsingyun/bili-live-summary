@@ -247,6 +247,24 @@ def t_h_build_rotator():
         check('H7b 纯魔搭链 8 模型', len(rot3.models) == 8, len(rot3.models))
         check('H8 MS_MODELS 覆盖链上全部魔搭模型',
               all(m in MS_MODELS for m in rot2.models if is_modelscope(m)))
+        # ★ 2026-11-25 新规则：use_gemini=false → 链上零 Gemini，从 Qwen 起步
+        cfg['summarize']['use_gemini'] = False
+        rot4 = build_rotator(cfg, log=lambda *_: None)
+        check('H9 use_gemini=false → 全魔搭链', isinstance(rot4, MultiProviderRotator)
+              and all(is_modelscope(m) for m in rot4.models))
+        check('H10 Qwen-only 链首=Qwen3.5-397B',
+              rot4.models[0] == 'Qwen/Qwen3.5-397B-A17B', rot4.models[:2])
+        check('H11 Qwen-only 链长 8', len(rot4.models) == 8, len(rot4.models))
+        check('H12 Qwen-only 无任何 Gemini 模型',
+              not any(not is_modelscope(m) for m in rot4.models))
+        check('H13 Qwen-only 链尾=Qwen3.5-35B-A3B',
+              rot4.models[-1] == 'Qwen/Qwen3.5-35B-A3B')
+        cfg['summarize'].pop('modelscope_api_key')
+        try:
+            build_rotator(cfg, log=lambda *_: None)
+            check('H14 禁用 Gemini 且无 MS key → 显式报错', False)
+        except RuntimeError:
+            check('H14 禁用 Gemini 且无 MS key → 显式报错', True)
     finally:
         if old is not None:
             os.environ['MODELSCOPE_API_KEY'] = old

@@ -23,8 +23,10 @@
     "path": ""
   },
   "summarize": {
-    "provider": "google",
-    "model": "gemini-4-hydrogen",
+    "_comment_20261125": "★ 默认不走 Gemini（调用频繁失败）：use_gemini=false → 魔搭纯 Qwen 链链首起步。需要回退历史混合链时改 true 并配 Gemini key。",
+    "provider": "modelscope",
+    "model": "Qwen/Qwen3.5-397B-A17B",
+    "use_gemini": false,
     "api_key": "",
     "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
     "proxy": "http://127.0.0.1:7897",
@@ -64,6 +66,8 @@
     "device": "auto",
     "batch_size_s": 300,
     "ncpu": 4,
+    "_comment_asr_batch": "★ VAD 段批量送 Nano（目标 120s 音频/批，内部动态组批）；0=退回逐段。仅 Nano 生效。",
+    "asr_batch_size_s": 120,
     "_comment": "chunk_hours_threshold: 超过此时长强制按 chunk_minutes 切块后再转写。经验值 2h：FunASR VAD 回退在 3h+ 单文件上出现过只返回前 2h48m 的截断，切 30min 块可彻底规避。",
     "chunk_hours_threshold": 2,
     "chunk_minutes": 30,
@@ -165,6 +169,8 @@
     "min_session_sec": 600,
     "timeout": 30,
     "retries": 3,
+    "_comment_parallel": "★ rec 分段下载并发度（2026-11-25）：默认 3；download_one 分段独立、断点续传语义不变，1=串行。",
+    "parallel_downloads": 3,
     "work_dir": "",
     "keep_flv_after_merge": false
   },

@@ -63,16 +63,16 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 ## 配置要点（config.json，位于工作目录根）
 - **series**：合集 mid / series_id / url（B站兜底用）
 - **local**：`root` = 本地录制根目录（flv/mp4 直接放这，不在日期子目录）；`name_regex` 留空用默认（`录制-<UID>-<YYYYMMDD>-<HHMMSS>-<序号>-<标题>.<ext>`），自定义须含命名组 `date(YYYYMMDD)`/`time(HHMMSS)`/`title`
-- **darkpy**（可选，第二备份源 rec.darkpy.cn）：`enabled` / `host` / `port`(5144 页面) / `file_port`(5143 文件) / `room_dir`(rec站目录名，一般 `<uid>-主播名`) / `max_gap_sec`(段归组间隙) / `min_session_sec`(不完整阈值) / `work_dir`(下载临时目录)。未配 `room_dir` 时该源自动跳过。
+- **darkpy**（可选，第二备份源 rec.darkpy.cn）：`enabled` / `host` / `port`(5144 页面) / `file_port`(5143 文件) / `room_dir`(rec站目录名，一般 `<uid>-主播名`) / `max_gap_sec`(段归组间隙) / `min_session_sec`(不完整阈值) / `work_dir`(下载临时目录) / `parallel_downloads`(分段下载并发度，默认 3；设 1=旧串行，自动不超过段数)。2026-11-25 P0-1：原 7 段串行约 47min，现默认 3 路并发，断点续传/Range 校验/返回顺序均不变。未配 `room_dir` 时该源自动跳过。
 - **backfill**：缺失检查/补档窗口与阈值：`enabled` / `start_date`(留空=用 `latest_mode.since_live_date`) / `end_date`(留空=今天) / `max_dates_per_run` / `min_cover_video_mb`(本地文件小于此值视为不完整)。
 - **live_calendar**：实际开播日期日历：`sources`(默认 `["darkpy","local","bilibili"]`) / `danmakus_api`(可插拔，默认空则跳过 danmakus) / `uid`。
 - **bilibili**：B站兜底录播的处置（用户规则 2026-08-29）。`keep_mp4`（默认 `true`）= 跑完流程后**保留 B站录播的 MP4**，原样归档到「录播根目录/YYYY-MM-DD/」；`compress`（默认 `false`）= **不压缩**这类 MP4
 - **latest_mode.mode**：「最新录播」判定（见下）
-- **summarize**：`provider` / `model` / `api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
-  **首选 `provider:"google"`、`model:"gemini-4-hydrogen"`（2026-11-22 升级）**（见下「大模型调用约定」），勿默认用 `zhipu/glm`。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
+- **summarize**：`provider` / `model` / `use_gemini` / `modelscope_api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
+  **2026-11-25 起 `provider:"modelscope"`、`model:"Qwen/Qwen3.5-397B-A17B"`、`use_gemini:false`**（见下「大模型调用约定」）；Gemini 调用经常失败，已放弃，勿在生产配置里重新启用。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
 - **output**：`doc_dir`、`doc_name_pattern`（支持 `{streamer}`/`{year}`/`{month}`）、`font`
 - **paths**：`project_root` / `python` / `ffmpeg` / `ffprobe` / `aria2c` / `cookies`
-- **transcribe / cleanup**：推理参数与产物清理
+- **transcribe / cleanup**：推理参数与产物清理。`transcribe.asr_batch_size_s`（默认 120）= 2026-11-25 P0-2：VAD 段按目标音频秒数打包成一次 `generate(list)`，由 FunASR 内部动态组批，压平实测 5.5x~13.6x 耗时波动；0=退回逐段（仅 Nano 生效，SenseVoice 保持逐段）。批量返回数量不符/抛异常会自动整批回退逐段，绝不丢段。
 - **hotwords**：转写后自动纠正（**固定流程「转写→热词→总结」的中间一环，勿跳过**）。`enabled:true` 时解析 `path`（默认用 skill 自带空模板 `SKILL_DIR/scripts/hotwords.md`）里的替换表，对 TXT/SRT 各做一遍替换再送 AI；`enabled:false` 关闭；`path` 可指向工作目录下的自定义替换表（相对路径以 WORKDIR 为基准）。改表立刻生效；改完用 `python scripts/hotwords.py --audit` 自检。
 - **标点清洗（冗余双标点）**：FunASR 的 VAD 分段兜底会在转写里叠出 `。，` `？，` `，。` `。？` 这类"句末终结符+句内连接符相邻"的冗余双标点。脚本在**写出 TXT/SRT 前**（`clean_segment_boundaries`）与**写 Word 前**（`clean_punctuation`，覆盖每块总结与概要）两处自动清洗——纯纠错不改语义，无需手动干预。若日后发现新双标点模式，改 `common.py` 的 `_RE_TERMINAL_CONN / _RE_CONN_TERMINAL` 即可。
 - **数字归一（规格数字中文读法→阿拉伯）**：FunASR 常把规格数字读成中文（`三零五零显卡`→`3050显卡`、`七十五赫兹`→`75Hz`、`八G`→`8G`）。脚本在**写出 TXT/SRT 前**（`normalize_numbers`）与**写 Word 前**（每块总结+概要各再做一遍）两处把"紧邻规格单位（显卡/GPU/Hz/赫兹/G/GB/寸/英寸/K/p/ti 等）的中国数字"转回阿拉伯，**仅对紧邻规格单位的读数生效，普通计数不动**，已是阿拉伯的文本幂等不受影响。若日后要增删单位，改 `common.py` 的 `_NUM_TRIGGERS` 即可。
@@ -82,18 +82,20 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
   - **是否删除原视频**由 `compress.replace_original` 控制（**本地录播与 rec站补档**）：`true` 时压缩成功且 ffprobe 校验通过后**一律直接永久删除原视频**（省空间，不进回收站/不备份/无需确认；`replace_mode` 已统一为 `delete`，用户 2026-08-28 选定，旧版 `recycle` 分支已废弃——本机回收站会堆积导致磁盘爆满）。设为 `false` 则只生成 `_compressed` 副本、保留原始。压缩失败都不会动原文件。幂等：目标已存在则跳过。rec站补档的源视频位于工作目录 `_darkpy/` 临时区，压缩成功后被同样规则删除（省盘），压缩失败则保留供下次续压。
   - **B站兜底录播：不压缩、保留 MP4**（用户规则 2026-08-29）：本地/rec站都没有当天录播而 B站有时，跑完流程后要留下 B站录播的 MP4。由 `bilibili.keep_mp4`（默认 `true`，归档到「录播根目录/YYYY-MM-DD/」）与 `bilibili.compress`（默认 `false`）控制。
 
-## 大模型调用约定（首选 Google / Gemini）
+## 大模型调用约定（Qwen 优先，Gemini 已停用）
 
-**默认且首选 Google Gemini API**，不要默认用 zhipu/glm 等其它 provider。
+★ **2026-11-25 用户规则**：Gemini 调用经常失败，**放弃 Gemini，生产链直接从 Qwen（魔搭）起步**。
+`build_rotator()` 见 `summarize.use_gemini=false` 时只返回 `MODELS_MS_ONLY`（8 个魔搭模型，链首 `Qwen/Qwen3.5-397B-A17B`）；config 里即使留着 Gemini key 也绝不读取、绝不发请求。
+历史混合链 `MODELS_MIXED` 只在显式 `use_gemini=true` 时作兼容/回退，生产默认勿开。
+
 `config.json` 的 `summarize` 应设：
 
 ```json
 "summarize": {
-  "provider": "google",
-  "model": "gemini-4-hydrogen",
-  "api_key": "<Google AI Studio / Gemini API Key>",
-  "api_host": "https://generativelanguage.googleapis.com/v1beta/models",
-  "proxy": "http://127.0.0.1:7897",
+  "provider": "modelscope",
+  "model": "Qwen/Qwen3.5-397B-A17B",
+  "use_gemini": false,
+  "modelscope_api_key": "<ModelScope API Key（或 MODELSCOPE_API_KEY 环境变量）>",
   "thinking_level": "low",
   "chunk_minutes": 30,
   "streamer": "主播名",
@@ -102,7 +104,12 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 }
 ```
 
-### 模型轮换顺序（GeminiRotator）
+### 魔搭降级链（生产默认，2026-11-25 起）
+链首 → 链尾：`Qwen3.5-397B-A17B` → `Qwen3.8-27B` → `Qwen3.5-122B-A10B` → `GLM-5.2`
+→ `DeepSeek-V4.1-Flash-1017` → `Qwen3.5-27B` → `Qwen3.8-Flash-Next` → `Qwen3.5-35B-A3B`。
+单模型 200 次/日、RPM30、国内直连（`trust_env=False`）；Qwen 系 `enable_thinking=false`。
+
+### 历史 Gemini 轮换顺序（仅 `use_gemini=true` 回退时参考，生产已停用）
 旁路重建 / 重跑脚本（`regen_gemini_v2.py`、`run_812.py`）使用 `GeminiRotator` 按下列顺序轮换，
 **首选 `gemini-4-hydrogen`**（2026-11-22 实测升级：Gemini 4 系列 11 月 GA，Hydrogen 为
 3.8-flash 继任者且唯一有免费层——Carbon/Neon/Argon 均无免费层、不收录；官方称比 3.8-flash
@@ -126,17 +133,14 @@ gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash
 > 已排除"当日用完"，故不收录。末尾两个 `*-latest` 为滚动别名，作永不失效兜底。
 
 `MODELS` 常量定义在 `regen_gemini_v2.py`，`run_812.py` 直接复用 `R.MODELS`，两处同步生效。
-`config.example.json` 与 `setup.py` 的默认 `model` 也已对齐为 `gemini-4-hydrogen`。
+`config.example.json` 与生产 `config.json` 的默认 `model` 已对齐为 `Qwen/Qwen3.5-397B-A17B`（2026-11-25）；下方 Gemini 历史描述只在 `use_gemini=true` 回退时适用。
 
 > **2026-11-22 实测补充**：`GET /v1beta/models` 确认 Gemini 4 四款（carbon/neon/hydrogen/argon）均已 GA
 > 且支持 generateContent。**仅 Hydrogen 有免费层**；Carbon/Neon/Argon 需付费，免费 key 调用会失败，
 > 故不进链。新模型上线初期高峰实测 503/超时较频繁，属暂时性高需求——退避机制（503→60s）会
 > 自动降级到 3.8-flash，不影响出活，勿因偶发 503 摘掉 hydrogen。
 
-> 补充（2026-09-14 核对）：`daily_pipeline.py` 同样走 `R.GeminiRotator(R.MODELS, rpm=5,
-> max_per_model=20)`，**有自动轮换兜底**（此前本段称其"单模型、无兜底"，与代码不符已更正）。
-> `summarize.model` 仅在非轮换路径/新建配置时作为默认首选；轮换链一律以 `MODELS[0]` 起。
-> 免费层每模型约 20 次/天，撞配额会自动顺切下一档。
+> 补充（2026-11-25 更正）：`daily_pipeline.py` 走 `MR.build_rotator(cfg, log)`；生产 `use_gemini=false` → `MultiProviderRotator` + `MODELS_MS_ONLY`（纯魔搭链）。`summarize.model` 仅作链首记录，实际链以 `MODELS_MS_ONLY[0]` 起。下方 GeminiRotator 说明仅回退/旁路脚本适用。
 
 ## 5 步每日流程（统一入口 `daily_pipeline.py`）
 
@@ -146,9 +150,9 @@ gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash
 1. **监测本地根目录**：扫描 `config.local.root` 根目录 + 各 `YYYY-MM-DD` 日期子目录下的新录播（`*.flv`/`*.mp4`/`*.mkv`/`*.mov`）。
    · 已处理（state 占位 / TXT 命中）的跳过；
    · **正在录制中**（文件大小不稳定 / 修改时间太新）的整段跳过，避免截半——这是防「录到一半就被拿去转写」的关键。
-2. **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Gemini 切块总结 → 写 Word，并写 `state.json` 占位（`LOCAL-YYYYMMDD[-N]`，`date` 推高一天，使 B站兜底不会重复抓同场，避免重复消耗 token）。
+2. **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Qwen 切块总结 → 写 Word，并写 `state.json` 占位（`LOCAL-YYYYMMDD[-N]`，`date` 推高一天，使 B站兜底不会重复抓同场，避免重复消耗 token）。
 3. **缺失检查 + 三级补档**（用户规则 2026-09-05）：用 `backfill.py` 对照「实际直播日历」（`live_calendar.py`：rec站文件日期 ∪ 本地文件日期 ∪ B站标题日期）找出**本地 / Word 月度总结 / state 都没覆盖**的直播日期，按 **本地 → rec.darkpy.cn → B站** 顺序补档：
-   · **rec.darkpy.cn**（第二备份，`darkpy_rec.py`）：FLV 分段**断点续传下载** → 按段结束时间归组（跨午夜尾巴归前一场）→ ffmpeg `concat demuxer -c copy` **无损合并**（编码不一致才回退重编码）→ 完整性校验 → **同一总结流程**（转写→热词→总结→Word→MP3→压缩）。
+   · **rec.darkpy.cn**（第二备份，`darkpy_rec.py`）：FLV 分段**断点续传下载**（默认 3 路并发，`darkpy.parallel_downloads` 可调） → 按段结束时间归组（跨午夜尾巴归前一场）→ ffmpeg `concat demuxer -c copy` **无损合并**（编码不一致才回退重编码）→ 完整性校验 → **同一总结流程**（转写→热词→总结→Word→MP3→压缩）。
    · **B站**（第三备份，原有功能不变）：仅当 rec站也没有该日时才抓（`bilibili_fallback(only_dates=...)` 限定目标日期）。跑完流程保留原 MP4、不压缩（`bilibili.keep_mp4=true`），归档到「录播根目录/YYYY-MM-DD/」。
    · 结束输出逐日结论（`2026-09-01：本地缺失 → rec.darkpy.cn → 成功`）。
 4. **导出识别专用低码率 MP3**：总结完成后，把视频转一份 **16 kHz / 单声道 / 64 kbps** 的 MP3（落在 `mp3_export.out_dir`；**用户规则 2026-09-08：与 Word 总结同目录，岁己 = `C:\Users\Tsing\DeskBox\文档`**，文件名直接以日期开头）。★ **2026-11-15 用户规则**：这份 MP3 只用于送千问做音频识别，「音质可以全面降低，满足普通的转录需求就可以」；ASR 服务端统一重采样到 16 kHz，双声道是单声道复制，故 `-ac 1 -ar 16000 -b:a 64k` 零有效信息损失、体积约降 67%。保守场景可把 `bitrate` 调 `96k`，勿降到 8 kHz；唱歌听感会变闷，收听版请另导。补跑时若已有 MP3 规格不符会自动重导。
