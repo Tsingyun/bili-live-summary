@@ -61,6 +61,7 @@ import fetch_latest
 import download_merge
 import hotwords
 import mp3_export
+import transcript_docx as TD  # 逐场原文汇总 DOCX（2026-11-25）
 import compress_video
 import backfill
 import reorder_doc as RD
@@ -876,6 +877,30 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
             hotwords.apply_to_file(txt_path, cfg, log)
         if os.path.exists(srt_path):
             hotwords.apply_to_file(srt_path, cfg, log)
+
+    # 2.5) 逐场原文汇总 DOCX（用户规则 2026-11-25）：每场单独一份，正文逐句短段、不合并。
+    #      失败不影响总结成品；已存在则跳过（幂等），重跑不会覆盖用户手工改过的文件。
+    try:
+        td_cfg = cfg.get('transcript_docx') or {}
+        if td_cfg.get('enabled', True):
+            td_out = td_cfg.get('out_dir') or r"C:\Users\Tsing\DeskBox\文档\总结"
+            if os.path.isdir(td_out):
+                # 优先用录播源 basename（含录制器 HHMMSS-序号），与「总结」样例命名一致；
+                # src_video 为 B站/非常规命名时回退到 fname stem。
+                td_name = os.path.splitext(os.path.basename(src_video))[0]
+                for pfx in (td_cfg.get('strip_prefix') or []):
+                    if td_name.startswith(pfx):
+                        td_name = td_name[len(pfx):]
+                if not re.match(r'^20\d{6}-', td_name):  # 非 YYYYMMDD- 开头 → 回退
+                    td_name = fname[:-4]
+                td_path = os.path.join(td_out, td_name + '.docx')
+                made, nseg = TD.build_docx(txt_path, td_path, title=td_name + '_原文')
+                log('[transcript_docx] %s %s（%d 段）' %
+                    ('已生成' if made else '已存在跳过', os.path.basename(td_path), nseg))
+            else:
+                log('[transcript_docx] 输出目录不存在，跳过：%s' % td_out, 'WARN')
+    except Exception as e:
+        log('[transcript_docx] 原文汇总 DOCX 异常（不影响总结）：%s' % e, 'WARN')
 
     # 3) Gemini 逐 30 分钟块总结 → 写 Word（含章节元数据 + 话题分隔线）
     sys_prompt = R.load_prompt(cfg)

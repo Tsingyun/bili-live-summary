@@ -71,6 +71,10 @@ python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run
 - **summarize**：`provider` / `model` / `use_gemini` / `modelscope_api_key` / `chunk_minutes`(30) / `streamer` / `audience` / `prompt_path`。
   **2026-11-25 起 `provider:"modelscope"`、`model:"Qwen/Qwen3.5-397B-A17B"`、`use_gemini:false`**（见下「大模型调用约定」）；Gemini 调用经常失败，已放弃，勿在生产配置里重新启用。`prompt_path` 指向的 prompt 文件支持 `{streamer}`/`{audience}` 占位符（运行时替换），无占位符则幂等保留字面内容，兼容既有 prompt。
 - **output**：`doc_dir`、`doc_name_pattern`（支持 `{streamer}`/`{year}`/`{month}`）、`font`
+- **transcript_docx**（★ 用户规则 2026-11-25）：每场录播总结后**单独生成一份逐段原文汇总 DOCX**，样式对标 `C:\Users\Tsing\DeskBox\文档\总结` 现有样例。`enabled`(默认 true) / `out_dir`(默认 `C:\Users\Tsing\DeskBox\文档\总结`) / `strip_prefix`(去掉录制器前缀，如 `录制-25788785-`)。
+  - **只用 DOCX，不用其他格式**；标题样式「大标题」= `<录播basename>_原文`，段1 居中生成时间，之后严格「时间戳 / 正文 / 空行」循环，全部「等线(中文正文)」10pt。
+  - ★ **正文必须一小段一小段**：严格按 TXT 的每一句独立成段，**绝不合并成长段、不加表格、不加额外标题样式或内容**。时间戳 `<1h` 用 `MM:SS`，超 1h 用 `H:MM:SS`。
+  - 命名取录播源 basename（含录制器 HHMMSS-序号），与样例一致；**幂等**：目标已存在则跳过，`--force` 才覆盖。实现 `scripts/transcript_docx.py`（22 项自测），挂钩在 `daily_pipeline.py` 的 `process_video_source` 步骤 2.5（热词之后、AI 总结之前，用热词纠正后的 TXT）。
 - **paths**：`project_root` / `python` / `ffmpeg` / `ffprobe` / `aria2c` / `cookies`
 - **transcribe / cleanup**：推理参数与产物清理。`transcribe.asr_batch_size_s`（默认 120）= 2026-11-25 P0-2：VAD 段按目标音频秒数打包成一次 `generate(list)`，由 FunASR 内部动态组批，压平实测 5.5x~13.6x 耗时波动；0=退回逐段（仅 Nano 生效，SenseVoice 保持逐段）。批量返回数量不符/抛异常会自动整批回退逐段，绝不丢段。
 - **hotwords**：转写后自动纠正（**固定流程「转写→热词→总结」的中间一环，勿跳过**）。`enabled:true` 时解析 `path`（默认用 skill 自带空模板 `SKILL_DIR/scripts/hotwords.md`）里的替换表，对 TXT/SRT 各做一遍替换再送 AI；`enabled:false` 关闭；`path` 可指向工作目录下的自定义替换表（相对路径以 WORKDIR 为基准）。改表立刻生效；改完用 `python scripts/hotwords.py --audit` 自检。
@@ -150,7 +154,7 @@ gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash
 1. **监测本地根目录**：扫描 `config.local.root` 根目录 + 各 `YYYY-MM-DD` 日期子目录下的新录播（`*.flv`/`*.mp4`/`*.mkv`/`*.mov`）。
    · 已处理（state 占位 / TXT 命中）的跳过；
    · **正在录制中**（文件大小不稳定 / 修改时间太新）的整段跳过，避免截半——这是防「录到一半就被拿去转写」的关键。
-2. **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → Qwen 切块总结 → 写 Word，并写 `state.json` 占位（`LOCAL-YYYYMMDD[-N]`，`date` 推高一天，使 B站兜底不会重复抓同场，避免重复消耗 token）。
+2. **有本地新文件 → 本地总结**：抽 16k 音频 → FunASR 转写 → 热词纠正 → **逐场原文汇总 DOCX（步骤 2.5，`transcript_docx`）** → Qwen 切块总结 → 写 Word，并写 `state.json` 占位（`LOCAL-YYYYMMDD[-N]`，`date` 推高一天，使 B站兜底不会重复抓同场，避免重复消耗 token）。
 3. **缺失检查 + 三级补档**（用户规则 2026-09-05）：用 `backfill.py` 对照「实际直播日历」（`live_calendar.py`：rec站文件日期 ∪ 本地文件日期 ∪ B站标题日期）找出**本地 / Word 月度总结 / state 都没覆盖**的直播日期，按 **本地 → rec.darkpy.cn → B站** 顺序补档：
    · **rec.darkpy.cn**（第二备份，`darkpy_rec.py`）：FLV 分段**断点续传下载**（默认 3 路并发，`darkpy.parallel_downloads` 可调） → 按段结束时间归组（跨午夜尾巴归前一场）→ ffmpeg `concat demuxer -c copy` **无损合并**（编码不一致才回退重编码）→ 完整性校验 → **同一总结流程**（转写→热词→总结→Word→MP3→压缩）。
    · **B站**（第三备份，原有功能不变）：仅当 rec站也没有该日时才抓（`bilibili_fallback(only_dates=...)` 限定目标日期）。跑完流程保留原 MP4、不压缩（`bilibili.keep_mp4=true`），归档到「录播根目录/YYYY-MM-DD/」。
