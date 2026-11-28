@@ -291,7 +291,8 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - 保留：`cleanup.merged_days=-1`、`purge_merged_after_session=false`（默认）。
   任何清扫（含 `--sweep`、`after_session(final=True)`）都**不删**合并 MP4。
 - 删源：`process_video_source()` 成功收尾后，主循环在 `mark_local_done()` 之后调
-  `cleanup.purge_source_members()`，**校验通过才清零删除该场源 FLV**，从而只占一份空间。
+  `cleanup.purge_source_members()`（多段）或 `cleanup.purge_single_source()`（单段），
+  **校验通过才清零删除该场源 FLV**，从而只占一份空间。
   校验 `cleanup.verify_merged_playable()` 三道门禁：① 文件 >1MB；
   ② ffprobe 时长 ≥ 各源分段之和的 95%；③ `ffmpeg` 对开头 3 秒和结尾 3 秒各解码一次、
   返回码为 0（读得出时长 ≠ 能解码，这一步才证明「可正常播放」）。
@@ -331,7 +332,7 @@ python cleanup.py --sweep --aggressive  # 无视保留天数，清空全部临�
 - **合并失败 = 整场跳过且不写完成标记（下次自动重试），绝不退化成逐段分别总结**——那会给一场直播产出多份残缺总结。
 - **合并产物先写 `.part.mp4`，校验时长达标（≥各分段之和 95%）后原子改名**；复用已有产物时同样校验时长——
   只看"文件存在 + 体积 >1MB"会把上次被杀留下的半截合并视频当成已完成，直接送去转写，结果一场直播只总结一半。
-- 合并产物默认落在**录播根目录**（`local.root`，`local_merge.merge_output=recording_root`），文件名沿用首段 basename 加 `_merged`；`_merged` 后缀让扫描器排除，不会被当成新录播重复处理。幂等（已存在且完整则跳过）。**合并 MP4 是交付件（整场可正常播放），默认永久保留，任何清扫都不删。**
+- 合并产物默认落在**录播根目录**（`local.root`，`local_merge.merge_output=recording_root`），文件名沿用首段 basename 加 `.mp4`（**不带 `_merged`**）；扫描器按「MP4=交付件」排除，不会被当成新录播重复处理。幂等（已存在且完整则跳过）。**合并 MP4 是交付件（整场可正常播放），默认永久保留，任何清扫都不删；校验通过后源 FLV 清零删除。**
 - 配置项（`config.json` 的 `local_merge`）：`enabled`(总开关) / `max_gap_sec`(连续判定间隙上限，默认 600) / `allow_overlap_sec`(允许的负间隙，默认 60) / `merge_output`(`recording_root`=合并产物落录播根目录，默认) / `delete_sources_after_verify`(默认 true：合并 MP4 校验通过后清零删除源 FLV 分段) / `keep_merged`(历史开关) / `exclude_dates`(日期列表，**显式强制不合并**)。
 - **单文件目录、或 `local_merge.enabled=false`** 时退化为旧行为（每目录取首个文件），不合并。
 - ⚠️ **临界风险**：若某日期多文件真实间隙只比 `max_gap_sec` 略大（如 609s vs 600s），ffprobe 时长精度波动可能让间隙跌破阈值而被误合并。对确认是独立多场的日期务必加入 `exclude_dates`（如 `"exclude_dates": ["2026-08-22"]`），不依赖阈值侥幸。

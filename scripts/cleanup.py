@@ -25,9 +25,9 @@ daily_pipeline 里），一旦中途失败（下载失败、Gemini 配额耗尽�
    录播根目录（local.root）下的任何成品——压缩 MP4、源 flv/mp4；以及 mp3_export.out_dir
    的归档 MP3（用户规则 2026-09-08 起与 Word 总结同目录，不在录播根目录）。
    源视频只允许 compress 模块在「压缩成功且校验通过」后删除，本模块不碰。
-4. 合并产物例外（2026-11-17 用户规则修正）：*_merged.mp4 是**交付件**（整场可播放 MP4），
-   默认永久保留，任何清扫都不碰；源 FLV 分段只在合并产物通过「时长 + 首尾解码」校验后
-   由 purge_source_members 清零删除。
+4. 合并/转封装产物例外（2026-11-29 用户规则）：MP4（文件名不再带 _merged）是**交付件**，
+   默认永久保留，任何清扫都不碰；源 FLV 只在同名 MP4 通过「时长 + 首尾解码」校验后，
+   由 purge_source_members（多段）/ purge_single_source（单段）清零删除。
 5. 删除走 common.force_unlink / force_rmtree（原生永久删除：ctypes Win32 DeleteFileW →
    PowerShell Remove-Item -Force，绕过 os.remove 安全删除 hook，绝不进回收站、无需确认）。
 
@@ -523,7 +523,7 @@ def purge_source_members(cfg, log, merged_path, member_files, date_iso, dry_run=
     安全条件（任一不满足即整体不删）：
       · cleanup/local_merge 两个开关都放行；
       · date_iso 已在 state.done_dates（Word 小节与归档 MP3 已落盘）；
-      · merged_path 就在 local.root 下且以 _merged.mp4 结尾，并通过 verify；
+      · merged_path 就在 local.root 下且为 .mp4 交付件（不带 _merged），并通过 verify；
       · 每个源都在 local.root 或其直接子目录下，且不是 _merged/_compressed/.part。
     删除走 release_then_unlink（大文件先 truncate(0)），否则本机软删进回收站不释放空间。
     """
@@ -540,7 +540,7 @@ def purge_source_members(cfg, log, merged_path, member_files, date_iso, dry_run=
         return 0
     root = os.path.abspath(root)
     mp = os.path.abspath(merged_path or '')
-    if os.path.dirname(mp) != root or not mp.lower().endswith('_merged.mp4'):
+    if os.path.dirname(mp) != root or not mp.lower().endswith('.mp4'):
         if log:
             log('[source] 合并产物不在录播根目录（%s），保留源 FLV 不删' % mp, 'WARN')
         return 0
@@ -590,6 +590,61 @@ def purge_source_members(cfg, log, merged_path, member_files, date_iso, dry_run=
                 log('[source] 源分段删除失败（保留）：%s' % os.path.basename(ap), 'WARN')
     return freed
 
+
+def purge_single_source(cfg, log, src_path, date_iso, dry_run=False):
+    """单段 FLV → MP4 转封装成功后删除源 FLV（用户规则 2026-11-29）。
+
+    门禁（任一不过即保留源）：① 配置允许；② 该场已进 done_dates；③ 同名 MP4
+    在录播根目录且通过 verify_merged_playable 三道校验；④ 源确为 FLV 且在根目录。
+    返回释放字节数。
+    """
+    lm = cfg.get('local_merge') or {}
+    if not lm.get('delete_sources_after_verify', True):
+        return 0
+    cu = cfg_cleanup(cfg)
+    if not cu.get('enabled', True):
+        return 0
+    root = (cfg.get('local') or {}).get('root') or ''
+    if not root or not src_path or not os.path.isfile(src_path):
+        return 0
+    root = os.path.abspath(root)
+    src = os.path.abspath(src_path)
+    if not src.lower().endswith('.flv'):
+        return 0
+    if os.path.dirname(src) != root and os.path.dirname(os.path.dirname(src)) != root:
+        return 0
+    try:
+        done = set(C.load_state(cfg).get('done_dates') or [])
+    except Exception:
+        done = set()
+    if date_iso not in done:
+        if log:
+            log('[source] %s 尚未写入 done_dates，保留单段源 FLV' % date_iso, 'WARN')
+        return 0
+    mp4 = os.path.splitext(src)[0] + '.mp4'
+    if os.path.dirname(mp4) != root or not os.path.isfile(mp4):
+        if log:
+            log('[source] 同名 MP4 不存在（%s），保留源 FLV' % os.path.basename(mp4), 'WARN')
+        return 0
+    ok, reason, got, exp = verify_merged_playable(cfg, log, mp4, [src])
+    if not ok:
+        if log:
+            log('[source] MP4 校验未通过（%s），保留源 FLV' % reason, 'WARN')
+        return 0
+    sz = os.path.getsize(src)
+    if dry_run:
+        if log:
+            log('[source] dry-run 将删除单段源 FLV %.2f GB：%s'
+                % (sz / (1024 ** 3), os.path.basename(src)))
+        return sz
+    if release_then_unlink(src, log):
+        if log:
+            log('[source] 已删除单段源 FLV %.2f GB：%s'
+                % (sz / (1024 ** 3), os.path.basename(src)))
+        return sz
+    if log:
+        log('[source] 单段源 FLV 删除失败（保留）：%s' % os.path.basename(src), 'WARN')
+    return 0
 
 # ---------------------------------------------------------------------------
 # 全量清扫

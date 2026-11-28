@@ -6,7 +6,7 @@
 马上去录播站下载完整版本，然后进行合并总结。」
 
 三条 DOWNLOAD 判据（任一命中即下 rec 站完整版）：
-  1. no_local_source —— 本地录播根目录该日期无任何源 FLV/MP4（排除 *_merged/*_compressed）
+  1. no_local_source —— 本地该日期无任何源 FLV/MKV/MOV（MP4 均为交付件，一律排除）
   2. local_too_short —— 本地合并时长 < rec 站同场跨度 - max_diff_min（默认 5 分钟）
   3. local_low_quality —— 本地平均码率 < rec 站同场平均码率 * quality_ratio（默认 0.6）
 
@@ -32,7 +32,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-MEDIA_EXT = ('.flv', '.mp4', '.mkv', '.ts', '.m4v')
+# ★ 2026-11-29：MP4 = 无损合并/转封装的交付件（文件名不再带 _merged），
+#    绝不能当源片段；源只认 FLV/MKV/MOV/TS/M4V。
+SOURCE_EXT = ('.flv', '.mkv', '.mov', '.ts', '.m4v')
 DEFAULT_MAX_DIFF_MIN = 5.0
 DEFAULT_QUALITY_RATIO = 0.6
 
@@ -44,10 +46,10 @@ def _lognoop(m, lv='INFO'):
 def _is_source_file(path):
     """源片段：媒体扩展名，且去掉所有尾缀后不以 _merged/_compressed 结尾。"""
     low = path.lower()
-    if not low.endswith(MEDIA_EXT):
+    if not low.endswith(SOURCE_EXT):
         return False
     core = low
-    while core.endswith(MEDIA_EXT):
+    while core.endswith(SOURCE_EXT):
         core = core[:core.rfind('.')]
     if core.endswith('_merged') or core.endswith('_compressed'):
         return False
@@ -258,6 +260,7 @@ def self_test():
     chk('排除 _merged', not _is_source_file('x_merged.mp4'))
     chk('排除 _compressed', not _is_source_file('x_compressed.mp4'))
     chk('保留普通 flv', _is_source_file('录制-25788785-20261119-201653-985-标题.flv'))
+    chk('排除普通 mp4 交付件', not _is_source_file('录制-25788785-20261128-202613-963-标题.mp4'))
 
     # 跨午夜 token
     a, b = _date_tokens('2026-11-19')

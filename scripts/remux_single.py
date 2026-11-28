@@ -4,8 +4,8 @@
 设计要点（2026-11-29 用户规则）：
   · 录播总结完后，每场都要有一个 MP4 文件作为「任务完成信号」——多段走
     prepare_session 的 concat 合并，单段走本脚本的 -c copy 转封装。
-  · 输出 <源basename去扩展>_merged.mp4，带 _merged 后缀 → 扫描器自动排除，
-    不会被当成新录播重复处理。源 FLV 不动（保留）。
+  · 输出 <源basename去扩展>.mp4（不带 _merged 后缀）。扫描器按「MP4=交付件、
+    FLV=源」排除 MP4，不会当新录播重复处理；MP4 校验通过后源 FLV 由管线清零删除。
   · 先写 <out>.part.mp4，ffprobe 校验时长 >= 源 95% 且首尾可解码，才原子改名；
     半截文件绝不变成正式交付件。
   · 不重编码、不压缩（-c copy），仅换容器；FLV(h264+aac) → MP4 秒级~分钟级。
@@ -54,7 +54,7 @@ def remux(cfg, src, out_path=None, log=None, force=False):
     if not os.path.isfile(src): return (False, None, '源不存在：%s' % src)
     if not out_path:
         base = os.path.splitext(os.path.basename(src))[0]
-        out_path = os.path.join(os.path.dirname(src), base + '_merged.mp4')
+        out_path = os.path.join(os.path.dirname(src), base + '.mp4')
     src_dur = _ffprobe_duration(ffprobe, src)
     if src_dur <= 0: return (False, None, '无法探测源时长：%s' % src)
 
@@ -112,8 +112,9 @@ def selftest():
     ck('full file accepted', 16761 >= src * 0.95)
     ok = _ffprobe_duration('/nonexistent/ffprobe', '/nonexistent/file') == 0.0
     ck('missing probe returns 0', ok)
-    ck('out suffix', os.path.splitext('录制-25788785-20261128-x.flv')[0] + '_merged.mp4' ==
-       '录制-25788785-20261128-x_merged.mp4')
+    _out = os.path.splitext('录制-25788785-20261128-x.flv')[0] + '.mp4'
+    ck('out suffix (no _merged)', _out == '录制-25788785-20261128-x.mp4')
+    ck('no _merged token', '_merged' not in _out)
     fails = [n for n, c in checks if not c]
     print('结果：%d 项通过，%d 项失败' % (len(checks) - len(fails), len(fails)))
     for n in fails: print('  [FAIL]', n)

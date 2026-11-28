@@ -81,6 +81,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_NAME_PATTERN = r'^(?:录制-)?(?P<uid>\d+)-(?P<date>\d{8})-(?P<time>\d{6})-(?P<num>\d+)-(?P<title>.+)\.(?P<ext>mp4|flv|mkv|mov|MP4|FLV|MKV|MOV)$'
 DEFAULT_NAME_RE = re.compile(DEFAULT_NAME_PATTERN)
 MEDIA_EXT = ('.mp4', '.flv', '.mkv', '.mov')
+# ★ 2026-11-29：MP4 = 无损合并/转封装的交付件，FLV = 录播源。
+#    本地源扫描只认 FLV/MKV/MOV，绝不把 MP4 当新录播——否则删源失败时
+#    同名 FLV + MP4 会被误判成同一场的两段，产出时长翻倍的废稿。
+LOCAL_SOURCE_EXT = ('.flv', '.mkv', '.mov')
 
 # 录制器实际行为（2026-08-31 确认）：录制中的临时文件在根目录，录完后最终文件会被
 # 移动进「根目录/YYYY-MM-DD/」日期子目录，导致根目录反而为空、本地监测扫不到任何东西。
@@ -321,14 +325,16 @@ def scan_root_sessions(cfg, log):
             fp = os.path.join(scan_d, fn)
             if not os.path.isfile(fp):
                 continue
-            if not fn.lower().endswith(MEDIA_EXT):
+            if not fn.lower().endswith(LOCAL_SOURCE_EXT):
                 continue
             low = fn.lower()
             # 排除压缩/合并产物及其半成品（2026-09-26 修复）：
             #  · 任意含 .part 的残留（压缩/合并被杀留下的 *.part.mp4）绝不能当新录播，
             #    否则会被 is_file_stable 误判成「录制中」，导致整场被永久跳过、源永不删；
             #  · 去掉全部尾缀扩展名后仍以 _compressed / _merged 结尾的（如
-            #    xxx_compressed.mp4、xxx_merged_compressed.mp4、xxx_merged.mp4）也排除。
+            #    xxx_compressed.mp4、xxx_merged_compressed.mp4、xxx_merged.mp4）也排除；
+            #  · ★ 2026-11-29：所有 .mp4 都是交付件（不带 _merged 后缀也排除），
+            #    源只认 FLV/MKV/MOV；MP4 校验通过后源 FLV 会被清零删除。
             if '.part' in low:
                 continue
             core = re.sub(r'(\.\w+)+$', '', fn)
@@ -565,9 +571,9 @@ def prepare_session(cfg, log, session):
     if not session['is_merged']:
         session['merged_src'] = session['member_files'][0]
         return session['merged_src']
-    # ★ 2026-11-17 用户规则修正：合并 MP4 是**交付件**，不是缓存。
-    #   默认落在录播根目录（跟源 FLV 一起），保留 _merged.mp4 后缀——扫描器
-   #   的 core.endswith('_merged') 排除规则保证它不会被当成新录播重复处理。
+    # ★ 2026-11-29 用户规则：合并 MP4 是**交付件**，文件名不带 _merged 后缀，
+    #   默认落在录播根目录（跟源 FLV 一起）。扫描器按「MP4=交付件」排除，
+    #   不会被当成新录播重复处理；MP4 校验通过后源 FLV 会被清零删除。
     local_root = (cfg.get('local') or {}).get('root') or ''
     lm = cfg.get('local_merge') or {}
     if lm.get('merge_output', 'recording_root') == 'recording_root' and local_root:
@@ -576,7 +582,7 @@ def prepare_session(cfg, log, session):
         merged_dir = os.path.join(cfg['_dirs']['root'], 'merged')
     os.makedirs(merged_dir, exist_ok=True)
     first_base = re.sub(r'\.\w+$', '', os.path.basename(session['member_files'][0]))
-    out_path = os.path.join(merged_dir, first_base + '_merged.mp4')
+    out_path = os.path.join(merged_dir, first_base + '.mp4')
 
     # 复用已有合并产物必须校验「时长接近各分段之和」，不能只看体积 >1MB。
     # 旧实现只看体积：上次被杀留下的半截合并文件会被当成已完成直接送去转写，
@@ -914,14 +920,14 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
         return False
 
-    # 3.5) ★ 2026-11-29 规则：MP4 文件 = 任务完成信号。
-    #   多段场次在 prepare_session 已产出 _merged.mp4；单段 FLV 此前直通、没有 MP4，
+    # 3.5) ★ 2026-11-29 规则：MP4 文件 = 任务完成信号，文件名不带 _merged。
+    #   多段场次在 prepare_session 已产出合并 MP4；单段 FLV 此前直通、没有 MP4，
     #   用户看不到 MP4 会以为任务没跑完。这里给单段源做无损转封装（-c copy，不改编码），
-    #   产出 <源basename>_merged.mp4 到录播根目录，时长/首尾解码校验通过才原子改名。
-    #   源 FLV 保留不动；失败只告警，不影响总结成品（下次重跑幂等补做）。
+    #   产出 <源basename>.mp4 到录播根目录，时长/首尾解码校验通过才原子改名。
+    #   MP4 就绪后源 FLV 在 mark_local_done() 之后清零删除；失败只告警，不影响总结成品。
     try:
         is_single = (not member_files) or len(member_files) <= 1
-        if src_kind == 'local' and is_single and not src_video.lower().endswith('_merged.mp4'):
+        if src_kind == 'local' and is_single and not src_video.lower().endswith('.mp4'):
             import remux_single
             mok, mout, mmsg = remux_single.remux(cfg, src_video, log=log)
             if mok:
@@ -1677,13 +1683,18 @@ def main():
                         # ★ 2026-11-17：合并 MP4 保留为交付件；源 FLV 在通过
                         #   「时长>=95% + 首尾可解码」校验后清零删除，省双份空间。
                         try:
-                            if src and src.lower().endswith('_merged.mp4'):
+                            if src and src.lower().endswith('.mp4'):
                                 cleanup.purge_source_members(
                                     cfg, log, src, s['member_files'],
                                     s['live_date'].isoformat(),
                                     dry_run=args.dry_run)
+                            elif src and src.lower().endswith('.flv'):
+                                # 单段：MP4 已在步骤 3.5 产出并校验，写完成标记后删源。
+                                cleanup.purge_single_source(
+                                    cfg, log, src, s['live_date'].isoformat(),
+                                    dry_run=args.dry_run)
                         except Exception as e:
-                            log('删除源分段异常（合并 MP4 已保留，可手工清理）：%s' % e, 'WARN')
+                            log('删除源分段异常（MP4 已保留，可手工清理）：%s' % e, 'WARN')
                 except KeyboardInterrupt:
                     raise                      # 优雅退出信号：交给外层 finally 收尾
                 except Exception as ex:
