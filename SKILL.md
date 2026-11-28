@@ -165,7 +165,7 @@ gemini-4-hydrogen → gemini-3.8-flash → gemini-3.7-flash → gemini-3.6-flash
    完整原件默认保留；阈值 `mp3_export.split_over_mb`（0=关闭），历史大文件用 `--scan` 补切。
 5. ~~**压缩 HEVC MP4**（2026-11-29 起已停用，`compress.enabled=false`）~~：~~把视频压成 ~5GB 的 HEVC(H.265) MP4~~，按 `compress.out_dir_mode=date_subfolder` 输出到「录播根目录/YYYY-MM-DD/」日期文件夹（**当前规则**，用户 2026-09-08：不要 MP4/ 文件夹，直接用日期命名文件夹）；压缩成功后按 `compress.replace_mode` 处理原视频（`delete` = 直接永久删除）。**B站兜底录播跳过本步骤，原样保留 MP4。**
 
-**最终每场交付物（2026-11-29 用户规则，勿再回退）**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 逐句原文汇总 DOCX（`transcript_docx.out_dir`）③ **视频 = FLV 无损合并的 MP4**（交付件，落录播根目录、永久保留）。★ **不再压缩**（`compress.enabled=false`，无 `_compressed.mp4`）；★ **不再生成归档 MP3**（`mp3_export.enabled=false`，无 16k/mono/64k 成品 MP3）。下方 MP3 / 压缩段落均为历史留档，以本条为准。
+**最终每场交付物（2026-11-29 用户规则，勿再回退）**：① AI 总结的 Word 文档（`output.doc_dir`，岁己 = `C:\Users\Tsing\DeskBox\文档`）② 逐句原文汇总 DOCX（`transcript_docx.out_dir`）③ **视频 = FLV 无损合并/转封装的 MP4**（交付件，落录播根目录、永久保留）。★ **MP4 = 任务完成信号**：多段场次在 `prepare_session` concat 合并、单段 FLV 由 `scripts/remux_single.py` 在总结写完后 `-c copy` 无损转封装（带 `_merged.mp4` 后缀、扫描器自动排除），**每场都必须有 MP4**，用户看到 MP4 即视为跑完。★ **不再压缩**（`compress.enabled=false`，无 `_compressed.mp4`）；★ **不再生成归档 MP3**（`mp3_export.enabled=false`，无 16k/mono/64k 成品 MP3）。下方 MP3 / 压缩段落均为历史留档，以本条为准。
 
 落地实现（已生效）：`daily_pipeline.py` 内置「根目录监测 + 本地总结 + 缺失补档(rec→B站) + MP3 + 压缩」+ 单实例锁 + 断点续跑（state 占位与 TXT/SRT 存在性判定）。手动运行：`python SKILL_DIR/scripts/daily_pipeline.py --workdir "<工作目录>" --dry-run` 只预览不处理。
 

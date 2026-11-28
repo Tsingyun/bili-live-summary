@@ -914,9 +914,27 @@ def process_video_source(cfg, st, src_video, date_iso, fname, src_kind, log, pro
         cleanup.after_session(cfg, log, stem=stem, src_kind=src_kind)
         return False
 
-    # 4) 总结后导出中质量 MP3（192k/44.1k，供文字识别/其他用途）
-    #    4)~5) 的产物（归档 MP3 / 压缩 MP4）失败**不影响总结成品**：TXT/SRT/Word 已落盘，
-    #    state 占位照写；下次重跑时转写与总结都会跳过，只补做 MP3/压缩（幂等）。
+    # 3.5) ★ 2026-11-29 规则：MP4 文件 = 任务完成信号。
+    #   多段场次在 prepare_session 已产出 _merged.mp4；单段 FLV 此前直通、没有 MP4，
+    #   用户看不到 MP4 会以为任务没跑完。这里给单段源做无损转封装（-c copy，不改编码），
+    #   产出 <源basename>_merged.mp4 到录播根目录，时长/首尾解码校验通过才原子改名。
+    #   源 FLV 保留不动；失败只告警，不影响总结成品（下次重跑幂等补做）。
+    try:
+        is_single = (not member_files) or len(member_files) <= 1
+        if src_kind == 'local' and is_single and not src_video.lower().endswith('_merged.mp4'):
+            import remux_single
+            mok, mout, mmsg = remux_single.remux(cfg, src_video, log=log)
+            if mok:
+                log('[remux] 单段 MP4 交付件已就绪（完成信号）：%s'
+                    % os.path.basename(mout))
+            else:
+                log('[remux] 单段转 MP4 失败（不影响总结，下次重跑补做）：%s' % mmsg, 'WARN')
+    except Exception as e:
+        log('[remux] 单段转 MP4 异常（不影响总结）：%s' % e, 'WARN')
+
+    # 4) 归档 MP3（2026-11-29 起已停用，mp3_export.enabled=false）
+    #    4)~5) 的产物失败**不影响总结成品**：TXT/SRT/Word 已落盘，
+    #    state 占位照写；下次重跑时转写与总结都会跳过，只补做（幂等）。
     try:
         mp3_export.export_for_local(cfg, log, src_video)
     except Exception as e:
