@@ -102,7 +102,8 @@
   },
   "mp3_export": {
     "_comment": "总结之后导出归档 MP3。★ 用户规则(2026-11-15)：归档 MP3 只用于送千问做音频识别，音质全面降低 = 默认 16kHz / 单声道 / 64kbps；保守场景可把 bitrate 调成 96k，勿降到 8kHz。out_dir 建议与 Word 总结同目录（用户规则 2026-09-08）；strip_prefix 去掉录制器前缀，使输出文件名以日期开头。",
-    "enabled": true,
+    "enabled": false,
+    "_comment_20261129": "★ 用户规则(2026-11-29)：录播总结后只输出 FLV 无损合并的 MP4，不再压缩、也不再生成归档 MP3。此开关保持 false；下方历史字段仅留档不生效。",
     "bitrate": "64k",
     "ar": 16000,
     "channels": 1,
